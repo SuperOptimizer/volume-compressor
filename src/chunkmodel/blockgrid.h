@@ -164,6 +164,14 @@ typedef struct {
                                    //     (ORC/Parquet 3-tier). Charges the tiny index
                                    //     bytes and lets near-constant (single-value)
                                    //     chunks store ONE byte instead of atom blobs.
+    // --- EXP#20: per-atom ADAPTIVE transform/mode selection (box path only) ----
+    // A 2-bit per-atom mode flag (stored in the seek directory) lets each 16^3 atom
+    // pick the cheapest of: DCT (default), SKIP (DC-only: store mean, drop all AC),
+    // RAW (incompressible escape: bypass-coded zig-zag levels, no shared table).
+    // The encoder picks by trial: lowest rate + adaptive_lambda * distortion (SSD).
+    // 0 = off (exactly the old DCT-only behaviour; flag costs nothing).
+    int             adaptive;      // 1 = enable per-atom mode selection
+    float           adaptive_lambda; // R-D Lagrange multiplier (bytes per SSD unit)
 } vc_bg_cfg;
 
 // Encoded archive (in-memory): a sequence of chunk records, each with a header
@@ -184,6 +192,10 @@ typedef struct {
     size_t skip_meta_bytes;  // (4) skip-index bytes (min/max+uniform flag per chunk)
     size_t skip_saved_bytes; // (4) payload+directory bytes skipped on uniform chunks
     u32    n_uniform_chunks;  // chunks flagged uniform (single value) and skipped
+    // EXP#20: per-atom adaptive mode histogram (non-absent atoms only).
+    u32    n_mode_dct;       // atoms coded as DCT
+    u32    n_mode_skip;      // atoms coded as SKIP (DC-only)
+    u32    n_mode_raw;       // atoms coded as RAW (bypass escape)
 } vc_bg_stats;
 
 // Encode a full u8 volume into a block-grid archive under cfg. Returns 0 on ok.

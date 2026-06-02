@@ -133,6 +133,13 @@ add_executable(bench_chunkmodel harness/bench_chunkmodel.c ${VC_CM_SRC})
 target_include_directories(bench_chunkmodel PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(bench_chunkmodel PRIVATE m)
 
+# EXP#20 per-atom adaptive transform/mode selection bake-off
+if(EXISTS ${CMAKE_SOURCE_DIR}/harness/bench_adaptive.c)
+  add_executable(bench_adaptive harness/bench_adaptive.c ${VC_CM_SRC})
+  target_include_directories(bench_adaptive PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_link_libraries(bench_adaptive PRIVATE m)
+endif()
+
 # --- HF / perceptual distortion-path bake-off (src/quant/ work; self-contained) -
 # Includes the won DCT-16 transform + the 16^3 quant matrix directly, links the
 # won RLGR + metrics. Does NOT touch codec.c / ratectrl / chunkmodel. Guarded so

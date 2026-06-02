@@ -296,10 +296,74 @@ static void rans_dec_banded(i16 *q, size_t n, const u8 *in, size_t len,
     free(scratch);
 }
 
+// ===========================================================================
+// EXP#20 RAW (bypass) AC coder — the "incompressible escape". Stores the freq-
+// scanned AC levels as zig-zag LEB128 varints with NO shared table and NO rANS
+// modelling. For atoms whose coefficient stats don't match the chunk's shared
+// table (noisy / outlier atoms), a table-free direct store can beat both the
+// shared-table rANS (which mis-models them) AND RLGR. Self-contained per atom.
+// Layout: [u24 n_nonzero-or-len][varint stream]. We store ALL AVOX levels (the
+// trailing zeros cost ~1 byte each via varint, but the chunk-relative escape is
+// only chosen for atoms where that still wins). To keep it cheap we run-length
+// the zeros: a zero level is encoded as a 0 token followed by a varint zero-run.
+// ===========================================================================
+static size_t raw_enc(u8 *restrict out, size_t cap, const i16 *restrict q, size_t n) {
+    vc_bitwriter bw; vc_bw_init(&bw, out, cap);
+    size_t i = 0;
+    while (i < n) {
+        u32 u = zz(q[i]);
+        if (u == 0) {
+            // count the zero run
+            size_t j = i + 1; while (j < n && q[j] == 0) ++j;
+            u32 run = (u32)(j - i);
+            vc_bw_put(&bw, 0, 8);                       // zero marker (varint byte 0)
+            do { u32 b = run & 0x7fu; run >>= 7; vc_bw_put(&bw, b | (run ? 0x80u : 0u), 8); } while (run);
+            i = j;
+        } else {
+            // nonzero: varint of (u<<1)|0? — distinguish from zero marker by always
+            // emitting u shifted so the first byte is never 0. We bias u by +1 so a
+            // nonzero symbol's varint first byte is >=1 (u>=1 => u+1>=2). Decoder
+            // subtracts 1.
+            u32 v = u + 1u;
+            do { u32 b = v & 0x7fu; v >>= 7; vc_bw_put(&bw, b | (v ? 0x80u : 0u), 8); } while (v);
+            ++i;
+        }
+    }
+    if (bw.overflow) return 0;
+    return vc_bw_finish(&bw);
+}
+static void raw_dec(i16 *restrict q, size_t n, const u8 *restrict in, size_t len) {
+    vc_bitreader br; vc_br_init(&br, in, len);
+    size_t i = 0;
+    while (i < n) {
+        u32 first = vc_br_get(&br, 8);
+        if (first == 0) {
+            // zero run: read run-length varint
+            u32 run = 0, sh = 0, b;
+            do { b = vc_br_get(&br, 8); run |= (b & 0x7fu) << sh; sh += 7; } while (b & 0x80u);
+            for (u32 k = 0; k < run && i < n; ++k) q[i++] = 0;
+        } else {
+            u32 v = 0, sh = 0; u32 b = first;
+            // reconstruct the varint whose first byte is `first`
+            v |= (b & 0x7fu) << sh; sh += 7;
+            while (b & 0x80u) { b = vc_br_get(&br, 8); v |= (b & 0x7fu) << sh; sh += 7; }
+            q[i++] = unzz(v - 1u);
+        }
+    }
+}
+
 // RLGR (table-free) for the VC_ENT_RLGR mode — declared in blocks.h, lives in
 // entropy/rlgr.c (already in the build).
 size_t vc_rlgr_encode(u8 *restrict out, size_t cap, const i16 *restrict q, size_t n);
 void   vc_rlgr_decode(i16 *restrict q, size_t n, const u8 *restrict in, size_t len);
+
+// EXP#20: sum of squared error between an original atom (u8) and a reconstructed
+// one (u8). Straight-line, autovectorizable.
+static double atom_ssd(const u8 *restrict orig, const u8 *restrict rec) {
+    double s = 0;
+    for (u32 i = 0; i < AVOX; ++i) { double d = (double)orig[i] - (double)rec[i]; s += d * d; }
+    return s;
+}
 
 // ===========================================================================
 // Traversal orderings over a chunk's chunk_atoms^3 atom grid (B axis).
@@ -393,12 +457,18 @@ static u32 stencil_offsets(vc_stencil s, nbr *out) {
 // table once per chunk, delta-coded directory, halo). Random access uses the
 // per-atom byte ranges + the chunk table + prediction ancestors.
 // ===========================================================================
+// EXP#20 per-atom adaptive modes (2-bit flag in the seek directory).
+#define BG_MODE_DCT  0u   // default: HF-quant DCT-16^3 AC levels via shared coder
+#define BG_MODE_SKIP 1u   // DC-only: no AC payload, reconstruct flat = DC value
+#define BG_MODE_RAW  2u   // incompressible escape: bypass-coded zig-zag AC levels
+
 typedef struct {
     u32 off, len;     // payload byte range within its chunk blob
     i16 dc_coef;      // reconstructed DC coefficient (for prediction + decode)
     i16 dc_resid_q;   // quantized DC residual level actually stored
     u8  absent;       // all-zero atom
     u8  intra;        // coded intra (no prediction) — boundary fallback
+    u8  mode;         // EXP#20: BG_MODE_* (0 for the non-adaptive path)
 } bg_atom;
 
 typedef struct {
@@ -880,6 +950,11 @@ int vc_bg_encode(const u8 *vol, u32 dz, u32 dy, u32 dx,
     i16 *coef = (i16 *)malloc(AVOX * sizeof(i16));
     i16 *qsc  = (i16 *)malloc(AVOX * sizeof(i16));
     u8  *pay  = (u8 *)malloc(AVOX * 4 + 64);
+    // EXP#20 adaptive-mode scratch: a reconstruction buffer + raw-coded payload +
+    // a second coef buffer for trial decode. Only used when cfg->adaptive.
+    u8  *arec = (u8 *)malloc(AVOX);
+    u8  *araw = (u8 *)malloc(AVOX * 4 + 64);
+    i16 *acoef= (i16 *)malloc(AVOX * sizeof(i16));
     // store every atom's quantized levels so a chunk can build a shared histogram
     // BEFORE coding (M1 needs the whole chunk's stats first).
     u32 namax = ca * ca * ca;
@@ -894,9 +969,10 @@ int vc_bg_encode(const u8 *vol, u32 dz, u32 dy, u32 dx,
     // pass 1 and coded once as a separate stream after all chunks (see below).
     i16 *dc_lvl = cfg->dc_subvol ? (i16 *)calloc(nat, sizeof(i16)) : NULL;
     if (!avox||!coef||!qsc||!pay||!qstore||!dcq||!intraf||!order||!rankc||!rank_lat
-        || (cfg->dc_subvol && !dc_lvl)) {
+        || !arec||!araw||!acoef || (cfg->dc_subvol && !dc_lvl)) {
         free(avox);free(coef);free(qsc);free(pay);free(qstore);free(dcq);free(intraf);
-        free(order);free(rankc);free(rank_lat);free(dc_lvl); vc_bg_free(a); return 1;
+        free(order);free(rankc);free(rank_lat);free(dc_lvl);
+        free(arec);free(araw);free(acoef); vc_bg_free(a); return 1;
     }
 
     nbr stoff[26]; u32 nst = stencil_offsets(cfg->stencil, stoff);
@@ -1073,10 +1149,11 @@ int vc_bg_encode(const u8 *vol, u32 dz, u32 dy, u32 dx,
             u32 gz = C->a0z+lz, gy = C->a0y+ly, gx = C->a0x+lx;
             bg_atom *at = &a->atoms[lat_idx(a, gz, gy, gx)];
             const i16 *q = qstore + (size_t)si*AVOX;
-            if (at->absent) { at->off = (u32)bl; at->len = 0; at->dc_resid_q = 0; si++; st->n_absent_atoms++; continue; }
+            if (at->absent) { at->off = (u32)bl; at->len = 0; at->dc_resid_q = 0; at->mode = BG_MODE_DCT; si++; st->n_absent_atoms++; continue; }
             at->dc_resid_q = dcq[si];
             size_t cap = AVOX * 4 + 64;
             size_t plen;
+            // --- DCT path: entropy-code the freq-scanned AC levels (default) ------
             if (cfg->entropy == VC_ENT_RLGR) {
                 plen = vc_rlgr_encode(pay, cap, q, AVOX);
             } else if (cfg->entropy == VC_ENT_RANS_SHARED && nb > 1) {
@@ -1091,8 +1168,46 @@ int vc_bg_encode(const u8 *vol, u32 dz, u32 dy, u32 dx,
                 plen = rans_enc(pay + NSYM*2, cap - NSYM*2, q, AVOX, &t1);
                 plen += NSYM*2;
             }
-            memcpy(blob + bl, pay, plen);
-            at->off = (u32)bl; at->len = (u32)plen; bl += plen;
+            u8 mode = BG_MODE_DCT;
+            const u8 *emit = pay; size_t emit_len = plen;
+            // --- EXP#20 per-atom adaptive mode selection (R-D trial) -------------
+            if (cfg->adaptive) {
+                f32 base = cfg->step;
+                // re-gather the original atom for honest decoded-block distortion.
+                gather_atom(avox, vol, dz, dy, dx, gz, gy, gx);
+                i16 dc_recon = at->dc_coef;       // reconstructed DC coefficient
+                // (a) DCT distortion: inverse the dequantized levels + this DC.
+                dequant_atom(acoef, q, dc_recon, base);
+                bg_dct16_inv(arec, acoef, 0);
+                double d_dct = atom_ssd(avox, arec);
+                // (b) SKIP distortion: DC-only atom (all AC = 0) -> flat reconstruct.
+                memset(acoef, 0, AVOX*sizeof(i16)); acoef[0] = dc_recon;
+                bg_dct16_inv(arec, acoef, 0);
+                double d_skip = atom_ssd(avox, arec);
+                // (c) RAW: same levels as DCT (lossless container) -> same distortion.
+                size_t raw_len = raw_enc(araw, AVOX*4+64, q, AVOX);
+                if (!raw_len) raw_len = (size_t)-1 >> 1;   // never pick if it overflowed
+                // R-D costs (bytes + lambda*SSD). DCT/SKIP/RAW rates in bytes.
+                double lam = cfg->adaptive_lambda;
+                double c_dct  = (double)plen      + lam * d_dct;
+                double c_skip = 0.0               + lam * d_skip;   // 0 AC bytes
+                double c_raw  = (double)raw_len   + lam * d_dct;
+                if (c_skip <= c_dct && c_skip <= c_raw) {
+                    mode = BG_MODE_SKIP; emit_len = 0; emit = pay;
+                } else if (c_raw < c_dct) {
+                    mode = BG_MODE_RAW;  emit_len = raw_len; emit = araw;
+                } else {
+                    mode = BG_MODE_DCT;
+                }
+            }
+            at->mode = mode;
+            if (cfg->adaptive) {
+                if (mode == BG_MODE_SKIP) st->n_mode_skip++;
+                else if (mode == BG_MODE_RAW) st->n_mode_raw++;
+                else st->n_mode_dct++;
+            }
+            if (emit_len) memcpy(blob + bl, emit, emit_len);
+            at->off = (u32)bl; at->len = (u32)emit_len; bl += emit_len;
             si++;
         }
         C->blob = blob; C->blob_len = bl;
@@ -1122,6 +1237,8 @@ int vc_bg_encode(const u8 *vol, u32 dz, u32 dy, u32 dx,
                 s2++;
             }
             dirbytes += (ndir + 7) / 8;                  // 1 absent-flag bit/atom
+            // EXP#20: 2-bit per-atom mode flag in the directory when adaptive.
+            if (cfg->adaptive) dirbytes += (2u * ndir + 7) / 8;
         }
         st->directory_bytes += dirbytes;
 
@@ -1148,6 +1265,7 @@ int vc_bg_encode(const u8 *vol, u32 dz, u32 dy, u32 dx,
         if (!dstream) {
             free(avox);free(coef);free(qsc);free(pay);free(qstore);free(dcq);
             free(intraf);free(order);free(rankc);free(rank_lat);free(dc_lvl);
+            free(arec);free(araw);free(acoef);
             vc_bg_free(a); return 1;
         }
         st->dc_subvol_bytes = dlen;
@@ -1172,6 +1290,7 @@ int vc_bg_encode(const u8 *vol, u32 dz, u32 dy, u32 dx,
     free(dc_lvl);
     free(avox);free(coef);free(qsc);free(pay);free(qstore);free(dcq);free(intraf);
     free(order);free(rankc);free(rank_lat);
+    free(arec);free(araw);free(acoef);
     *out = a;
     return 0;
 }
@@ -1183,6 +1302,13 @@ int vc_bg_encode(const u8 *vol, u32 dz, u32 dy, u32 dx,
 static void decode_one_atom_levels(const vc_bg_archive *a, const bg_chunk *C,
                                     const bg_atom *at, i16 *qsc) {
     if (at->absent) { memset(qsc, 0, AVOX*sizeof(i16)); return; }
+    // EXP#20 per-atom adaptive modes: SKIP stores no AC (flat = DC), RAW is a
+    // table-free bypass stream. Both keep cheap O(1) random access (touched stays
+    // 1: one byte range, no shared-table dependency beyond DCT atoms).
+    if (a->cfg.adaptive) {
+        if (at->mode == BG_MODE_SKIP) { memset(qsc, 0, AVOX*sizeof(i16)); return; }
+        if (at->mode == BG_MODE_RAW)  { raw_dec(qsc, AVOX, C->blob + at->off, at->len); return; }
+    }
     const u8 *p = C->blob + at->off;
     u32 nb = band_count(a->cfg.band_split);
     if (a->cfg.entropy == VC_ENT_RLGR) {
