@@ -150,6 +150,24 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_qmatrix16.c)
   target_link_libraries(vc_test_qmatrix16 PRIVATE m)
 endif()
 
+# --- Bit-plane / SNR-scalable coding bake-off (PARKED-axis re-examination) ---
+# Embedded MSB->LSB coder vs the won RLGR baseline on the same DCT-16^3 quantized
+# atoms. Self-contained (transform + qmatrix #included; entropy bitplane.c
+# #included; RLGR + metrics linked). Does NOT touch codec.c.
+if(EXISTS ${CMAKE_SOURCE_DIR}/harness/bench_bitplane.c)
+  add_executable(bench_bitplane harness/bench_bitplane.c
+                 src/entropy/rlgr.c src/metrics/metrics.c)
+  target_include_directories(bench_bitplane PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_link_libraries(bench_bitplane PRIVATE m)
+endif()
+
+# Round-trip + truncation unit test for the bit-plane coder.
+if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_bitplane.c)
+  add_executable(vc_test_bitplane tests/test_bitplane.c)
+  target_include_directories(vc_test_bitplane PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_link_libraries(vc_test_bitplane PRIVATE m)
+endif()
+
 enable_testing()
 add_test(NAME roundtrip COMMAND vc_test)
 add_test(NAME ratectrl COMMAND vc_test_ratectrl)
@@ -159,4 +177,7 @@ add_test(NAME healing COMMAND vc_test_healing)
 add_test(NAME chunkmodel COMMAND vc_test_chunkmodel)
 if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_qmatrix16.c)
   add_test(NAME qmatrix16 COMMAND vc_test_qmatrix16)
+endif()
+if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_bitplane.c)
+  add_test(NAME bitplane COMMAND vc_test_bitplane)
 endif()
