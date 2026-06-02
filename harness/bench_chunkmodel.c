@@ -21,11 +21,11 @@ static u8 *rd(const char*p,size_t*n){FILE*f=fopen(p,"rb");if(!f)return 0;fseek(f
 static u8 *load_hires256(const char *root) {
     char dir[512]; snprintf(dir,sizeof(dir),"%s/data/cache_hires",root);
     // collect up to 8 names deterministically (sorted)
-    char names[64][64]; int nn=0;
+    char names[64][512]; int nn=0;
     FILE *pp; char cmd[700]; snprintf(cmd,sizeof(cmd),"ls %s/*.u8 2>/dev/null | sort",dir);
     pp=popen(cmd,"r"); if(!pp) return 0;
     char line[600];
-    while (nn<8 && fgets(line,sizeof(line),pp)) { line[strcspn(line,"\n")]=0; snprintf(names[nn],64,"%s",line); nn++; }
+    while (nn<8 && fgets(line,sizeof(line),pp)) { line[strcspn(line,"\n")]=0; snprintf(names[nn],512,"%s",line); nn++; }
     pclose(pp);
     if (nn<8) return 0;
     const u32 C=128; u8 *vol=calloc(256u*256*256,1);

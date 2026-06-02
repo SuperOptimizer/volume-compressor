@@ -457,6 +457,7 @@ static i16 predict_dc(const vc_bg_archive *a, u32 z, u32 y, u32 x,
 // ===========================================================================
 static inline i16 dcsv_predict(const i16 *lvl, u32 Az, u32 Ay, u32 Ax,
                                u32 z, u32 y, u32 x) {
+    (void)Az;                         // raster index needs only Ay,Ax
     i32 acc = 0; u32 cnt = 0;
     if (x) { acc += lvl[(z*Ay + y)*Ax + (x-1)]; ++cnt; }
     if (y) { acc += lvl[(z*Ay + (y-1))*Ax + x]; ++cnt; }
@@ -733,13 +734,17 @@ int vc_bg_encode(const u8 *vol, u32 dz, u32 dy, u32 dx,
             free(intraf);free(order);free(rankc);free(rank_lat);free(dc_lvl);
             vc_bg_free(a); return 1;
         }
-        free(dstream);                 // stream not needed post-measurement
         st->dc_subvol_bytes = dlen;
-        // Reconstructed DC coefficient grid for decode-time O(1) lookup. Levels
-        // here equal what dcsv_decode would produce (lossless), so we dequant
-        // directly rather than round-trip the stream.
+        // Reconstructed DC coefficient grid for decode-time O(1) lookup. Decode
+        // the stream back exactly as the real decoder would (round-trips the DC
+        // levels), then dequant — this exercises dcsv_decode and guarantees the
+        // encoder's a->dc_sub matches what a from-bytes decode would reconstruct.
+        i16 *dc_lvl_rec = (i16 *)malloc((size_t)nat * sizeof(i16));
+        dcsv_decode(dstream, dlen, dc_lvl_rec, a->Az, a->Ay, a->Ax);
+        free(dstream);
         a->dc_sub = (i16 *)malloc((size_t)nat*sizeof(i16));
-        for (u32 i=0;i<nat;++i) a->dc_sub[i] = dc_dequant(dc_lvl[i], base);
+        for (u32 i=0;i<nat;++i) a->dc_sub[i] = dc_dequant(dc_lvl_rec[i], base);
+        free(dc_lvl_rec);
     }
 
     // shared-table-bytes only counted for SHARED above; M0 table cost rides inside
