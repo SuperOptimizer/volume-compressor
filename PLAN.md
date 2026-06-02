@@ -220,3 +220,23 @@ edge cases, fuzzing, the drop-in single-config build.
   byte-determinism is a non-goal). Target portable across x86-64/ARM via the *compiler*, not
   per-ISA code.
 ```
+
+---
+
+## 8. Phase-1 experiment results (measured on real PHerc Paris 4)
+
+All on the real scroll corpus, vs c3d/c4d references. Status: experiment matrix nearly complete.
+
+| Axis | Result | Decision |
+|---|---|---|
+| **Transform** | DCT-16³ best PSNR/MS-SSIM/GMSD + least blocking at 50-100×; 9/7 wavelet only wins at chunk=128 on edge metrics at 2.5-4× slowdown; ZFP-lift fast but quality collapses; DCT-8³ dominated | **integer DCT-16³** (also keeps 16³ random access) |
+| **Chunk size** | ratio flat 32³→128³ (compaction = the 16³ block, not the chunk); 256³ loses | size is an I/O knob; **≈128³ (8³ atoms)** |
+| **Entropy** | rANS+HF 3.2× over Phase-0; but on the 16³ whole-chunk path **table-free RLGR beats rANS big** (72× vs 39× @ q64) — per-chunk rANS table side-cost hurts sparse high-q payloads | **RLGR** (rANS only if tables shared across chunks later) |
+| **Chunk model** | independent-16³ = −50% cliff (confirmed); **M1 shared-static-table recovers ~all of it at touched=1** (full 16³ random access); cross-atom AC prediction buys ~0 (6/18/26-conn all ≈ M1-none); DC sub-volume ratio-neutral but kept for O(1) random access + banding-free | **M1 shared table + DC sub-volume + NO AC stencil**, raster, self-contained |
+| **16³ random access** | every config decodes one atom at touched=1, amortized 1.00× | preserved — it's the invariant |
+| **Healing** | adaptive deblock cuts seam-step 44-90% @ ≤0.2dB PSNR cost, fixes the reported smear/blocking; ~1.2GB/s | **mild deblock (strength 0.3-0.5)** default; CDEF optional hi-res only |
+| **vs c4d** | **GAP CLOSED**: M1-RLGR-16³ matches/beats c4d at every PSNR (35-43× @ 38dB vs c4d 39×; 72× vs 62× @ 35.5dB) — with DCT, no wavelet | at parity with the wavelet reference |
+| **Rate control** | (in progress) Lagrangian global-ratio allocator, per-chunk + per-16³ q-field | pending results |
+| **HF distortion paths** | (queued) plain MSE / HF-weighted / perceptual-in-loop | pending |
+
+**The winning config = the codec:** integer DCT-16³ atom · HF-protecting dead-zone quant + 3D freq-scan · table-free RLGR · M1 shared-table chunk (~128³) + DC sub-volume + per-block seek directory · mild deblock · Lagrangian per-16³ variable-q rate control. Full 16³ random access, banding-free, matches c4d ratio without a wavelet. The "DCT-vs-wavelet / random-access-vs-ratio" tradeoff dissolved — DCT-16³ achieves both.
