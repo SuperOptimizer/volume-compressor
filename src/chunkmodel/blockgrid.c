@@ -42,6 +42,10 @@ static u16 g_scan[AVOX];     // linear offset z*256+y*16+x of i-th scanned coeff
 static u16 g_fsum[AVOX];     // u+v+w of i-th scanned coeff (0..45)
 static f32 g_wt[AVOX];       // per-position HF-protecting step weight
 static int g_init = 0;
+// EG2024 band id of each freq-scan position for each split mode. band2[i]=DC/AC,
+// band3[i]=DC/lowAC/hiAC. Filled in scan_init (depends only on g_fsum, the scan).
+static u8  g_band2[AVOX];
+static u8  g_band3[AVOX];
 
 static void scan_init(void) {
     u32 w = 0;
@@ -56,7 +60,19 @@ static void scan_init(void) {
                 g_wt[w]  = 1.0f - 0.55f * t;      // HF-protecting (DC=1 .. HF~0.45)
                 ++w;
             }
+    for (u32 i = 0; i < AVOX; ++i) {
+        u32 fs = g_fsum[i];
+        g_band2[i] = (fs == 0) ? 0u : 1u;                       // DC | AC
+        g_band3[i] = (fs == 0) ? 0u : (fs <= VC_BAND_LO ? 1u : 2u); // DC|lo|hi
+    }
     g_init = 1;
+}
+// Number of bands and the per-position band map for a split mode.
+static inline u32 band_count(vc_band_split bs) {
+    return bs == VC_BAND_DC_LO_HI ? 3u : (bs == VC_BAND_DC_AC ? 2u : 1u);
+}
+static inline const u8 *band_map(vc_band_split bs) {
+    return bs == VC_BAND_DC_LO_HI ? g_band3 : g_band2; // unused when bs==NONE
 }
 static inline void ensure_init(void) { if (!g_init) scan_init(); }
 
@@ -232,6 +248,44 @@ static void rans_dec(i16 *q, size_t n, const u8 *in, size_t len, const rans_tabl
     }
 }
 
+// --- EG2024 (1): per-band shared-table coding. The atom's AVOX freq-scanned
+// levels are split into `nb` bands by the band map; each band's subsequence is
+// coded against its OWN shared table (tbl[band]). Layout: per band a u24 length
+// prefix then that band's rANS stream. Decode reverses it, scattering each band's
+// decoded levels back to their scan positions. Band-NONE callers use rans_enc.
+static size_t rans_enc_banded(u8 *out, size_t cap, const i16 *q, size_t n,
+                              const rans_table *tbl, const u8 *bmap, u32 nb) {
+    i16 *scratch = (i16 *)malloc(n * sizeof(i16));
+    if (!scratch) return 0;
+    size_t off = 0;
+    for (u32 b = 0; b < nb; ++b) {
+        size_t m = 0;
+        for (size_t i = 0; i < n; ++i) if (bmap[i] == b) scratch[m++] = q[i];
+        if (off + 3 > cap) { free(scratch); return 0; }
+        size_t plen = rans_enc(out + off + 3, cap - off - 3, scratch, m, &tbl[b]);
+        if (!plen && m) { free(scratch); return 0; }
+        out[off] = (u8)plen; out[off+1] = (u8)(plen>>8); out[off+2] = (u8)(plen>>16);
+        off += 3 + plen;
+    }
+    free(scratch);
+    return off;
+}
+static void rans_dec_banded(i16 *q, size_t n, const u8 *in, size_t len,
+                            const rans_table *tbl, const u8 *bmap, u32 nb) {
+    (void)len;
+    i16 *scratch = (i16 *)malloc(n * sizeof(i16));
+    size_t off = 0;
+    for (u32 b = 0; b < nb; ++b) {
+        size_t m = 0; for (size_t i = 0; i < n; ++i) if (bmap[i] == b) ++m;
+        size_t plen = (size_t)in[off] | ((size_t)in[off+1]<<8) | ((size_t)in[off+2]<<16);
+        off += 3;
+        if (m) rans_dec(scratch, m, in + off, plen, &tbl[b]);
+        off += plen;
+        size_t j = 0; for (size_t i = 0; i < n; ++i) if (bmap[i] == b) q[i] = scratch[j++];
+    }
+    free(scratch);
+}
+
 // RLGR (table-free) for the VC_ENT_RLGR mode — declared in blocks.h, lives in
 // entropy/rlgr.c (already in the build).
 size_t vc_rlgr_encode(u8 *restrict out, size_t cap, const i16 *restrict q, size_t n);
@@ -339,6 +393,9 @@ typedef struct {
 
 typedef struct {
     rans_table table;     // shared table (M1 / M0-per-atom unused field for RLGR)
+    rans_table btable[VC_NBAND_MAX];  // EG2024 (1): per-band shared tables
+    u8 uniform;           // EG2024 (4): chunk is a single value (skipped); val in uval
+    u8 uval;              // the constant value when uniform
     u8 *blob;             // concatenated atom payloads
     size_t blob_len;
     u32 a0z, a0y, a0x;    // chunk's atom-origin in the lattice
@@ -869,9 +926,17 @@ int vc_bg_encode(const u8 *vol, u32 dz, u32 dy, u32 dx,
         build_order(cfg->traversal, ca, order, rankc);
 
         u64 counts[NSYM]; memset(counts, 0, sizeof(counts));
+        // EG2024 (1): per-band histograms. bcounts[b] = histogram of band b's
+        // coefficients across the chunk. EG2024 (3): sparse prepass samples every
+        // `stride`-th atom for histogram building (the encoded payload still codes
+        // ALL atoms — only the table-fitting sample is sparsened).
+        u32 nb = band_count(cfg->band_split);
+        const u8 *bmap = band_map(cfg->band_split);
+        u64 (*bcounts)[NSYM] = (u64(*)[NSYM])calloc(VC_NBAND_MAX, sizeof(u64[NSYM]));
+        u32 prep = cfg->sparse_prepass ? cfg->sparse_prepass : 1u;
         // Pass 1: transform+quant every atom IN CODING ORDER, predict DC, store
         // levels, accumulate the chunk histogram for the shared table (M1).
-        u32 nstored = 0;
+        u32 nstored = 0; u32 hist_seen = 0;
         for (u32 k = 0; k < namax; ++k) {
             u32 lin = order[k];
             u32 lz = lin / (ca*ca), ly = (lin / ca) % ca, lx = lin % ca;
@@ -918,14 +983,75 @@ int vc_bg_encode(const u8 *vol, u32 dz, u32 dy, u32 dx,
             memcpy(qstore + (size_t)nstored*AVOX, qsc, AVOX*sizeof(i16));
             qstore[(size_t)nstored*AVOX + 0] = 0;
             dcq[nstored] = dc_resid; intraf[nstored] = (u8)was_intra;
-            rans_hist(qstore + (size_t)nstored*AVOX, AVOX, counts);
+            // sparse prepass: only every prep-th non-absent atom feeds the table.
+            if ((hist_seen++ % prep) == 0) {
+                const i16 *qh = qstore + (size_t)nstored*AVOX;
+                rans_hist(qh, AVOX, counts);
+                if (nb > 1) for (u32 i = 0; i < AVOX; ++i) {
+                    u32 u = zz(qh[i]); bcounts[bmap[i]][u < ESC ? u : ESC]++;
+                }
+            }
             nstored++;
         }
 
         // Build shared table once (M1). For M0 we rebuild per atom below.
+        // EG2024 (3) sparse prepass: the table is fit to a SAMPLE, so a symbol that
+        // occurs in an un-sampled atom could get freq 0 and break rANS. Laplace-
+        // smooth (every 0..254 symbol gets a floor count) so coverage is total.
+        // This is the standard fix and keeps the encode-time saving (we still only
+        // histogram the sample). ESC (255) is the catch-all bypass and never zero.
         if (cfg->entropy == VC_ENT_RANS_SHARED) {
-            rt_build(&C->table, counts);
-            st->table_bytes += NSYM * 2;     // serialized 12-bit freqs
+            if (prep > 1) {
+                for (u32 s = 0; s < ESC; ++s) {
+                    counts[s] += 1;
+                    for (u32 b = 0; b < nb; ++b) bcounts[b][s] += 1;
+                }
+            }
+            if (nb > 1) {
+                for (u32 b = 0; b < nb; ++b) rt_build(&C->btable[b], bcounts[b]);
+                st->table_bytes += (size_t)nb * NSYM * 2;   // one table per band
+            } else {
+                rt_build(&C->table, counts);
+                st->table_bytes += NSYM * 2;     // serialized 12-bit freqs
+            }
+        }
+        free(bcounts);
+
+        // EG2024 (4): skip metadata. Charge a tiny per-chunk index (min,max =2B +
+        // 1 uniform flag bit). If the whole chunk reconstructs to a single value
+        // (every atom absent, OR a constant-value chunk that quantized to DC-only
+        // zero-AC + identical DC), flag it uniform and store ONE value instead of
+        // the atom blobs+directory. We detect the cheap, common case: all atoms
+        // absent (pure air) — extended to "all atoms have zero AC and equal DC".
+        if (cfg->skip_meta) {
+            st->skip_meta_bytes += 3;        // min(1)+max(1)+flags(1) per chunk
+            int uni = 1; i16 dc0 = 0; int have = 0;
+            for (u32 s = 0; s < nstored && uni; ++s) {
+                const i16 *q = qstore + (size_t)s*AVOX;
+                for (u32 i = 1; i < AVOX; ++i) if (q[i]) { uni = 0; break; }
+            }
+            // uniform DC across the chunk's atoms (use reconstructed dc_coef)
+            if (uni) {
+                u32 s2 = 0;
+                for (u32 k = 0; k < namax && uni; ++k) {
+                    u32 lin = order[k];
+                    u32 lz=lin/(ca*ca), ly=(lin/ca)%ca, lx=lin%ca;
+                    if (lz>=C->caz||ly>=C->cay||lx>=C->cax) continue;
+                    u32 gz=C->a0z+lz, gy=C->a0y+ly, gx=C->a0x+lx;
+                    i16 d = a->atoms[lat_idx(a,gz,gy,gx)].dc_coef;
+                    if (!have) { dc0 = d; have = 1; } else if (d != dc0) uni = 0;
+                    s2++;
+                }
+            }
+            if (uni && nstored > 0) {
+                C->uniform = 1;
+                // reconstructed constant byte value: inverse-DCT of a DC-only atom
+                // is flat; recover one sample via the volume directly (origin atom).
+                C->uval = vol[((size_t)(C->a0z*A)*dy + (C->a0y*A))*dx + C->a0x*A];
+                C->blob = NULL; C->blob_len = 0;
+                st->n_uniform_chunks++;
+                continue;     // skip Pass 2 + directory entirely for this chunk
+            }
         }
 
         // Pass 2: entropy-code each stored atom into the chunk blob; record range.
@@ -945,6 +1071,8 @@ int vc_bg_encode(const u8 *vol, u32 dz, u32 dy, u32 dx,
             size_t plen;
             if (cfg->entropy == VC_ENT_RLGR) {
                 plen = vc_rlgr_encode(pay, cap, q, AVOX);
+            } else if (cfg->entropy == VC_ENT_RANS_SHARED && nb > 1) {
+                plen = rans_enc_banded(pay, cap, q, AVOX, C->btable, bmap, nb);
             } else if (cfg->entropy == VC_ENT_RANS_SHARED) {
                 plen = rans_enc(pay, cap, q, AVOX, &C->table);
             } else { // M0 independent: own table per atom
@@ -1048,8 +1176,11 @@ static void decode_one_atom_levels(const vc_bg_archive *a, const bg_chunk *C,
                                     const bg_atom *at, i16 *qsc) {
     if (at->absent) { memset(qsc, 0, AVOX*sizeof(i16)); return; }
     const u8 *p = C->blob + at->off;
+    u32 nb = band_count(a->cfg.band_split);
     if (a->cfg.entropy == VC_ENT_RLGR) {
         vc_rlgr_decode(qsc, AVOX, p, at->len);
+    } else if (a->cfg.entropy == VC_ENT_RANS_SHARED && nb > 1) {
+        rans_dec_banded(qsc, AVOX, p, at->len, C->btable, band_map(a->cfg.band_split), nb);
     } else if (a->cfg.entropy == VC_ENT_RANS_SHARED) {
         rans_dec(qsc, AVOX, p, at->len, &C->table);
     } else {
@@ -1127,6 +1258,17 @@ int vc_bg_decode(const vc_bg_archive *a, u8 *vol) {
     for (u32 cx = 0; cx < a->ncx; ++cx, ++ci) {
         const bg_chunk *C = &a->chunks[ci];
         build_order(a->cfg.traversal, ca, order, rankc);
+        // EG2024 (4): uniform (skipped) chunk -> fill its voxel span with uval.
+        if (C->uniform) {
+            for (u32 lz=0; lz<C->caz; ++lz)
+            for (u32 ly=0; ly<C->cay; ++ly)
+            for (u32 lx=0; lx<C->cax; ++lx) {
+                memset(avox, C->uval, AVOX);
+                scatter_atom(vol, avox, a->dz, a->dy, a->dx,
+                             C->a0z+lz, C->a0y+ly, C->a0x+lx);
+            }
+            continue;
+        }
         for (u32 k = 0; k < namax; ++k) {
             u32 lin = order[k];
             u32 lz = lin/(ca*ca), ly=(lin/ca)%ca, lx=lin%ca;
@@ -1302,6 +1444,8 @@ int vc_bg_decode_atom(const vc_bg_archive *a, u32 az, u32 ay, u32 ax,
     u32 gi = lat_idx(a, az, ay, ax);
     const bg_atom *at = &a->atoms[gi];
     const bg_chunk *C = &a->chunks[chunk_of(a,az,ay,ax)];
+    if (C->uniform) { memset(atom_out, C->uval, AVOX); *touched = 1;
+        free(qsc);free(coef);free(rank_lat);free(mc.dc);free(mc.state); return 0; }
     if (at->absent) { memset(atom_out, 0, AVOX); *touched = 1;
         free(qsc);free(coef);free(rank_lat);free(mc.dc);free(mc.state); return 0; }
 
