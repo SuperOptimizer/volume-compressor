@@ -9,6 +9,8 @@
 // --- Transform (transform/*.c) ---------------------------------------------
 void vc_dct_int8_fwd(i16 *restrict coef, const u8 *restrict vox, i32 dc);
 void vc_dct_int8_inv(u8 *restrict vox, const i16 *restrict coef, i32 dc);
+void vc_dct_int16_fwd(i16 *restrict coef, const u8 *restrict vox, i32 dc);
+void vc_dct_int16_inv(u8 *restrict vox, const i16 *restrict coef, i32 dc);
 
 // --- Entropy (entropy/*.c) -------------------------------------------------
 // All share the VC_ENTROPY_ENC/DEC contract (see config.h). rice = Phase-0

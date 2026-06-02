@@ -17,6 +17,7 @@ set(VC_CHUNK_SIDE "64" CACHE STRING "chunk edge in voxels (32/64/128/256)")
 #   VC_QWEIGHT: 0 (flat) | 1 (HF-protecting) | 2 (content-adaptive)
 set(VC_ENTROPY "rice" CACHE STRING "entropy coder: rice|rlgr|rans")
 set(VC_QWEIGHT "0" CACHE STRING "quant HF weighting: 0 flat|1 HF|2 adaptive")
+set(VC_TRANSFORM "dct8" CACHE STRING "transform: dct8|dct16")
 
 add_compile_options(-O3 -ffp-contract=fast -ffast-math -Wall -Wextra)
 add_compile_definitions(VC_CHUNK_SIDE=${VC_CHUNK_SIDE})
@@ -43,15 +44,30 @@ if(VC_VEC_REPORT)
   endif()
 endif()
 
+if(VC_TRANSFORM STREQUAL "dct8")
+  set(VC_TRANSFORM_SRC src/transform/dct_int.c)
+elseif(VC_TRANSFORM STREQUAL "dct16")
+  set(VC_TRANSFORM_SRC src/transform/dct_int16.c)
+  add_compile_definitions(VC_TRANSFORM_FWD=vc_dct_int16_fwd
+                          VC_TRANSFORM_INV=vc_dct_int16_inv
+                          VC_CODEC_TAG_TRANSFORM=2)
+else()
+  message(FATAL_ERROR "VC_TRANSFORM must be dct8|dct16")
+endif()
+
 set(VC_SRC
   src/codec.c
-  src/transform/dct_int.c
+  ${VC_TRANSFORM_SRC}
   src/entropy/rice.c
   src/entropy/rlgr.c
   src/entropy/rans_static.c
   src/quant/subband.c
   src/ratectrl/fixed.c
+  src/ratectrl/lagrangian.c
   src/metrics/metrics.c
+  src/healing/none.c
+  src/healing/deblock.c
+  src/healing/cdef.c
 )
 
 add_library(vc STATIC ${VC_SRC})
@@ -68,6 +84,13 @@ target_link_libraries(vc_test PRIVATE vc)
 add_executable(vc_test_entropy tests/test_entropy.c)
 target_link_libraries(vc_test_entropy PRIVATE vc)
 
+# --- Boundary-healing (healing/) tests + bench -----------------------------
+add_executable(vc_test_healing tests/test_healing.c)
+target_link_libraries(vc_test_healing PRIVATE vc)
+
+add_executable(bench_healing harness/bench_healing.c)
+target_link_libraries(bench_healing PRIVATE vc)
+
 # --- Phase-1 transform bake-off (transform/ work; self-contained) ----------
 # These targets #include the candidate transform .c files directly with renamed
 # symbols, so they do not need the dct_int.c already inside libvc; only metrics +
@@ -80,7 +103,40 @@ add_executable(bench_transforms harness/bench_transforms.c src/metrics/metrics.c
 target_include_directories(bench_transforms PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(bench_transforms PRIVATE m)
 
+# --- Rate-control allocator (ratectrl/) tests + bench ----------------------
+# Guarded so an as-yet-uncreated source (in-progress on another branch) doesn't
+# break configure for everyone.
+if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_ratectrl.c)
+  add_executable(vc_test_ratectrl tests/test_ratectrl.c)
+  target_link_libraries(vc_test_ratectrl PRIVATE vc)
+endif()
+
+if(EXISTS ${CMAKE_SOURCE_DIR}/harness/bench_ratectrl.c)
+  add_executable(bench_ratectrl harness/bench_ratectrl.c)
+  target_link_libraries(bench_ratectrl PRIVATE vc)
+endif()
+
+# --- Phase-1 chunk-model (block-grid) bake-off (src/chunkmodel/) ------------
+# Self-contained engine: blockgrid.c #includes dct_int16.c (renamed) and links
+# rlgr.c + metrics.c. Does NOT touch codec.c. Runtime-parameterized so one binary
+# sweeps the {stencil x traversal x edge x chunk-size x entropy} matrix.
+set(VC_CM_SRC
+  src/chunkmodel/blockgrid.c
+  src/entropy/rlgr.c
+  src/metrics/metrics.c
+)
+add_executable(vc_test_chunkmodel tests/test_chunkmodel.c ${VC_CM_SRC})
+target_include_directories(vc_test_chunkmodel PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(vc_test_chunkmodel PRIVATE m)
+
+add_executable(bench_chunkmodel harness/bench_chunkmodel.c ${VC_CM_SRC})
+target_include_directories(bench_chunkmodel PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(bench_chunkmodel PRIVATE m)
+
 enable_testing()
 add_test(NAME roundtrip COMMAND vc_test)
+add_test(NAME ratectrl COMMAND vc_test_ratectrl)
 add_test(NAME entropy COMMAND vc_test_entropy)
 add_test(NAME transforms COMMAND vc_test_transforms)
+add_test(NAME healing COMMAND vc_test_healing)
+add_test(NAME chunkmodel COMMAND vc_test_chunkmodel)

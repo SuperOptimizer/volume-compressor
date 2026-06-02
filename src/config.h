@@ -26,8 +26,10 @@
 // Operates on one VC_CHUNK_SIDE^3 cube. `dc` is the per-chunk DC bias removed
 // before / added after the transform. coef is a chunk-sized i16 SoA buffer in
 // the transform's own coefficient layout (the inverse must match the forward).
+#ifndef VC_TRANSFORM_FWD
 #define VC_TRANSFORM_FWD  vc_dct_int8_fwd
 #define VC_TRANSFORM_INV  vc_dct_int8_inv
+#endif
 
 // --- Quantizer + scan (quant/*.c) ------------------------------------------
 // Contract:
@@ -79,7 +81,9 @@
 
 // --- Codec tag recorded in the archive header ------------------------------
 // Identifies the active pipeline so a decoder validates it matches the build.
+#ifndef VC_CODEC_TAG_TRANSFORM
 #define VC_CODEC_TAG_TRANSFORM 1   /* int-DCT 8^3 */
+#endif
 #ifndef VC_CFG_ENTROPY_TAG
 #define VC_CFG_ENTROPY_TAG 1       /* 1=Rice 2=RLGR 3=rANS (set by CMake) */
 #endif
