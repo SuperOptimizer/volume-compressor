@@ -71,6 +71,27 @@ int main(int argc, char **argv) {
     int nl=0; vc_dims t; for (int l=0;l<8;l++){ if(vc_lod_dims(a,l,&t)==VC_OK){nl++; } }
     printf("%d\n", nl);
 
+    // ABSENT chunk path: a 256^3-ish volume with a whole empty chunk region.
+    {
+        vc_dims bd = { 256, 64, 64 };
+        size_t bn = (size_t)bd.nx*bd.ny*bd.nz;
+        unsigned char *bv = calloc(bn,1); // all zero -> absent chunks
+        // put structure only in first 128 voxels of x
+        for (unsigned z=0;z<bd.nz;z++) for (unsigned y=0;y<bd.ny;y++) for (unsigned x=0;x<128;x++)
+            bv[((size_t)z*bd.ny+y)*bd.nx+x] = (unsigned char)(100+30*sin(x*0.2));
+        unsigned char *ba; size_t bl;
+        vc_encode(bv, bd, 30.0f, &ba, &bl);
+        vc_archive *bA = vc_open(ba,bl);
+        unsigned char *bo = malloc(bn);
+        vc_decode_lod(bA,0,bo,NULL);
+        // check an atom in the empty region decodes to 0
+        unsigned char eatom[4096]; vc_decode_atom(bA,0,12,0,0,eatom);
+        int ez=1; for(int i=0;i<4096;i++) if(eatom[i]!=0) ez=0;
+        printf("absent-chunk atom zero: %s  (absent-region ratio=%.1f)\n", ez?"OK":"FAIL",(double)bn/bl);
+        if(!ez) mismatch++;
+        vc_close(bA); free(ba); free(bv); free(bo);
+    }
+
     int ok = (mismatch==0) && upass && (psnr(vol,out,n) > 25.0);
     printf("RESULT: %s\n", ok?"PASS":"FAIL");
     vc_close(a); free(arc); free(vol); free(out);

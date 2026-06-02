@@ -618,6 +618,7 @@ static void encode_member(const u8 *vol, vc_dims d, float base_q, bbuf *arc,
     u32 nchunks = ccx * ccy * ccz;
     atom_dir **dirs = (atom_dir **)vc_xcalloc(nchunks, sizeof(atom_dir *));
     u32 *chunk_natoms = (u32 *)vc_xcalloc(nchunks, sizeof(u32));
+    u8  *chunk_absent = (u8 *)vc_xcalloc(nchunks, sizeof(u8));
 
     u8 atom[A3];
     for (u32 cz = 0; cz < ccz; ++cz)
@@ -648,6 +649,11 @@ static void encode_member(const u8 *vol, vc_dims d, float base_q, bbuf *arc,
             e->length = len;
             e->offset = uni ? 0 : off; // pay-relative; patched to member-relative below
         }
+        // ABSENT-chunk detection (plan §4): entire chunk uniform with fill (0).
+        int all_absent = 1;
+        for (u32 k = 0; k < na; ++k)
+            if (!((dir[k].flags & AF_UNIFORM) && dir[k].uval == 0)) { all_absent = 0; break; }
+        chunk_absent[ci] = (u8)all_absent;
     }
 
     // Write member header
@@ -656,8 +662,10 @@ static void encode_member(const u8 *vol, vc_dims d, float base_q, bbuf *arc,
     bb_u32(&hdr, acx); bb_u32(&hdr, acy); bb_u32(&hdr, acz);
     bb_u32(&hdr, ccx); bb_u32(&hdr, ccy); bb_u32(&hdr, ccz);
     bb_put(&hdr, &base_q, 4);
-    // chunk directories
+    // chunk directories. Sentinel n_atoms = 0xFFFFFFFF marks an ABSENT chunk
+    // (entirely fill/zero) with NO atom entries and zero payload (plan §4).
     for (u32 ci = 0; ci < nchunks; ++ci) {
+        if (chunk_absent[ci]) { bb_u32(&hdr, 0xFFFFFFFFu); continue; }
         bb_u32(&hdr, chunk_natoms[ci]);
         for (u32 ai = 0; ai < chunk_natoms[ci]; ++ai) {
             atom_dir *e = &dirs[ci][ai];
@@ -680,7 +688,8 @@ static void encode_member(const u8 *vol, vc_dims d, float base_q, bbuf *arc,
         size_t pos = 0;
         pos += 9*4 + 4; // 9 u32 + f32 base_q
         for (u32 ci = 0; ci < nchunks; ++ci) {
-            pos += 4; // n_atoms u32
+            pos += 4; // n_atoms u32 (or sentinel)
+            if (chunk_absent[ci]) continue;
             for (u32 ai = 0; ai < chunk_natoms[ci]; ++ai) {
                 atom_dir *e = &dirs[ci][ai];
                 u64 newoff = (e->flags & AF_UNIFORM) ? 0 : (pay_base + e->offset);
@@ -698,7 +707,7 @@ static void encode_member(const u8 *vol, vc_dims d, float base_q, bbuf *arc,
     rec->length = arc->len - member_start;
 
     for (u32 ci = 0; ci < nchunks; ++ci) free(dirs[ci]);
-    free(dirs); free(chunk_natoms);
+    free(dirs); free(chunk_natoms); free(chunk_absent);
     free(hdr.p); free(pay.p);
 }
 
@@ -856,10 +865,15 @@ static vc_status find_atom_entry(const u8 *m, const member_rec *r,
     const u8 *p = member_dir_base(m, r);
     u32 target = (cz*r->ccy + cy)*r->ccx + cx;
     for (u32 ci = 0; ci < target; ++ci) {
-        u32 na = rd_u32(p);
-        p += 4 + (u64)na * 16;
+        u32 na = rd_u32(p); p += 4;
+        if (na == 0xFFFFFFFFu) continue; // ABSENT chunk: no entries
+        p += (u64)na * 16;
     }
     u32 na = rd_u32(p); p += 4;
+    if (na == 0xFFFFFFFFu) { // target chunk ABSENT
+        *off = ABSENT; *len = 0; *flags = AF_ABSENT; *uval = 0; *dc = 0;
+        return VC_OK;
+    }
     // local atom index within chunk: need chunk's atom extents
     u32 ax0 = cx*CHUNK_ATOMS, ay0 = cy*CHUNK_ATOMS;
     u32 axn = r->acx - ax0; if (axn > CHUNK_ATOMS) axn = CHUNK_ATOMS;
