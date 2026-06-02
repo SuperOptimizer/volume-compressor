@@ -69,9 +69,8 @@ int main(int argc,char**argv){
         vc_archive *a=vc_open(arc,alen);
         unsigned char *out=malloc(n);
         double t1=now_s(); vc_decode_lod(a,0,out,NULL); double td=now_s()-t1;
-        // LOD0 compressed size only (for ratio vs raw LOD0)
-        vc_dims l0; vc_lod_dims(a,0,&l0);
-        // measure LOD0 member size
+        // count LOD members + their dims
+        int nl=0; vc_dims ld; for(int l=0;l<8;l++) if(vc_lod_dims(a,l,&ld)==VC_OK) nl++;
         double ratio=(double)n/alen; // whole archive incl pyramid
         double ps=psnr(vol,out,n);
         double ss=ssim_slice(vol,out,d.nx,d.ny,d.nz);
@@ -82,8 +81,8 @@ int main(int argc,char**argv){
         double t2=now_s();
         for(int r=0;r<reps;r++){int ax=rand()%16,ay=rand()%16,az=rand()%16; vc_decode_atom(a,0,ax,ay,az,atom);}
         double atom_us=(now_s()-t2)/reps*1e6;
-        printf("%5.0fx  %7.2fx %7.2f %7.4f %7.4f %8.1f %8.1f %7.2f %10.2f\n",
-               targets[t],ratio,ps,ss,gm,enc_mbs,dec_mbs,atom_us,alen/1e6);
+        printf("%5.0fx  %7.2fx %7.2f %7.4f %7.4f %8.1f %8.1f %7.2f %10.3f  (LODs=%d)\n",
+               targets[t],ratio,ps,ss,gm,enc_mbs,dec_mbs,atom_us,alen/1e6,nl);
         vc_close(a); free(arc); free(out);
     }
     free(vol); return 0;
