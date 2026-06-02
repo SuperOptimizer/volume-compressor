@@ -72,8 +72,13 @@ static int one(u32 d, u32 h, u32 w, int kind, vc_bg_cfg cfg, const char *name) {
     }
     printf("  %-30s PSNR=%.2f ratio=%.1f RA_match=%d maxtouch=%u\n",
            name, m.psnr, ratio, ra_ok, maxtouch);
+    // Curve-group + DC-sub-volume + no-stencil paths MUST keep touched==1.
+    int touch_ok = 1;
+    if (cfg.group_mode == VC_GROUP_CURVE || cfg.dc_subvol
+        || cfg.stencil == VC_STENCIL_NONE)
+        touch_ok = (maxtouch == 1);
     vc_bg_free(a); free(vol); free(rec);
-    return (m.psnr > 24.0 && ra_ok) ? 0 : 1;
+    return (m.psnr > 24.0 && ra_ok && touch_ok) ? 0 : 1;
 }
 
 int main(void) {
@@ -111,6 +116,57 @@ int main(void) {
 
     // Unaligned shape (edge padding path)
     c=base; c.stencil=VC_STENCIL_6; CHECK(one(100,70,53,1,c,"6-conn unaligned")==0,"unaligned");
+
+    // --- CURVE-GROUP mode (curve-groups experiment): round-trip + RA, touched=1.
+    // Sharing scope = N consecutive atoms along a global curve, no chunk boxes.
+    vc_bg_cfg cg = { VC_STENCIL_NONE, VC_TRAV_MORTON, VC_EDGE_SELF,
+                     VC_ENT_RANS_SHARED, 8, 1, 8.0f, 0, VC_GROUP_CURVE, 64 };
+    c=cg; c.traversal=VC_TRAV_MORTON;  c.entropy=VC_ENT_RANS_SHARED; c.group_n=64;
+        CHECK(one(128,128,128,0,c,"curve Morton N=64 rans")==0,"curve-morton-64-rans");
+    c=cg; c.traversal=VC_TRAV_HILBERT; c.entropy=VC_ENT_RANS_SHARED; c.group_n=256;
+        CHECK(one(128,128,128,1,c,"curve Hilbert N=256 rans")==0,"curve-hilbert-256-rans");
+    c=cg; c.traversal=VC_TRAV_HILBERT; c.entropy=VC_ENT_RLGR;        c.group_n=512;
+        CHECK(one(128,128,128,1,c,"curve Hilbert N=512 rlgr")==0,"curve-hilbert-512-rlgr");
+    c=cg; c.traversal=VC_TRAV_MORTON;  c.entropy=VC_ENT_RLGR;        c.group_n=256;
+        CHECK(one(100,70,53,2,c,"curve Morton N=256 rlgr unaligned")==0,"curve-morton-256-unaligned");
+
+    // --- THREE-LEVEL HIERARCHY variants (E1 table-delta, E2 base, I1 drift, B1
+    // DC-curve-pred, I2 nested). Each must round-trip + keep random access touched=1.
+    // E1: group-to-group table DELTA (rANS only; affects bytes, must round-trip).
+    c=cg; c.entropy=VC_ENT_RANS_SHARED; c.traversal=VC_TRAV_HILBERT; c.group_n=64;
+        c.table_coding=VC_TABLE_DELTA;
+        CHECK(one(128,128,128,0,c,"curve Hilbert N=64 rans E1-tabledelta")==0,"E1-table-delta");
+    // E2: coarse super-group base table + per-group delta.
+    c=cg; c.entropy=VC_ENT_RANS_SHARED; c.traversal=VC_TRAV_HILBERT; c.group_n=64;
+        c.table_coding=VC_TABLE_BASE;
+        CHECK(one(128,128,128,1,c,"curve Hilbert N=64 rans E2-base")==0,"E2-base");
+    // I1: drift-adaptive group boundaries (variable size).
+    c=cg; c.entropy=VC_ENT_RANS_SHARED; c.traversal=VC_TRAV_HILBERT; c.group_n=256;
+        c.boundary=VC_BOUND_DRIFT; c.drift_thresh=0.15f;
+        CHECK(one(128,128,128,1,c,"curve Hilbert drift rans")==0,"I1-drift-rans");
+    c=cg; c.entropy=VC_ENT_RLGR; c.traversal=VC_TRAV_MORTON; c.group_n=256;
+        c.boundary=VC_BOUND_DRIFT; c.drift_thresh=0.10f;
+        CHECK(one(100,70,53,2,c,"curve Morton drift rlgr unaligned")==0,"I1-drift-rlgr-unaligned");
+    // I1+E1 combined (the spec's likely-winner shape).
+    c=cg; c.entropy=VC_ENT_RANS_SHARED; c.traversal=VC_TRAV_HILBERT; c.group_n=128;
+        c.boundary=VC_BOUND_DRIFT; c.drift_thresh=0.15f; c.table_coding=VC_TABLE_DELTA;
+        CHECK(one(128,128,128,0,c,"curve Hilbert drift+E1 rans")==0,"I1+E1");
+    // B1: DC-only curve-predecessor prediction (touched must stay 1).
+    c=cg; c.entropy=VC_ENT_RANS_SHARED; c.traversal=VC_TRAV_HILBERT; c.group_n=256;
+        c.dc_pred_curve=1;
+        CHECK(one(128,128,128,0,c,"curve Hilbert N=256 B1-dcpred")==0,"B1-dc-pred");
+    c=cg; c.entropy=VC_ENT_RLGR; c.traversal=VC_TRAV_MORTON; c.group_n=64;
+        c.dc_pred_curve=1;
+        CHECK(one(100,70,53,1,c,"curve Morton B1-dcpred unaligned")==0,"B1-dc-pred-unaligned");
+    // I2: nested sub-groups (index overhead; must still round-trip).
+    c=cg; c.entropy=VC_ENT_RANS_SHARED; c.traversal=VC_TRAV_HILBERT; c.group_n=256;
+        c.nested_sub=16;
+        CHECK(one(128,128,128,1,c,"curve Hilbert N=256 I2-nested")==0,"I2-nested");
+    // Full stack: drift + E1 + B1 + Hilbert.
+    c=cg; c.entropy=VC_ENT_RANS_SHARED; c.traversal=VC_TRAV_HILBERT; c.group_n=128;
+        c.boundary=VC_BOUND_DRIFT; c.drift_thresh=0.15f; c.table_coding=VC_TABLE_DELTA;
+        c.dc_pred_curve=1;
+        CHECK(one(128,128,128,0,c,"curve full-stack rans")==0,"full-stack");
 
     printf(fail ? "\nSOME TESTS FAILED\n" : "\nALL TESTS PASSED\n");
     return fail;

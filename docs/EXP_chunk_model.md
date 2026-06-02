@@ -1,4 +1,27 @@
-# Experiment Spec: Chunk Model — recovering ratio while keeping 16³ random access
+# Experiment Spec: Block-Grid Model — recovering ratio while keeping 16³ random access
+
+> **Foundational model (user 2026-06-02): the 16³ block is THE ONE TRUE ATOM; everything else
+> is RELATIVE to it.** The atom is the decode = transform (DCT-16³) = cache = access = quant =
+> prediction-node unit. Fixed/absolute. The data is ONE continuous volume; the codec operates
+> on a **global 3D lattice of 16³ atoms**, with prediction & entropy context flowing across it
+> by a **stencil**, INDEPENDENT of where chunk walls fall. A **chunk is purely "N atoms bundled
+> for I/O"** (shared header + seek directory) — NOT a hard codec wall. "Do we need a neighbor
+> atom's data to decode this one?" is a *data-availability* question (halo/fetch), NOT a coding
+> boundary. Three orthogonal swept axes fall out, plus an I/O knob:
+> - **(A) prediction stencil** — how much spatial neighborhood the coding uses: {none, 6-conn, 18-conn, 26-conn}.
+> - **(B) atom traversal order** — the order atoms are coded across the grid: {raster ZYX, Morton/Z-order, Hilbert}.
+> - **(C) edge data-availability** — how neighbor data is supplied at a storage boundary: {self-contained, halo, fetch-neighbor}.
+> - **chunk size** = atoms-per-bundle (4³=64³, 8³=128³, …) — a separate I/O-amortization knob.
+>
+> **Two distinct "zigzags," both tested:** (1) coefficient scan WITHIN a 16³ atom — 3D-zigzag by
+> (u+v+w) frequency so quantized-zero HF coeffs form long runs for the entropy coder (classic
+> DCT ratio trick; entropy agent builds this). (2) atom TRAVERSAL order across the grid (axis B)
+> — a space-filling curve (Morton/Hilbert) so consecutively-coded atoms are spatial neighbors →
+> causal prediction/context lands on true neighbors (ratio↑) + neighborhood fetches contiguous
+> (I/O↑). Morton recursion = "2×2×2 groups of atoms" maps a chunk to a contiguous curve run
+> cleanly; seek directory still gives O(1) random access (index by Morton code). A,B interact:
+> a space-filling order makes a *causal* stencil far more effective (more stencil neighbors are
+> already-coded + near).
 
 **Status:** queued (depends on the entropy bake-off landing first — see §1).
 **Owner:** a Phase-1 agent, after the entropy experiment commits.
@@ -25,10 +48,13 @@ The crux tension: **more shared state → more ratio, but more you must "replay"
 |---|---|---|---|
 | **M0 independent-16³** (reference cliff, measure briefly to confirm) | each 16³ block self-contained: own table/param + own byte range | trivial (block bytes only) | ~−50% (the cliff) |
 | **M1 shared-static-table** *(leading candidate)* | one entropy table/param set per *chunk*, stored once in chunk header; each 16³ block entropy-coded into its **own seekable byte range** against that shared table; per-block DC kept but cheap | cheap: load chunk header (table) + block byte range | target ≈ −10% (recovers the table-overhead part) |
-| **M2 shared-adaptive-state** | coder adaptation carries across blocks in scan order | expensive: must replay blocks 0..N−1 to decode block N | best ratio, but **breaks cheap random access** |
-| **M3 cross-block-prediction** | block N predicted from decoded neighbors | most expensive: need neighbors decoded | best ratio, **breaks random access hardest** |
+| **M2 shared-adaptive-state** | coder adaptation carries across blocks in scan order | expensive: must replay blocks 0..N−1 to decode block N | best ratio, but **breaks cheap random access** (upper-bound reference only) |
+| **M3a 6-connected prediction, INTRA-CHUNK only** *(strong candidate — user-proposed)* | each 16³ block predicted from its ≤6 face-neighbors *within the same chunk*; face-blocks at the chunk boundary fall back to no/intra prediction | decode ≤7 blocks per target; **cached + neighborhood access → ~1× amortized** (the 6 neighbors are blocks you'll want next anyway) | **YES — fully self-contained, no cross-chunk fetch, no halo** |
+| **M3b 6-connected prediction, with HALO** | as M3a but face-blocks predict across the chunk edge using a thin stored boundary halo | ≤7 blocks + halo read (halo is in-chunk) | yes (halo stored in chunk) |
+| **M3c 6-connected, FETCH neighbor chunks** | face/edge/corner blocks fetch 1–3 neighbor chunks' edges | ≤7 blocks + neighbor-chunk fetch | no (cross-chunk dependency) |
 
-**Hypothesis:** M1 captures most of the recoverable ratio (the c4d cliff was dominated by per-block *table* overhead, which M1 amortizes) while preserving cheap 16³ seek. M2/M3 add a little more ratio but forfeit the 16³-random-access invariant, so they're measured only to quantify what we're *choosing to give up* (and may be offered as a separate "archival, no-random-access" config).
+**Revised hypothesis (after user note 2026-06-02):** cross-block prediction is NOT off the table — it's a spectrum, and "decode ~7 blocks to get 1" is absorbed by the cache + neighborhood access pattern (≈1× amortized when sweeping a region; the 7× only bites for a truly isolated single-block fetch, which is rare). Key geometric fact: **the bigger the chunk, the larger the fraction of pure-INTERIOR blocks** (all 6 neighbors in-chunk → full prediction, zero cross-chunk dependency) — so prediction is *another* reason a large chunk earns its keep. **M3a is the likely sweet spot**: keeps chunks fully self-contained (no neighbor fetch, no halo storage), gains prediction on all interior blocks, decode cost absorbed by cache. M1 = the no-prediction baseline; M3b = recover face-block prediction via stored halo (small redundancy); M3c probably not worth the cross-chunk dependency; M2 = upper-bound reference only.
+**Decision number additions:** ratio(M3a)/ratio(M1) — how much does intra-chunk prediction buy? And the *amortized* 16³ decode cost of M3a under a neighborhood-sweep access trace (not isolated single-block). If M3a buys meaningful ratio at ~1× amortized decode, it beats M1.
 
 ---
 
@@ -75,6 +101,7 @@ Report per cell:
 2. **Per-block DC**: independent per-16³ DC subtraction causes DC steps at 16³ faces (banding). Test a **shared/predicted DC reference** in the chunk header (block stores a small delta) vs independent per-block DC — does it cut GMSD/seam-step at near-zero ratio cost?
 3. **Chunk-size knee**: c4d saw 256³→64³ ≈ −10%. With M1, where does the amortization curve flatten? Pick the chunk size at the knee (likely 64³–128³) — big enough to amortize the shared header, not so big that fetch granularity / padding waste hurts.
 4. **Directory overhead**: N × {offset,len,q,flags} per chunk. At 16³ blocks in a 128³ chunk that's 512 entries — quantify the directory's byte cost as a fraction of payload; compress it if needed (it's cheap: monotonic offsets → delta-code).
+5. **DC sub-volume (JPEG-XL "DC frame" trick)** *(added 2026-06-02 from lit. review)*: code ALL atoms' DC together as a separate, globally-predicted DC SUB-VOLUME (one DC level/atom, an Az·Ay·Ax mini-volume, raster left/up/front-predicted + rANS), decoded ONCE; each atom then stores AC only and looks up its DC. Decouples DC prediction from atom decode order → preserves O(1) 16³ random access. **SETTLED** (`cfg.dc_subvol`, see `harness/CHUNKMODEL_RESULTS.md`): ratio-neutral vs M1 on this DCT-16³ pipeline (the shared table already captures the DC redundancy the DC-frame would), but it is the recommended design — touched=1 / amortized-decode=1.00 with strictly simpler random access (no prediction-ancestor cone) and banding-free DC by construction. Cross-atom **AC** stencils (6/18/26-conn) confirmed ~0 ratio gain — dropped.
 
 ---
 

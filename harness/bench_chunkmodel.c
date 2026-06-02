@@ -75,6 +75,9 @@ static void run_cell(const char*input,const u8*vol,u32 D,u32 H,u32 W,
     double seam=seam16(vol,rec,D,H,W);
     double ratio=(double)((size_t)D*H*W)/st.total_bytes;
     double raw=(double)((size_t)D*H*W)/1e6;
+    // group-header overhead = (shared table + seek directory) as % of payload.
+    double hdr_pct = st.payload_bytes ?
+        100.0*(double)(st.table_bytes+st.directory_bytes)/(double)st.payload_bytes : 0;
     double enc=raw/(t1-t0), dec=raw/(t2-t1);
 
     // Single-atom random-access decode cost (avg touched + time/atom).
@@ -95,8 +98,11 @@ static void run_cell(const char*input,const u8*vol,u32 D,u32 H,u32 W,
     vc_bg_decode_region(a,bz,by,bx,bz+4,by+4,bx+4,&totdec,&box);
     double amort = box? (double)totdec/box : 0;
 
-    printf("%-24s %-10s %7.1f %6.2f %7.4f %7.4f %7.3f %7.0f %7.0f %6.2f %7.2f %6.2f\n",
-           label,input,ratio,m.psnr,m.ms_ssim,gm,seam,enc,dec,avgtouch,us_per_atom,amort);
+    // table bytes as % of payload (isolates the E1/E2 table-coding effect).
+    double tbl_pct = st.payload_bytes ? 100.0*(double)st.table_bytes/(double)st.payload_bytes : 0;
+    printf("%-28s %-10s %7.1f %6.2f %7.4f %7.4f %7.0f %6.2f %7.2f %6.2f %6.2f %6.2f %6u\n",
+           label,input,ratio,m.psnr,m.ms_ssim,gm,dec,avgtouch,us_per_atom,amort,hdr_pct,tbl_pct,st.n_chunks);
+    (void)seam; (void)enc;
     vc_bg_free(a); free(rec);
 }
 
@@ -107,10 +113,73 @@ int main(int argc,char**argv){
     if (!hi) fprintf(stderr,"[no hires data under %s]\n",root);
     if (!co) fprintf(stderr,"[no coarse data under %s]\n",root);
 
-    printf("# block-grid bake-off  q(base-step)=%.1f   atom=16^3\n",q);
-    printf("# cols: ratio PSNR MS-SSIM GMSD seam16 encMB/s decMB/s avgTouch us/atom amortDecode(4^3box)\n");
-    printf("%-24s %-10s %7s %6s %7s %7s %7s %7s %7s %6s %7s %6s\n",
-           "config","input","ratio","PSNR","MSSSIM","GMSD","seam16","enc","dec","touch","us/atom","amort");
+    const char *mode = (argc>3)? argv[3] : "";
+    int curve_mode = (strcmp(mode,"curve")==0);
+
+    printf("# block-grid bake-off  q(base-step)=%.1f   atom=16^3%s\n", q,
+           curve_mode? "   [CURVE-GROUP experiment]" : "");
+    printf("# cols: ratio PSNR MS-SSIM GMSD decMB/s avgTouch us/atom amortDecode(4^3box) hdr%%payload tbl%%payload ngroups\n");
+    printf("%-28s %-10s %7s %6s %7s %7s %7s %6s %7s %6s %6s %6s %6s\n",
+           "config","input","ratio","PSNR","MSSSIM","GMSD","dec","touch","us/atom","amort","hdr%","tbl%","ngrp");
+
+    // ----- CURVE-GROUP experiment cell set (group-mode = curve, N in {64,256,512}).
+    // Baseline = box-128^3 (M1, ca8) at the SAME no-prediction winning stack, for
+    // both rANS and RLGR. Then curve-group Morton/Hilbert x N for each coder.
+    if (curve_mode) {
+        // vc_bg_cfg fields (in order): stencil,traversal,edge,entropy,chunk_atoms,
+        // shared_dc,step,dc_subvol, group_mode,group_n,
+        //   boundary,drift_thresh,table_coding,dc_pred_curve,nested_sub
+        #define BOX(en) (vc_bg_cfg){VC_STENCIL_NONE,VC_TRAV_RASTER,VC_EDGE_SELF,en,8,1,q,0,VC_GROUP_BOX,0,\
+            VC_BOUND_FIXED,0,VC_TABLE_FULL,0,0}
+        // fixed-N curve group (the second baseline)
+        #define CRV(tr,en,n) (vc_bg_cfg){VC_STENCIL_NONE,tr,VC_EDGE_SELF,en,8,1,q,0,VC_GROUP_CURVE,n,\
+            VC_BOUND_FIXED,0,VC_TABLE_FULL,0,0}
+        // fully-parameterised curve group
+        #define CG(tr,en,n,bnd,dth,tc,dcp,nst) (vc_bg_cfg){VC_STENCIL_NONE,tr,VC_EDGE_SELF,en,8,1,q,0,\
+            VC_GROUP_CURVE,n,bnd,dth,tc,dcp,nst}
+        cell cc[] = {
+          // ===== BASELINES =====
+          {"BASE box-128 rans",          BOX(VC_ENT_RANS_SHARED)},
+          {"BASE box-128 rlgr",          BOX(VC_ENT_RLGR)},
+          {"BASE curveHil N64  rans",    CRV(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED, 64)},
+          {"BASE curveHil N256 rans",    CRV(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED, 256)},
+          {"BASE curveMor N64  rans",    CRV(VC_TRAV_MORTON, VC_ENT_RANS_SHARED, 64)},
+          {"BASE curveMor N256 rans",    CRV(VC_TRAV_MORTON, VC_ENT_RANS_SHARED, 256)},
+          {"BASE curveHil N256 rlgr",    CRV(VC_TRAV_HILBERT,VC_ENT_RLGR, 256)},
+          // ===== C1: Hilbert vs Morton group compactness (rANS, FULL table) =====
+          {"C1 Hil N512 rans",           CRV(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED, 512)},
+          {"C1 Mor N512 rans",           CRV(VC_TRAV_MORTON, VC_ENT_RANS_SHARED, 512)},
+          // ===== E1: group-to-group table DELTA (the small-group unlocker) =====
+          {"E1 Hil N64  delta rans",     CG(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,64, VC_BOUND_FIXED,0,VC_TABLE_DELTA,0,0)},
+          {"E1 Hil N128 delta rans",     CG(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,128,VC_BOUND_FIXED,0,VC_TABLE_DELTA,0,0)},
+          {"E1 Hil N256 delta rans",     CG(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,256,VC_BOUND_FIXED,0,VC_TABLE_DELTA,0,0)},
+          {"E1 Mor N64  delta rans",     CG(VC_TRAV_MORTON, VC_ENT_RANS_SHARED,64, VC_BOUND_FIXED,0,VC_TABLE_DELTA,0,0)},
+          // ===== E2: coarse super-group base + per-group delta =====
+          {"E2 Hil N64  base rans",      CG(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,64, VC_BOUND_FIXED,0,VC_TABLE_BASE,0,0)},
+          {"E2 Hil N256 base rans",      CG(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,256,VC_BOUND_FIXED,0,VC_TABLE_BASE,0,0)},
+          // ===== I1: drift-adaptive boundaries (cap=group_n) =====
+          {"I1 Hil drift.10 rans",       CG(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,512,VC_BOUND_DRIFT,0.10f,VC_TABLE_FULL,0,0)},
+          {"I1 Hil drift.15 rans",       CG(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,512,VC_BOUND_DRIFT,0.15f,VC_TABLE_FULL,0,0)},
+          {"I1 Hil drift.20 rans",       CG(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,512,VC_BOUND_DRIFT,0.20f,VC_TABLE_FULL,0,0)},
+          {"I1 Hil drift.15 rlgr",       CG(VC_TRAV_HILBERT,VC_ENT_RLGR,       512,VC_BOUND_DRIFT,0.15f,VC_TABLE_FULL,0,0)},
+          // ===== I1 + E1 (drift boundaries + table delta = the likely winner) =====
+          {"I1+E1 Hil drift.15 rans",    CG(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,512,VC_BOUND_DRIFT,0.15f,VC_TABLE_DELTA,0,0)},
+          {"I1+E1 Mor drift.15 rans",    CG(VC_TRAV_MORTON, VC_ENT_RANS_SHARED,512,VC_BOUND_DRIFT,0.15f,VC_TABLE_DELTA,0,0)},
+          // ===== I2: nested sub-groups =====
+          {"I2 Hil N256 nest16 rans",    CG(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,256,VC_BOUND_FIXED,0,VC_TABLE_FULL,0,16)},
+          // ===== B1: DC-only curve-predecessor prediction (marginal-gain test) ===
+          {"B1 Hil N256 dcpred rans",    CG(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,256,VC_BOUND_FIXED,0,VC_TABLE_FULL,1,0)},
+          {"B1 Hil N256 dcpred rlgr",    CG(VC_TRAV_HILBERT,VC_ENT_RLGR,       256,VC_BOUND_FIXED,0,VC_TABLE_FULL,1,0)},
+          // B2: B1 ON TOP OF the best group-model variant (drift+E1) — marginal gain
+          {"B2 Hil drift.15 E1 dcpred",  CG(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,512,VC_BOUND_DRIFT,0.15f,VC_TABLE_DELTA,1,0)},
+        };
+        int ncc=(int)(sizeof(cc)/sizeof(cc[0]));
+        for (int i=0;i<ncc;++i) if (hi) run_cell("hires-256",hi,256,256,256,cc[i].name,cc[i].cfg);
+        printf("\n");
+        for (int i=0;i<ncc;++i) if (co) run_cell("coarse-256",co,256,256,256,cc[i].name,cc[i].cfg);
+        free(hi); free(co);
+        return 0;
+    }
 
     // The sweep matrix. base = M1 (no prediction) reference, then the axes.
     // fields: stencil, traversal, edge, entropy, chunk_atoms, shared_dc, step, dc_subvol

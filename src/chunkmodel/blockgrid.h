@@ -57,6 +57,52 @@ typedef enum {
     VC_ENT_RLGR       = 2,  // table-free RLGR (shared param seed)
 } vc_entropy_mode;
 
+// --- grouping mode: the SHARING + FETCH unit (curve-group experiment) -------
+// Defines WHAT set of 16^3 atoms shares one entropy table + one seek directory.
+//   VC_GROUP_BOX   : the current M1 design — an axis-aligned chunk_atoms^3 box.
+//   VC_GROUP_CURVE : a "curve group" = N CONSECUTIVE atoms along a global
+//                    space-filling curve (Morton/Hilbert) over the whole lattice.
+//                    Eliminates the chunk-box concept: the data is ONE continuous
+//                    lattice of 16^3 atoms; groups are contiguous runs along the
+//                    curve. The `traversal` field selects the curve; `group_n` is
+//                    the run length (atoms per group). Decode one atom: compute
+//                    its curve index -> find its group (group-index table) -> load
+//                    that group's header (shared table + per-atom directory) ->
+//                    decode just that atom's bytes. touched stays 1.
+typedef enum {
+    VC_GROUP_BOX   = 0,
+    VC_GROUP_CURVE = 1,
+} vc_group_mode;
+
+// --- THREE-LEVEL REDUNDANCY HIERARCHY variants (curve-group experiment) ------
+// All consulted ONLY in VC_GROUP_CURVE mode; ignored (0) otherwise so a zero-
+// initialised cfg is exactly the old fixed-N curve-group / box behaviour.
+//
+// (I) INTRA-group boundary rule — how a group ENDS (how big it is):
+//   FIXED  : every group is exactly group_n atoms (the original curve-group).
+//   DRIFT  : a group ENDS when its running symbol histogram diverges from the
+//            group's accumulated histogram past `drift_thresh` (variable-size,
+//            internally-homogeneous groups). group_n becomes the MAX cap.
+typedef enum {
+    VC_BOUND_FIXED = 0,
+    VC_BOUND_DRIFT = 1,
+} vc_boundary_rule;
+
+// (E) INTER-group table coding — how each group's rANS table is STORED:
+//   FULL  : store the full NSYM*2-byte freq table per group (original).
+//   DELTA : store group N's table as a zig-zag varint DELTA from group N-1's
+//           table (E1). Adjacent curve-groups have similar stats -> tiny delta
+//           -> cheap header -> makes small coherent groups affordable.
+//   BASE  : a single coarse SUPER-GROUP base table (built from the whole
+//           lattice histogram) that every group corrects against with a delta
+//           (E2, two-level base+group-delta). The base is stored once.
+// Table coding only affects VC_ENT_RANS_SHARED (RLGR is table-free).
+typedef enum {
+    VC_TABLE_FULL  = 0,
+    VC_TABLE_DELTA = 1,
+    VC_TABLE_BASE  = 2,
+} vc_table_coding;
+
 typedef struct {
     vc_stencil      stencil;
     vc_traversal    traversal;
@@ -74,6 +120,24 @@ typedef struct {
     // per-atom `stencil` applies to AC only (typically NONE). 0 = off (per-atom
     // DC threading per `stencil`, the original path).
     int             dc_subvol;
+    // Curve-group experiment (see vc_group_mode). Only consulted when
+    // group_mode == VC_GROUP_CURVE; ignored for VC_GROUP_BOX (back-compat: a
+    // zero-initialized cfg is exactly the old box behavior).
+    vc_group_mode   group_mode;
+    u32             group_n;       // atoms per curve group (e.g. 64/256/512)
+    // --- three-level hierarchy knobs (curve mode only; 0 = original behaviour) -
+    vc_boundary_rule boundary;     // I1: FIXED vs DRIFT-adaptive group sizing
+    float           drift_thresh;  // I1: histogram-divergence cut (e.g. 0.15);
+                                   //     only used when boundary==DRIFT. group_n
+                                   //     is then the MAX cap (and a min of 8).
+    vc_table_coding table_coding;  // E1/E2: FULL / DELTA(prev) / BASE(super-group)
+    int             dc_pred_curve; // B1: DC-only prediction from the CURVE
+                                   //     PREDECESSOR (touched stays 1; DC residual
+                                   //     in the directory). 0 = absolute DC.
+    u32             nested_sub;    // I2: nested sub-group size (atoms). >0 splits a
+                                   //     group into sub-runs that each carry a small
+                                   //     DC-base delta on top of the group DC mean
+                                   //     (intra-group two-level DC model). 0 = off.
 } vc_bg_cfg;
 
 // Encoded archive (in-memory): a sequence of chunk records, each with a header

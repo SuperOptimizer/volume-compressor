@@ -355,6 +355,19 @@ struct vc_bg_archive {
     // DC sub-volume variant (cfg.dc_subvol): decoded DC coefficient per atom,
     // [Az*Ay*Ax] lattice raster. Decoded ONCE up front; atom decode just looks up.
     i16 *dc_sub;          // NULL unless dc_subvol active
+    // CURVE-GROUP mode (cfg.group_mode==VC_GROUP_CURVE): a global space-filling
+    // curve over the lattice bounding cube. group_of[gi] = group id owning atom
+    // gi (lattice raster index). Groups are contiguous runs of group_n atoms in
+    // curve order; each group is stored in chunks[group_id] (reusing bg_chunk as
+    // a group record: its table + blob + directory). The DC residual stays in the
+    // per-atom directory (at->dc_resid_q), so random access touches only the one
+    // atom's payload. group_of doubles as the "group-index table".
+    u32 *group_of;        // [Az*Ay*Ax] group id per atom (NULL in box mode)
+    u32  curve_bits;      // curve cube side = 2^curve_bits (>= max lattice dim)
+    // Variable-size grouping (I1 drift) needs explicit boundaries: group g spans
+    // curve positions [group_start[g], group_start[g+1]). For FIXED grouping this
+    // is simply g*N. Length n_chunks+1. Built in curve_encode, reused by decode.
+    u32 *group_start;     // [n_chunks+1] curve-order start of each group
 };
 
 static inline u32 lat_idx(const vc_bg_archive *a, u32 z, u32 y, u32 x) {
@@ -510,6 +523,262 @@ static void dcsv_decode(const u8 *in, size_t len, i16 *lvl_out,
     free(resid);
 }
 
+// ===========================================================================
+// CURVE-GROUP MODE (the curve-groups experiment). The sharing+fetch unit is a
+// run of N consecutive 16^3 atoms along a GLOBAL space-filling curve over the
+// whole lattice (no axis-aligned chunk boxes). Same winning stack otherwise:
+// DCT-16^3 + HF-quant + shared rANS table (or RLGR), NO prediction. The DC level
+// is carried per-atom in the group directory (dc_resid_q holds the absolute DC
+// level, was_intra=1 always), so single-atom random access touches exactly 1
+// payload after an O(1) group-index lookup.
+// ===========================================================================
+
+// Compute the global curve index of a lattice atom (gz,gy,gx) for the chosen
+// curve over a cube of side 2^bits. Atoms outside the lattice are skipped by the
+// caller; the curve simply orders the bounding cube and we keep the present ones.
+static inline u32 curve_index(vc_traversal trav, u32 bits, u32 gz, u32 gy, u32 gx) {
+    if (trav == VC_TRAV_HILBERT) return hilbert_d(bits, gx, gy, gz);
+    return morton3(gx, gy, gz);     // Morton (raster falls back to Morton here)
+}
+
+typedef struct { u32 code, lin; } curve_pr;
+static int curve_pr_cmp(const void *pa, const void *pb) {
+    u32 ca = ((const curve_pr *)pa)->code, cb = ((const curve_pr *)pb)->code;
+    return ca < cb ? -1 : (ca > cb ? 1 : 0);
+}
+
+// Build the global curve order over the lattice: order_lat[k] = lattice raster
+// index of the k-th present atom in curve order (k=0..nat-1). Returns curve bits.
+static u32 build_curve_order(const vc_bg_archive *a, u32 *order_lat) {
+    u32 maxd = a->Az > a->Ay ? a->Az : a->Ay; if (a->Ax > maxd) maxd = a->Ax;
+    u32 bits = 1; while ((1u << bits) < maxd) ++bits;
+    u32 nat = a->Az * a->Ay * a->Ax;
+    curve_pr *p = (curve_pr *)malloc((size_t)nat * sizeof(curve_pr));
+    u32 m = 0;
+    for (u32 z = 0; z < a->Az; ++z)
+    for (u32 y = 0; y < a->Ay; ++y)
+    for (u32 x = 0; x < a->Ax; ++x) {
+        p[m].code = curve_index(a->cfg.traversal, bits, z, y, x);
+        p[m].lin  = (z * a->Ay + y) * a->Ax + x;
+        ++m;
+    }
+    qsort(p, nat, sizeof(curve_pr), curve_pr_cmp);
+    for (u32 k = 0; k < nat; ++k) order_lat[k] = p[k].lin;
+    free(p);
+    return bits;
+}
+
+// --- varint byte cost of an unsigned value (LEB128) -------------------------
+static inline size_t varint_cost(u32 v) { size_t n = 1; while (v >>= 7) ++n; return n; }
+
+// --- I1 drift boundary: total-variation distance between two normalised hists.
+// Returns 0..1. Used to decide when a curve-group has drifted enough to split.
+static double hist_tv(const u64 *acc, u64 acc_tot, const u64 *win, u64 win_tot) {
+    if (!acc_tot || !win_tot) return 0.0;
+    double d = 0.0;
+    for (u32 s = 0; s < NSYM; ++s) {
+        double pa = (double)acc[s] / (double)acc_tot;
+        double pw = (double)win[s] / (double)win_tot;
+        d += (pa > pw ? pa - pw : pw - pa);
+    }
+    return 0.5 * d;            // total-variation distance in [0,1]
+}
+
+// --- E1/E2 table coding cost + EXACT round-trip of the stored freq table.
+// Returns the byte cost of storing table `cur`'s quantised freqs under the chosen
+// coding, AND overwrites cur->freq with the value a decoder would reconstruct
+// (so decode == bytes). For FULL: raw 12-bit freqs (NSYM*2 bytes, no change).
+// For DELTA: zig-zag-varint of (cur.freq[s]-ref.freq[s]); reconstruction adds the
+// delta back to ref (lossless -> cur unchanged, but cost reflects the delta).
+// `ref` is the previous group's already-reconstructed table (DELTA) or the global
+// base table (BASE); NULL on the first DELTA group (falls back to FULL cost).
+static size_t table_code_cost(rans_table *cur, const rans_table *ref,
+                              vc_table_coding mode) {
+    if (mode == VC_TABLE_FULL || !ref) {
+        // raw store: 2 bytes/sym. Reconstruction is identity.
+        return NSYM * 2;
+    }
+    // DELTA / BASE: zig-zag varint of per-symbol freq delta vs ref. Lossless, so
+    // cur->freq is already exactly what a decoder reconstructs (ref + delta).
+    size_t bytes = 0;
+    for (u32 s = 0; s < NSYM; ++s) {
+        i32 d = (i32)cur->freq[s] - (i32)ref->freq[s];
+        u32 u = (u32)((d << 1) ^ (d >> 31));   // zig-zag
+        bytes += varint_cost(u);
+    }
+    return bytes;
+}
+
+static int curve_encode(const u8 *vol, vc_bg_archive *a, vc_bg_stats *st) {
+    const vc_bg_cfg *cfg = &a->cfg;
+    u32 dz = a->dz, dy = a->dy, dx = a->dx;
+    u32 nat = a->Az * a->Ay * a->Ax;
+    f32 base = cfg->step;
+    u32 N = cfg->group_n ? cfg->group_n : 256u;
+    int drift = (cfg->boundary == VC_BOUND_DRIFT);
+    int rans  = (cfg->entropy == VC_ENT_RANS_SHARED);
+
+    u32 *order_lat = (u32 *)malloc((size_t)nat * sizeof(u32));
+    a->group_of = (u32 *)malloc((size_t)nat * sizeof(u32));
+    if (!order_lat || !a->group_of) { free(order_lat); return 1; }
+    a->curve_bits = build_curve_order(a, order_lat);
+
+    // ---- PHASE A: transform+quant EVERY atom in curve order. Store all levels
+    // (qstore), per-atom histogram (for drift boundaries), and the absolute DC
+    // level. Curve order means qstore[k] is the k-th atom along the curve.
+    i16 *qstore = (i16 *)malloc((size_t)nat * AVOX * sizeof(i16));
+    i16 *dc_lvl = (i16 *)malloc((size_t)nat * sizeof(i16)); // absolute DC level/atom
+    u8  *avox = (u8 *)malloc(AVOX);
+    i16 *coef = (i16 *)malloc(AVOX * sizeof(i16));
+    i16 *qsc  = (i16 *)malloc(AVOX * sizeof(i16));
+    u8  *pay  = (u8 *)malloc(AVOX * 4 + 64);
+    if (!qstore||!dc_lvl||!avox||!coef||!qsc||!pay) {
+        free(qstore);free(dc_lvl);free(avox);free(coef);free(qsc);free(pay);free(order_lat); return 1; }
+
+    for (u32 k = 0; k < nat; ++k) {
+        u32 gi = order_lat[k];
+        u32 gz = gi / (a->Ay * a->Ax), gy = (gi / a->Ax) % a->Ay, gx = gi % a->Ax;
+        bg_atom *at = &a->atoms[gi];
+        i16 *qs = qstore + (size_t)k * AVOX;
+        gather_atom(avox, vol, dz, dy, dx, gz, gy, gx);
+        int allz = 1; for (u32 i = 0; i < AVOX; ++i) if (avox[i]) { allz = 0; break; }
+        if (allz) { at->absent = 1; at->dc_coef = 0; at->intra = 1;
+                    memset(qs, 0, AVOX*sizeof(i16)); dc_lvl[k] = 0; continue; }
+        bg_dct16_fwd(coef, avox, 0);
+        i32 dc_raw = quant_atom(qsc, coef, base);
+        i16 dc_q_full = dc_quant(dc_raw, base);
+        at->dc_coef = dc_dequant(dc_q_full, base);
+        at->intra = 1; at->absent = 0;
+        memcpy(qs, qsc, AVOX*sizeof(i16));
+        qs[0] = 0;
+        dc_lvl[k] = dc_q_full;            // absolute DC level (curve order)
+    }
+
+    // ---- B1: DC-only prediction from the CURVE PREDECESSOR. Stored per atom in
+    // the directory is the residual (dc_lvl[k] - dc_lvl[k-1]); k=0 stores absolute.
+    // touched stays 1 (the predecessor's DC is a directory read on full decode; for
+    // random access we walk back along the curve reading only directory DC levels —
+    // accounted as touched==1 because no AC payload of a predecessor is decoded).
+    // We materialise the per-atom STORED dc level into at->dc_resid_q below per the
+    // boundary pass so the chosen reset semantics (reset at group start) hold.
+
+    // ---- PHASE B: form group boundaries. FIXED: every N atoms. DRIFT: end a group
+    // when the next atom's histogram pushes the group's running histogram past the
+    // TV-distance threshold, capped at [min, N].
+    u32 *gstart = (u32 *)malloc((size_t)(nat + 2) * sizeof(u32));
+    if (!gstart) { free(qstore);free(dc_lvl);free(avox);free(coef);free(qsc);free(pay);free(order_lat); return 1; }
+    u32 ng = 0; gstart[0] = 0;
+    if (!drift) {
+        ng = 0; for (u32 k = 0; k < nat; k += N) gstart[ng++] = k;
+        gstart[ng] = nat;
+    } else {
+        u32 gmin = 8; if (gmin > N) gmin = N;
+        u64 acc[NSYM]; memset(acc, 0, sizeof(acc)); u64 acc_tot = 0;
+        u64 win[NSYM]; u32 cur_start = 0; ng = 0; gstart[0] = 0;
+        for (u32 k = 0; k < nat; ++k) {
+            memset(win, 0, sizeof(win));
+            rans_hist(qstore + (size_t)k*AVOX, AVOX, win);
+            u64 win_tot = 0; for (u32 s=0;s<NSYM;++s) win_tot += win[s];
+            u32 sz = k - cur_start;
+            double d = hist_tv(acc, acc_tot, win, win_tot);
+            int split = (sz >= gmin && d > (double)cfg->drift_thresh) || (sz >= N);
+            if (split && sz > 0) {
+                gstart[++ng] = k; cur_start = k;
+                memset(acc, 0, sizeof(acc)); acc_tot = 0;
+            }
+            for (u32 s=0;s<NSYM;++s) acc[s] += win[s];
+            acc_tot += win_tot;
+        }
+        gstart[++ng] = nat;
+    }
+    a->n_chunks = ng; st->n_chunks = ng;
+    a->ncz = a->ncy = a->ncx = 0;
+    a->group_start = (u32 *)malloc((size_t)(ng + 1) * sizeof(u32));
+    a->chunks = (bg_chunk *)calloc(ng, sizeof(bg_chunk));
+    if (!a->group_start || !a->chunks) { free(gstart);free(qstore);free(dc_lvl);
+        free(avox);free(coef);free(qsc);free(pay);free(order_lat); return 1; }
+    for (u32 g = 0; g <= ng; ++g) a->group_start[g] = gstart[g];
+
+    rans_table base_tbl; int have_base = 0;        // E2 super-group base
+    if (rans && cfg->table_coding == VC_TABLE_BASE) {
+        u64 gc[NSYM]; memset(gc, 0, sizeof(gc));
+        for (u32 k = 0; k < nat; ++k) if (!a->atoms[order_lat[k]].absent)
+            rans_hist(qstore + (size_t)k*AVOX, AVOX, gc);
+        rt_build(&base_tbl, gc);
+        st->table_bytes += NSYM * 2;               // base stored once
+        have_base = 1;
+    }
+    rans_table prev_tbl; int have_prev = 0;        // E1 previous-group table
+
+    // ---- PHASE C: per group, build table (+code it E1/E2), entropy-code atoms.
+    for (u32 g = 0; g < ng; ++g) {
+        bg_chunk *C = &a->chunks[g];
+        u32 k0 = gstart[g], k1 = gstart[g+1], cnt = k1 - k0;
+        u64 counts[NSYM]; memset(counts, 0, sizeof(counts));
+        for (u32 k = k0; k < k1; ++k) {
+            u32 gi = order_lat[k]; a->group_of[gi] = g;
+            if (!a->atoms[gi].absent) rans_hist(qstore + (size_t)k*AVOX, AVOX, counts);
+        }
+
+        if (rans) {
+            rt_build(&C->table, counts);
+            // E1/E2: charge the (possibly delta-coded) table cost. table_code_cost
+            // also guarantees C->table.freq equals the decoder's reconstruction.
+            const rans_table *ref = NULL;
+            if (cfg->table_coding == VC_TABLE_DELTA && have_prev) ref = &prev_tbl;
+            else if (cfg->table_coding == VC_TABLE_BASE && have_base) ref = &base_tbl;
+            st->table_bytes += table_code_cost(&C->table, ref, cfg->table_coding);
+            prev_tbl = C->table; have_prev = 1;
+        }
+
+        u8 *blob = (u8 *)malloc((size_t)cnt * (AVOX * 4 + 64) + 16);
+        if (!blob) { free(gstart);free(qstore);free(dc_lvl);free(avox);free(coef);
+            free(qsc);free(pay);free(order_lat); return 1; }
+        size_t bl = 0; size_t dirbytes = 0;
+        for (u32 k = k0; k < k1; ++k) {
+            u32 gi = order_lat[k];
+            bg_atom *at = &a->atoms[gi];
+            const i16 *q = qstore + (size_t)k*AVOX;
+            // --- DC stored level: B1 curve-predecessor prediction (reset at group
+            // start under FIXED so the directory stays self-contained per group; the
+            // predecessor at k-1 is always the spatial neighbour under the curve).
+            i16 dc_store;
+            if (cfg->dc_pred_curve && k > k0) dc_store = (i16)(dc_lvl[k] - dc_lvl[k-1]);
+            else                              dc_store = dc_lvl[k];
+            at->dc_resid_q = dc_store;
+            at->dc_coef = dc_dequant(dc_lvl[k], base);
+            if (at->absent) { at->off = (u32)bl; at->len = 0; st->n_absent_atoms++; }
+            else {
+                size_t cap = AVOX * 4 + 64, plen;
+                if (cfg->entropy == VC_ENT_RLGR)        plen = vc_rlgr_encode(pay, cap, q, AVOX);
+                else if (rans)                          plen = rans_enc(pay, cap, q, AVOX, &C->table);
+                else { u64 c1[NSYM]; memset(c1,0,sizeof(c1)); rans_hist(q, AVOX, c1);
+                       rans_table t1; rt_build(&t1, c1);
+                       for (u32 s=0;s<NSYM;++s){ pay[2*s]=(u8)(t1.freq[s]&0xff); pay[2*s+1]=(u8)(t1.freq[s]>>8); }
+                       plen = rans_enc(pay + NSYM*2, cap - NSYM*2, q, AVOX, &t1) + NSYM*2; }
+                memcpy(blob + bl, pay, plen);
+                at->off = (u32)bl; at->len = (u32)plen; bl += plen;
+            }
+            dirbytes += varint_cost(at->len);
+            dirbytes += varint_cost(zz(at->dc_resid_q));
+        }
+        dirbytes += (cnt + 7) / 8;        // absent-flag bits
+        // I2 nested sub-groups: tiny per-sub-group index (one boundary marker per
+        // sub-run). Charged as 1 byte / sub-group. (The DC base/delta itself rides
+        // in the already-counted directory DC residuals; this measures the index
+        // overhead the nesting costs.)
+        if (cfg->nested_sub) dirbytes += (cnt + cfg->nested_sub - 1) / cfg->nested_sub;
+        C->blob = blob; C->blob_len = bl;
+        st->payload_bytes += bl;
+        st->directory_bytes += dirbytes;
+    }
+
+    st->total_bytes = st->payload_bytes + st->directory_bytes + st->table_bytes
+                    + st->halo_bytes + st->dc_subvol_bytes + 64;
+    free(gstart);free(qstore);free(dc_lvl);free(avox);free(coef);free(qsc);free(pay);free(order_lat);
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // ENCODE
 // ---------------------------------------------------------------------------
@@ -522,6 +791,17 @@ int vc_bg_encode(const u8 *vol, u32 dz, u32 dy, u32 dx,
     a->Az = vc_bg_natoms(dz); a->Ay = vc_bg_natoms(dy); a->Ax = vc_bg_natoms(dx);
     u32 nat = a->Az * a->Ay * a->Ax;
     a->atoms = (bg_atom *)calloc(nat, sizeof(bg_atom));
+    if (!a->atoms) { vc_bg_free(a); return 1; }
+
+    // CURVE-GROUP mode: a separate, self-contained path (no chunk boxes). Forces
+    // the winning stack (no prediction, no DC sub-volume; DC carried per-atom).
+    if (cfg->group_mode == VC_GROUP_CURVE) {
+        memset(st, 0, sizeof(*st));
+        st->n_atoms = nat;
+        if (curve_encode(vol, a, st)) { vc_bg_free(a); return 1; }
+        *out = a; return 0;
+    }
+
     u32 ca = cfg->chunk_atoms;
     a->ncz = (a->Az + ca - 1) / ca; a->ncy = (a->Ay + ca - 1) / ca; a->ncx = (a->Ax + ca - 1) / ca;
     a->n_chunks = a->ncz * a->ncy * a->ncx;
@@ -780,9 +1060,51 @@ static void decode_one_atom_levels(const vc_bg_archive *a, const bg_chunk *C,
     }
 }
 
+// Curve-group full decode: walk each group, entropy-decode each atom against the
+// group's shared table, reconstruct DC from the per-atom directory level, inverse
+// quant + DCT, scatter. Atom lattice positions come from the global curve order.
+static int curve_decode(const vc_bg_archive *a, u8 *vol) {
+    u32 nat = a->Az * a->Ay * a->Ax;
+    f32 base = a->cfg.step;
+    int dcpred = a->cfg.dc_pred_curve;
+    u32 *order_lat = (u32 *)malloc((size_t)nat * sizeof(u32));
+    i16 *qsc = (i16 *)malloc(AVOX*sizeof(i16));
+    i16 *coef = (i16 *)malloc(AVOX*sizeof(i16));
+    u8  *avox = (u8 *)malloc(AVOX);
+    if (!order_lat||!qsc||!coef||!avox) { free(order_lat);free(qsc);free(coef);free(avox); return 1; }
+    build_curve_order(a, order_lat);
+    for (u32 g = 0; g < a->n_chunks; ++g) {
+        const bg_chunk *C = &a->chunks[g];
+        u32 k0 = a->group_start[g], k1 = a->group_start[g+1];
+        i16 prev_dc_lvl = 0;            // B1: running absolute DC level (resets/group)
+        for (u32 k = k0; k < k1; ++k) {
+            u32 gi = order_lat[k];
+            u32 gz = gi / (a->Ay * a->Ax), gy = (gi / a->Ax) % a->Ay, gx = gi % a->Ax;
+            bg_atom *at = (bg_atom *)&a->atoms[gi];
+            // reconstruct absolute DC level from the stored (possibly residual) one
+            i16 dc_lvl;
+            if (dcpred && k > k0) dc_lvl = (i16)(prev_dc_lvl + at->dc_resid_q);
+            else                  dc_lvl = at->dc_resid_q;
+            prev_dc_lvl = dc_lvl;
+            if (at->absent) { memset(avox, 0, AVOX); }
+            else {
+                decode_one_atom_levels(a, C, at, qsc);
+                i16 dc_recon = dc_dequant(dc_lvl, base);
+                at->dc_coef = dc_recon;
+                dequant_atom(coef, qsc, dc_recon, base);
+                bg_dct16_inv(avox, coef, 0);
+            }
+            scatter_atom(vol, avox, a->dz, a->dy, a->dx, gz, gy, gx);
+        }
+    }
+    free(order_lat); free(qsc); free(coef); free(avox);
+    return 0;
+}
+
 int vc_bg_decode(const vc_bg_archive *a, u8 *vol) {
     ensure_init();
     memset(vol, 0, (size_t)a->dz * a->dy * a->dx);
+    if (a->cfg.group_mode == VC_GROUP_CURVE) return curve_decode(a, vol);
     i16 *qsc = (i16 *)malloc(AVOX*sizeof(i16));
     i16 *coef = (i16 *)malloc(AVOX*sizeof(i16));
     u8  *avox = (u8 *)malloc(AVOX);
@@ -914,9 +1236,61 @@ static u32 *build_rank_lat(const vc_bg_archive *a) {
     return rl;
 }
 
+// Curve-group single-atom random access. Realistic cost path: (1) compute the
+// atom's GLOBAL CURVE INDEX (Morton/Hilbert) — the extra indexing cost vs box;
+// (2) map curve index -> group id via the group-index table; (3) load that
+// group's header (shared table, cached) + the atom's directory entry; (4)
+// entropy-decode JUST that atom's payload; DC from the directory level. touched=1
+// (no neighbor-atom decode). We use the precomputed group_of[] as the realistic
+// O(1) group-index lookup and still PAY the curve_index() computation so the
+// extraction-µs reflects curve indexing being pricier than a box division.
+static int curve_decode_atom(const vc_bg_archive *a, u32 az, u32 ay, u32 ax,
+                             u8 *atom_out, u32 *touched) {
+    u32 gi = lat_idx(a, az, ay, ax);
+    // (1) compute the curve index (the pricier-than-box indexing step). The result
+    // is consumed by the group-index map below; computing it here makes the µs
+    // measurement honest about curve-vs-box indexing cost.
+    volatile u32 cidx = curve_index(a->cfg.traversal, a->curve_bits, az, ay, ax);
+    (void)cidx;
+    // (2) group lookup
+    u32 g = a->group_of[gi];
+    const bg_chunk *C = &a->chunks[g];
+    const bg_atom *at = &a->atoms[gi];
+    if (at->absent) { memset(atom_out, 0, AVOX); *touched = 1; return 0; }
+    i16 *qsc = (i16*)malloc(AVOX*sizeof(i16));
+    i16 *coef = (i16*)malloc(AVOX*sizeof(i16));
+    if (!qsc||!coef) { free(qsc);free(coef); return 1; }
+    decode_one_atom_levels(a, C, at, qsc);     // the ONE AC payload decode
+    // DC level: B1 curve-predecessor prediction needs the running sum from the
+    // group start back to this atom. That walk reads ONLY directory DC residuals
+    // (no ancestor AC payload is entropy-decoded) so touched stays 1. Recover this
+    // atom's curve position k by scanning the group's curve range for gi.
+    i16 dc_lvl = at->dc_resid_q;
+    if (a->cfg.dc_pred_curve) {
+        u32 *order_lat = (u32*)malloc((size_t)a->Az*a->Ay*a->Ax*sizeof(u32));
+        if (order_lat) {
+            build_curve_order(a, order_lat);
+            u32 k0 = a->group_start[g], k1 = a->group_start[g+1], kk = k0;
+            for (u32 k = k0; k < k1; ++k) if (order_lat[k] == gi) { kk = k; break; }
+            i32 acc = 0;           // k0 holds absolute, k>k0 hold deltas -> sum
+            for (u32 k = k0; k <= kk; ++k) acc += a->atoms[order_lat[k]].dc_resid_q;
+            dc_lvl = (i16)acc;
+            free(order_lat);
+        }
+    }
+    i16 dc_recon = dc_dequant(dc_lvl, a->cfg.step);
+    dequant_atom(coef, qsc, dc_recon, a->cfg.step);
+    bg_dct16_inv(atom_out, coef, 0);
+    *touched = 1;
+    free(qsc); free(coef);
+    return 0;
+}
+
 int vc_bg_decode_atom(const vc_bg_archive *a, u32 az, u32 ay, u32 ax,
                       u8 *atom_out, u32 *touched) {
     ensure_init();
+    if (a->cfg.group_mode == VC_GROUP_CURVE)
+        return curve_decode_atom(a, az, ay, ax, atom_out, touched);
     size_t nat = (size_t)a->Az*a->Ay*a->Ax;
     i16 *qsc = (i16*)malloc(AVOX*sizeof(i16));
     i16 *coef = (i16*)malloc(AVOX*sizeof(i16));
@@ -948,6 +1322,18 @@ int vc_bg_decode_region(const vc_bg_archive *a,
     // ancestors) decoded once stays cached for the rest of the box. The amortized
     // cost = unique atom-decodes / atoms_in_box.
     ensure_init();
+    // Curve-group mode: no prediction ancestry -> exactly one AC decode per
+    // non-absent atom in the box (amortized = 1.00).
+    if (a->cfg.group_mode == VC_GROUP_CURVE) {
+        u32 box = 0; u64 dec = 0;
+        for (u32 z=z0; z<z1 && z<a->Az; ++z)
+        for (u32 y=y0; y<y1 && y<a->Ay; ++y)
+        for (u32 x=x0; x<x1 && x<a->Ax; ++x) {
+            if (!a->atoms[lat_idx(a,z,y,x)].absent) ++dec;
+            box++;
+        }
+        *total_decodes = dec; *atoms_in_box = box; return 0;
+    }
     size_t nat = (size_t)a->Az*a->Ay*a->Ax;
     u32 *rank_lat = build_rank_lat(a);
     nbr stoff[26]; u32 nst = stencil_offsets(a->cfg.stencil, stoff);
@@ -974,5 +1360,6 @@ int vc_bg_decode_region(const vc_bg_archive *a,
 void vc_bg_free(vc_bg_archive *a) {
     if (!a) return;
     if (a->chunks) for (u32 i = 0; i < a->n_chunks; ++i) free(a->chunks[i].blob);
-    free(a->chunks); free(a->atoms); free(a->dc_sub); free(a);
+    free(a->chunks); free(a->atoms); free(a->dc_sub); free(a->group_of);
+    free(a->group_start); free(a);
 }
