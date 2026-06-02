@@ -100,9 +100,11 @@ static void run_cell(const char*input,const u8*vol,u32 D,u32 H,u32 W,
 
     // table bytes as % of payload (isolates the E1/E2 table-coding effect).
     double tbl_pct = st.payload_bytes ? 100.0*(double)st.table_bytes/(double)st.payload_bytes : 0;
-    printf("%-28s %-10s %7.1f %6.2f %7.4f %7.4f %7.0f %6.2f %7.2f %6.2f %6.2f %6.2f %6u\n",
-           label,input,ratio,m.psnr,m.ms_ssim,gm,dec,avgtouch,us_per_atom,amort,hdr_pct,tbl_pct,st.n_chunks);
-    (void)seam; (void)enc;
+    // skip-meta: bytes saved on uniform chunks as % of total archive (air-heavy effect).
+    double skip_pct = st.total_bytes ? 100.0*(double)st.skip_saved_bytes/(double)(st.total_bytes+st.skip_saved_bytes) : 0;
+    printf("%-28s %-10s %7.1f %6.2f %7.4f %7.4f %7.0f %6.2f %7.2f %6.2f %6.2f %6.2f %6u %7.0f %6.2f\n",
+           label,input,ratio,m.psnr,m.ms_ssim,gm,dec,avgtouch,us_per_atom,amort,hdr_pct,tbl_pct,st.n_chunks,enc,skip_pct);
+    (void)seam;
     vc_bg_free(a); free(rec);
 }
 
@@ -115,12 +117,63 @@ int main(int argc,char**argv){
 
     const char *mode = (argc>3)? argv[3] : "";
     int curve_mode = (strcmp(mode,"curve")==0);
+    int eg_mode    = (strcmp(mode,"eg")==0);
+
+    // ===== EG2024 (Fast Compressed Segmentation Volumes) experiment cell set =====
+    if (eg_mode) {
+        printf("# EG2024 experiment  q=%.1f  atom=16^3\n", q);
+        printf("# cols: ratio PSNR MS-SSIM GMSD decMB/s touch us/atom amort hdr%% tbl%% ngrp encMB/s skip%%\n");
+        printf("%-28s %-10s %7s %6s %7s %7s %7s %6s %7s %6s %6s %6s %6s %7s %6s\n",
+               "config","input","ratio","PSNR","MSSSIM","GMSD","dec","touch","us/atom","amort","hdr%","tbl%","ngrp","enc","skip%");
+        // box cfg helper: stencil,trav,edge,entropy,ca,shared_dc,step,dc_subvol,
+        //   group_mode,group_n,boundary,drift,table_coding,dc_pred,nested,
+        //   band_split,sparse_prepass,skip_meta
+        #define EB(en,ca,band,sp,sk) (vc_bg_cfg){VC_STENCIL_NONE,VC_TRAV_RASTER,VC_EDGE_SELF,en,ca,1,q,0,\
+            VC_GROUP_BOX,0,VC_BOUND_FIXED,0,VC_TABLE_FULL,0,0, band,sp,sk}
+        #define ECRV(tr,en,n,band) (vc_bg_cfg){VC_STENCIL_NONE,tr,VC_EDGE_SELF,en,8,1,q,0,\
+            VC_GROUP_CURVE,n,VC_BOUND_FIXED,0,VC_TABLE_FULL,0,0, band,0,0}
+        cell eg[] = {
+          // ---- (1) ★ SYMBOL-ROLE table split (DC vs AC bands), per-128 box rANS ----
+          {"1 box-128 pooled rans",      EB(VC_ENT_RANS_SHARED,8,VC_BAND_NONE,0,0)},
+          {"1 box-128 DC|AC rans",       EB(VC_ENT_RANS_SHARED,8,VC_BAND_DC_AC,0,0)},
+          {"1 box-128 DC|lo|hi rans",    EB(VC_ENT_RANS_SHARED,8,VC_BAND_DC_LO_HI,0,0)},
+          // ---- (2) REGION/scope: per-128 box vs whole-256 cube vs per-64 box vs curve
+          {"2 box-64 pooled rans",       EB(VC_ENT_RANS_SHARED,4,VC_BAND_NONE,0,0)},
+          {"2 box-128 pooled rans",      EB(VC_ENT_RANS_SHARED,8,VC_BAND_NONE,0,0)},
+          {"2 whole-256 pooled rans",    EB(VC_ENT_RANS_SHARED,16,VC_BAND_NONE,0,0)},
+          {"2 whole-256 DC|lo|hi rans",  EB(VC_ENT_RANS_SHARED,16,VC_BAND_DC_LO_HI,0,0)},
+          {"2 curveHil N512 pooled",     ECRV(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,512,VC_BAND_NONE)},
+          // ---- (3) SPARSE PREPASS (table from every Nth atom) ----
+          {"3 box-128 prepass/1",        EB(VC_ENT_RANS_SHARED,8,VC_BAND_NONE,1,0)},
+          {"3 box-128 prepass/64",       EB(VC_ENT_RANS_SHARED,8,VC_BAND_NONE,64,0)},
+          {"3 box-128 prepass/512",      EB(VC_ENT_RANS_SHARED,8,VC_BAND_NONE,512,0)},
+          {"3 whole-256 prepass/512",    EB(VC_ENT_RANS_SHARED,16,VC_BAND_NONE,512,0)},
+          // ---- (4) SKIP metadata (min/max+uniform) — air-heavy effect ----
+          {"4 box-128 skipmeta off",     EB(VC_ENT_RANS_SHARED,8,VC_BAND_NONE,0,0)},
+          {"4 box-128 skipmeta on",      EB(VC_ENT_RANS_SHARED,8,VC_BAND_NONE,0,1)},
+          {"4 box-64  skipmeta on",      EB(VC_ENT_RANS_SHARED,4,VC_BAND_NONE,0,1)},
+          // ---- (5) Morton >= Hilbert confirm (curve-group, equal N) ----
+          {"5 curveMor N512 pooled",     ECRV(VC_TRAV_MORTON, VC_ENT_RANS_SHARED,512,VC_BAND_NONE)},
+          {"5 curveHil N512 pooled",     ECRV(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,512,VC_BAND_NONE)},
+          // ---- combined best: whole-cube + DC|lo|hi + sparse prepass ----
+          {"* whole-256 DC|lo|hi prep512",EB(VC_ENT_RANS_SHARED,16,VC_BAND_DC_LO_HI,512,0)},
+          // RLGR references (band split is a no-op; for ratio context) ----
+          {"R box-128 rlgr",             EB(VC_ENT_RLGR,8,VC_BAND_NONE,0,0)},
+          {"R whole-256 rlgr",           EB(VC_ENT_RLGR,16,VC_BAND_NONE,0,0)},
+        };
+        int neg=(int)(sizeof(eg)/sizeof(eg[0]));
+        for (int i=0;i<neg;++i) if (hi) run_cell("hires-256",hi,256,256,256,eg[i].name,eg[i].cfg);
+        printf("\n");
+        for (int i=0;i<neg;++i) if (co) run_cell("coarse-256",co,256,256,256,eg[i].name,eg[i].cfg);
+        free(hi); free(co);
+        return 0;
+    }
 
     printf("# block-grid bake-off  q(base-step)=%.1f   atom=16^3%s\n", q,
            curve_mode? "   [CURVE-GROUP experiment]" : "");
-    printf("# cols: ratio PSNR MS-SSIM GMSD decMB/s avgTouch us/atom amortDecode(4^3box) hdr%%payload tbl%%payload ngroups\n");
-    printf("%-28s %-10s %7s %6s %7s %7s %7s %6s %7s %6s %6s %6s %6s\n",
-           "config","input","ratio","PSNR","MSSSIM","GMSD","dec","touch","us/atom","amort","hdr%","tbl%","ngrp");
+    printf("# cols: ratio PSNR MS-SSIM GMSD decMB/s avgTouch us/atom amortDecode(4^3box) hdr%%payload tbl%%payload ngroups encMB/s skip%%\n");
+    printf("%-28s %-10s %7s %6s %7s %7s %7s %6s %7s %6s %6s %6s %6s %7s %6s\n",
+           "config","input","ratio","PSNR","MSSSIM","GMSD","dec","touch","us/atom","amort","hdr%","tbl%","ngrp","enc","skip%");
 
     // ----- CURVE-GROUP experiment cell set (group-mode = curve, N in {64,256,512}).
     // Baseline = box-128^3 (M1, ca8) at the SAME no-prediction winning stack, for

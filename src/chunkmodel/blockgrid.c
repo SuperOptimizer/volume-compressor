@@ -203,6 +203,12 @@ static size_t rans_enc(u8 *out, size_t cap, const i16 *q, size_t n, const rans_t
     size_t nw = 0; u32 state = RL;
     for (size_t ii = n; ii-- > 0; ) {
         u32 u = zz(q[ii]); u32 sym = u < ESC ? u : ESC;
+        // EG2024 (3) sparse prepass: a symbol the SAMPLE never saw has freq 0 in the
+        // table; route it to ESC (its full value rides the bypass stream) so the
+        // table stays a valid sampled model and decode is exact. Requires ESC freq>=1
+        // (guaranteed at table build when sparse). For the full-scan path no symbol
+        // that occurs has freq 0, so this is a no-op there.
+        if (sym != ESC && t->freq[sym] == 0) sym = ESC;
         u32 f = t->freq[sym], c = t->cum[sym];
         u64 xmax = (u64)((RL >> PB) << 16) * f;
         while (state >= xmax) { if (nw >= wcap) return 0; words[nw++] = (u16)(state & 0xffff); state >>= 16; }
@@ -221,7 +227,11 @@ static size_t rans_enc(u8 *out, size_t cap, const i16 *q, size_t n, const rans_t
     vc_bitwriter bw; vc_bw_init(&bw, out + boff, cap - boff);
     for (size_t i = 0; i < n; ++i) {
         u32 u = zz(q[i]);
-        if (u >= ESC) { u32 x = u; do { u32 b = x & 0x7fu; x >>= 7; vc_bw_put(&bw, b | (x ? 0x80u : 0u), 8); } while (x); }
+        // bypass-encode whenever the token was ESC: either u>=ESC, or a sampled-
+        // model gap (freq 0). Decoder reads a varint after every ESC token.
+        u32 sym = u < ESC ? u : ESC;
+        if (sym != ESC && t->freq[sym] == 0) sym = ESC;
+        if (sym == ESC) { u32 x = u; do { u32 b = x & 0x7fu; x >>= 7; vc_bw_put(&bw, b | (x ? 0x80u : 0u), 8); } while (x); }
     }
     if (bw.overflow) return 0;
     size_t blen = vc_bw_finish(&bw);
@@ -996,16 +1006,14 @@ int vc_bg_encode(const u8 *vol, u32 dz, u32 dy, u32 dx,
 
         // Build shared table once (M1). For M0 we rebuild per atom below.
         // EG2024 (3) sparse prepass: the table is fit to a SAMPLE, so a symbol that
-        // occurs in an un-sampled atom could get freq 0 and break rANS. Laplace-
-        // smooth (every 0..254 symbol gets a floor count) so coverage is total.
-        // This is the standard fix and keeps the encode-time saving (we still only
-        // histogram the sample). ESC (255) is the catch-all bypass and never zero.
+        // occurs only in un-sampled atoms has count 0. Rather than smooth (which
+        // distorts the model on sparse high-q data), we ESCAPE such gaps at encode
+        // time (rans_enc routes freq-0 symbols to ESC). For that the ESC symbol must
+        // be codeable, so floor its count to >=1 when sampling. Cheap + exact.
         if (cfg->entropy == VC_ENT_RANS_SHARED) {
             if (prep > 1) {
-                for (u32 s = 0; s < ESC; ++s) {
-                    counts[s] += 1;
-                    for (u32 b = 0; b < nb; ++b) bcounts[b][s] += 1;
-                }
+                if (!counts[ESC]) counts[ESC] = 1;
+                for (u32 b = 0; b < nb; ++b) if (!bcounts[b][ESC]) bcounts[b][ESC] = 1;
             }
             if (nb > 1) {
                 for (u32 b = 0; b < nb; ++b) rt_build(&C->btable[b], bcounts[b]);
