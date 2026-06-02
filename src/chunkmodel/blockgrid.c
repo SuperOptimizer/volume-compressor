@@ -546,10 +546,86 @@ static inline i16 dcsv_predict(const i16 *lvl, u32 Az, u32 Ay, u32 Ax,
     return (i16)((acc + (i32)cnt/2) / (i32)cnt);
 }
 
+// --- DC-DPCM analysis probe (experiment r2-dc-dpcm) -------------------------
+// Quantifies the DC-residual-reduction claim on the actual DC LEVEL field, for
+// several predictors, in both an entropy-coder-byte and a directory-varint cost
+// model. Filled by dcsv_encode; read by the bench. All purely additive analysis.
+typedef struct {
+    u32    n;
+    double H_raw, H_causal, H_planar;   // order-0 entropy (bits/level)
+    size_t rans_raw, rans_causal, rans_planar; // rANS bytes incl. NSYM*2 table
+    size_t vint_raw, vint_causal, vint_planar; // zigzag-varint bytes (directory)
+    size_t resid_abs_raw, resid_abs_causal, resid_abs_planar; // sum|residual|
+} dc_probe_t;
+static dc_probe_t g_dc_probe;   // single-threaded reentrant: overwritten per encode
+
+static double order0_entropy(const i16 *v, u32 n) {
+    u64 c[NSYM]; memset(c, 0, sizeof(c));
+    for (u32 i = 0; i < n; ++i) { u32 u = zz(v[i]); c[u < ESC ? u : ESC]++; }
+    double H = 0.0;
+    for (u32 s = 0; s < NSYM; ++s) if (c[s]) { double p = (double)c[s]/n; H -= p*log2(p); }
+    return H;
+}
+static size_t rans_cost_with_table(const i16 *v, u32 n) {
+    u64 c[NSYM]; memset(c, 0, sizeof(c)); rans_hist(v, n, c);
+    rans_table t; rt_build(&t, c);
+    size_t cap = (size_t)n*4 + NSYM*2 + 64; u8 *tmp = (u8*)malloc(cap);
+    size_t plen = rans_enc(tmp, cap, v, n, &t); free(tmp);
+    return plen ? plen + NSYM*2 : 0;     // +12-bit freq table
+}
+static size_t vint_cost(const i16 *v, u32 n) {
+    size_t b = 0;
+    for (u32 i = 0; i < n; ++i) { u32 u = zz(v[i]); do { u >>= 7; b++; } while (u); }
+    return b;
+}
+static size_t sum_abs(const i16 *v, u32 n) {
+    size_t s = 0; for (u32 i = 0; i < n; ++i) s += (v[i] < 0 ? -v[i] : v[i]); return s;
+}
+// Planar predictor: p = L + U + F - (UL + UF + LF) + ... clamped to a simple
+// 3D gradient extrapolation; we use the standard 2D-per-plane planar
+// (L + U - UL) extended with the front neighbor: pred = L + U + F - UL - UF - FL + ULF.
+static i16 planar_pred(const i16 *lvl, u32 Ay, u32 Ax, u32 z, u32 y, u32 x) {
+    #define LV(dz,dy,dx) lvl[(((z-(dz))*Ay)+(y-(dy)))*Ax+(x-(dx))]
+    int hx = (x>0), hy = (y>0), hz = (z>0);
+    if (hx&&hy&&hz) { i32 p = LV(0,0,1)+LV(0,1,0)+LV(1,0,0)
+                              - LV(0,1,1)-LV(1,0,1)-LV(1,1,0)+LV(1,1,1);
+                      if (p<-32768)p=-32768; if(p>32767)p=32767; return (i16)p; }
+    if (hx&&hy)     { i32 p = LV(0,0,1)+LV(0,1,0)-LV(0,1,1); return (i16)p; }
+    if (hx) return LV(0,0,1);
+    if (hy) return LV(0,1,0);
+    if (hz) return LV(1,0,0);
+    return 0;
+    #undef LV
+}
+static void dc_probe_run(const i16 *lvl, u32 Az, u32 Ay, u32 Ax) {
+    u32 n = Az*Ay*Ax;
+    i16 *rc = (i16*)malloc((size_t)n*2), *rp = (i16*)malloc((size_t)n*2);
+    for (u32 z=0;z<Az;++z) for (u32 y=0;y<Ay;++y) for (u32 x=0;x<Ax;++x) {
+        u32 i=(z*Ay+y)*Ax+x;
+        rc[i]=(i16)(lvl[i]-dcsv_predict(lvl,Az,Ay,Ax,z,y,x));
+        rp[i]=(i16)(lvl[i]-planar_pred(lvl,Ay,Ax,z,y,x));
+    }
+    g_dc_probe.n = n;
+    g_dc_probe.H_raw    = order0_entropy(lvl, n);
+    g_dc_probe.H_causal = order0_entropy(rc, n);
+    g_dc_probe.H_planar = order0_entropy(rp, n);
+    g_dc_probe.rans_raw    = rans_cost_with_table(lvl, n);
+    g_dc_probe.rans_causal = rans_cost_with_table(rc, n);
+    g_dc_probe.rans_planar = rans_cost_with_table(rp, n);
+    g_dc_probe.vint_raw    = vint_cost(lvl, n);
+    g_dc_probe.vint_causal = vint_cost(rc, n);
+    g_dc_probe.vint_planar = vint_cost(rp, n);
+    g_dc_probe.resid_abs_raw    = sum_abs(lvl, n);
+    g_dc_probe.resid_abs_causal = sum_abs(rc, n);
+    g_dc_probe.resid_abs_planar = sum_abs(rp, n);
+    free(rc); free(rp);
+}
+
 // Encode the DC level grid into a freshly malloc'd stream. Returns stream (caller
 // frees) and sets *out_len; charges *stat_bytes. Residuals = level - causal pred.
 static u8 *dcsv_encode(const i16 *lvl, u32 Az, u32 Ay, u32 Ax,
                        size_t *out_len) {
+    dc_probe_run(lvl, Az, Ay, Ax);
     u32 n = Az*Ay*Ax;
     i16 *resid = (i16*)malloc((size_t)n*sizeof(i16));
     for (u32 z=0; z<Az; ++z) for (u32 y=0; y<Ay; ++y) for (u32 x=0; x<Ax; ++x) {
@@ -1506,6 +1582,12 @@ int vc_bg_decode_region(const vc_bg_archive *a,
     *total_decodes = ac_decodes;  // unique AC payload-decodes for the whole box
     *atoms_in_box = box;
     free(qsc); free(rank_lat); free(mc.dc); free(mc.state);
+    return 0;
+}
+
+int vc_bg_get_dc_probe(vc_bg_dc_probe *out) {
+    if (!g_dc_probe.n) return 1;
+    memcpy(out, &g_dc_probe, sizeof(*out));
     return 0;
 }
 

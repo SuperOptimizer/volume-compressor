@@ -210,6 +210,22 @@ int vc_bg_decode_region(const vc_bg_archive *a,
 
 void vc_bg_free(vc_bg_archive *a);
 
+// --- DC-DPCM analysis probe (experiment r2-dc-dpcm) -------------------------
+// After a vc_bg_encode with cfg.dc_subvol=1, these report the per-predictor cost
+// of the per-atom DC LEVEL field (raw absolute vs causal-mean DPCM vs planar
+// DPCM), in both entropy-coded bytes (rANS incl. table) and directory varint
+// bytes, plus order-0 entropy and sum|residual|. Lets the bench attribute the
+// total-stream delta to the DC field and quantify the residual reduction.
+typedef struct {
+    u32    n;
+    double H_raw, H_causal, H_planar;
+    size_t rans_raw, rans_causal, rans_planar;
+    size_t vint_raw, vint_causal, vint_planar;
+    size_t resid_abs_raw, resid_abs_causal, resid_abs_planar;
+} vc_bg_dc_probe;
+// Copy the last encode's DC probe into *out. Returns 0 if a probe was recorded.
+int vc_bg_get_dc_probe(vc_bg_dc_probe *out);
+
 // Lattice dims (atoms per axis) for a volume shape (ceil-div by 16).
 static inline u32 vc_bg_natoms(u32 n) { return (n + VC_ATOM - 1u) / VC_ATOM; }
 

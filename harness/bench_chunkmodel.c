@@ -19,6 +19,9 @@ static u8 *rd(const char*p,size_t*n){FILE*f=fopen(p,"rb");if(!f)return 0;fseek(f
 
 // Assemble hires-256 from data/cache_hires/*.u8 (first 8, 2x2x2). Returns volume.
 static u8 *load_hires256(const char *root) {
+    // Prefer the prebuilt single-file 256^3 (data/refbuild/hires_256.u8).
+    { char p[512]; snprintf(p,sizeof(p),"%s/data/refbuild/hires_256.u8",root);
+      size_t l; u8 *b=rd(p,&l); if(b && l==(size_t)256*256*256) return b; if(b) free(b); }
     char dir[512]; snprintf(dir,sizeof(dir),"%s/data/cache_hires",root);
     // collect up to 8 names deterministically (sorted)
     char names[64][512]; int nn=0;
@@ -41,6 +44,8 @@ static u8 *load_hires256(const char *root) {
     return vol;
 }
 static u8 *load_coarse256(const char *root) {
+    { char p2[512]; snprintf(p2,sizeof(p2),"%s/data/refbuild/coarse_256.u8",root);
+      size_t l; u8 *b=rd(p2,&l); if(b && l==(size_t)256*256*256) return b; if(b) free(b); }
     char p[512]; snprintf(p,sizeof(p),"%s/data/coarse/coarse_z15_y8_x8_3x3x3.u8",root);
     size_t l; u8 *raw=rd(p,&l); if(!raw) return 0; const u32 S=384;
     if (l<(size_t)S*S*S){free(raw);return 0;}
@@ -118,6 +123,53 @@ int main(int argc,char**argv){
     const char *mode = (argc>3)? argv[3] : "";
     int curve_mode = (strcmp(mode,"curve")==0);
     int eg_mode    = (strcmp(mode,"eg")==0);
+    int dc_mode    = (strcmp(mode,"dc")==0);
+
+    // ===== DC-DPCM probe: attribute the DC field cost across predictors =====
+    if (dc_mode) {
+        printf("# DC-DPCM probe  q(base-step)=%.1f  atom=16^3   (lattice 16^3 atoms, n=4096 DC levels)\n", q);
+        struct { const char*nm; const u8*v; } in[2] = {{"hires-256",hi},{"coarse-256",co}};
+        for (int t=0;t<2;++t) {
+            if (!in[t].v) continue;
+            // Enable DC sub-volume so the encoder fills the DC level grid + probe.
+            vc_bg_cfg cfg = (vc_bg_cfg){VC_STENCIL_NONE,VC_TRAV_RASTER,VC_EDGE_SELF,
+                VC_ENT_RLGR,8,1,q,1, VC_GROUP_BOX,0,VC_BOUND_FIXED,0,VC_TABLE_FULL,0,0,
+                VC_BAND_NONE,0,0};
+            vc_bg_archive *a=NULL; vc_bg_stats st;
+            if (vc_bg_encode(in[t].v,256,256,256,&cfg,&a,&st)) { printf("%s ENCODE FAIL\n",in[t].nm); continue; }
+            vc_bg_dc_probe p;
+            if (vc_bg_get_dc_probe(&p)) { printf("%s no probe\n",in[t].nm); vc_bg_free(a); continue; }
+            double tot = (double)st.total_bytes;
+            printf("--- %s  total=%.0fB  ratio=%.1f ---\n", in[t].nm, tot,
+                   (double)(256.0*256*256)/tot);
+            printf("  DC levels n=%u\n", p.n);
+            printf("  order-0 entropy bits/level:  raw=%.3f  causal-DPCM=%.3f  planar-DPCM=%.3f\n",
+                   p.H_raw, p.H_causal, p.H_planar);
+            printf("  sum|residual|:               raw=%zu  causal=%zu (%.1f%%)  planar=%zu (%.1f%%)\n",
+                   p.resid_abs_raw, p.resid_abs_causal,
+                   100.0*(double)p.resid_abs_causal/(double)(p.resid_abs_raw?p.resid_abs_raw:1),
+                   p.resid_abs_planar,
+                   100.0*(double)p.resid_abs_planar/(double)(p.resid_abs_raw?p.resid_abs_raw:1));
+            printf("  rANS bytes (incl table):     raw=%zu  causal=%zu  planar=%zu\n",
+                   p.rans_raw, p.rans_causal, p.rans_planar);
+            printf("  directory varint bytes:      raw=%zu  causal=%zu  planar=%zu\n",
+                   p.vint_raw, p.vint_causal, p.vint_planar);
+            // DC cost as % of total stream, and the absolute byte saving of the
+            // best DPCM scheme vs the raw varint that the box-M1 directory uses.
+            double dc_pct_raw_vint = 100.0*(double)p.vint_raw/tot;
+            size_t best_dpcm = p.rans_causal;
+            if (p.rans_planar<best_dpcm) best_dpcm=p.rans_planar;
+            if (p.vint_causal<best_dpcm) best_dpcm=p.vint_causal;
+            if (p.vint_planar<best_dpcm) best_dpcm=p.vint_planar;
+            long save = (long)p.vint_raw - (long)best_dpcm;
+            printf("  DC raw-varint is %.2f%% of total stream; best DPCM saves %ldB = %.3f%% of total\n",
+                   dc_pct_raw_vint, save, 100.0*(double)save/tot);
+            vc_bg_free(a);
+        }
+        printf("\n");
+        free(hi); free(co);
+        return 0;
+    }
 
     // ===== EG2024 (Fast Compressed Segmentation Volumes) experiment cell set =====
     if (eg_mode) {
