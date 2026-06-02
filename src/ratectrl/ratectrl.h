@@ -62,6 +62,15 @@ typedef struct {
     vc_rc_dist  dist;
     vc_rc_model model;
     f64 target_ratio;       // global ratio target (e.g. 10.0 for 10x)
+    // Per-unit step is clamped to [base/step_window, base*step_window] around the
+    // Lagrangian base step (base = 2.94*sqrt(lambda)). This is what HEVC/JPEG-XL
+    // do: QP varies in a bounded window around a frame base-QP, NOT unbounded.
+    // Plain summed-MSE Lagrangian otherwise degenerates to "bang-bang" (a few
+    // units near-lossless, the rest crushed) which underperforms uniform-q in
+    // PSNR (PLAN §2 "MSE-optimal allocation provably starves HF"). A window of
+    // ~4x reproduces the realistic "easy chunks 20x / hard chunks 5x" spread.
+    // 0 or <1 => unbounded (the degenerate baseline, for comparison).
+    f64 step_window;
     int verbose;
 } vc_rc_config;
 

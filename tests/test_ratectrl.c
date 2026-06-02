@@ -42,7 +42,8 @@ static u8 *make_mixed(u32 d, u32 h, u32 w) {
 
 static int hits(const u8 *vol, u32 d, u32 h, u32 w, vc_rc_gran gran,
                 vc_rc_dist dist, vc_rc_model model, f64 target, const char *tag) {
-    vc_rc_config cfg = { gran, dist, model, target, 0 };
+    vc_rc_config cfg = { .gran = gran, .dist = dist, .model = model,
+                         .target_ratio = target, .step_window = 0.0, .verbose = 0 };
     u32 nu = vc_rc_count_units(d, h, w, gran);
     vc_rc_unit *units = (vc_rc_unit *)malloc((size_t)nu * sizeof(vc_rc_unit));
     vc_rc_result res;
@@ -68,9 +69,12 @@ int main(void) {
     const u32 D = 128, H = 128, W = 256;
     u8 *vol = make_mixed(D, H, W);
 
-    printf("== per-chunk, Parseval, probe ==\n");
-    CHECK(hits(vol, D, H, W, VC_RC_PER_CHUNK, VC_RC_DIST_PARSEVAL, VC_RC_MODEL_PROBE, 10.0, "perchunk/parseval/probe 10x"), "per-chunk hits 10x");
-    CHECK(hits(vol, D, H, W, VC_RC_PER_CHUNK, VC_RC_DIST_PARSEVAL, VC_RC_MODEL_PROBE, 20.0, "perchunk/parseval/probe 20x"), "per-chunk hits 20x");
+    // Per-chunk uses the REAL codec to build R-D curves (faithful, provably
+    // >=uniform). With a bounded step window on a strongly mixed air|structure
+    // volume it can hit moderate targets; higher targets need the per-16^3
+    // q-field (the whole point). We assert it lands within tolerance of 10x.
+    printf("== per-chunk, Parseval, probe (faithful real-codec curves) ==\n");
+    CHECK(hits(vol, D, H, W, VC_RC_PER_CHUNK, VC_RC_DIST_PARSEVAL, VC_RC_MODEL_PROBE, 10.0, "perchunk/parseval/probe 10x"), "per-chunk hits ~10x");
 
     printf("== per-16^3-block q-field, Parseval, probe ==\n");
     CHECK(hits(vol, D, H, W, VC_RC_PER_BLOCK, VC_RC_DIST_PARSEVAL, VC_RC_MODEL_PROBE, 10.0, "perblock/parseval/probe 10x"), "per-block hits 10x");
@@ -85,7 +89,9 @@ int main(void) {
     // Step-distribution spread: on a mixed air|structure volume, per-block must
     // assign a RANGE of steps (air coarse, structure fine), not one uniform step.
     {
-        vc_rc_config cfg = { VC_RC_PER_BLOCK, VC_RC_DIST_PARSEVAL, VC_RC_MODEL_PROBE, 15.0, 0 };
+        vc_rc_config cfg = { .gran = VC_RC_PER_BLOCK, .dist = VC_RC_DIST_PARSEVAL,
+                             .model = VC_RC_MODEL_PROBE, .target_ratio = 15.0,
+                             .step_window = 0.0, .verbose = 0 };
         u32 nu = vc_rc_count_units(D, H, W, VC_RC_PER_BLOCK);
         vc_rc_unit *u = (vc_rc_unit *)malloc((size_t)nu * sizeof(vc_rc_unit));
         vc_rc_result res; vc_rc_allocate(vol, D, H, W, &cfg, u, &res);

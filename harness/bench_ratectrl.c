@@ -46,8 +46,8 @@ static double mse(const u8 *a, const u8 *b, size_t n){
 }
 static double psnr_of(double m){ return m<=0?99.0:10.0*log10(255.0*255.0/m); }
 
-// Encode the volume with a UNIFORM step (fixed-q proxy) at the given step, return
-// achieved ratio + true PSNR (uses the real codec).
+// Encode the volume with a UNIFORM step (fixed-q) via the real codec, return
+// achieved ratio + true whole-volume PSNR.
 static void fixed_q(const u8 *vol,u32 d,u32 h,u32 w,f32 step,double *ratio,double *psnr){
     u8 *arc=NULL; size_t alen=0;
     vc_encode_volume(vol,d,h,w,step,&arc,&alen);
@@ -55,6 +55,41 @@ static void fixed_q(const u8 *vol,u32 d,u32 h,u32 w,f32 step,double *ratio,doubl
     *ratio = (double)((size_t)d*h*w)/alen;
     *psnr = psnr_of(mse(vol,rec,(size_t)d*h*w));
     free(arc); free(rec);
+}
+
+// REAL per-chunk variable-q: the codec already stores one step per chunk in the
+// chunk header, but vc_encode_volume drives one global step. To exercise true
+// variable allocation through the unmodified codec we encode each VC_CHUNK_SIDE^3
+// chunk as its OWN sub-volume at the allocator's per-chunk step, sum the chunk
+// payload bytes, decode it back, and scatter into the reconstruction. This is an
+// honest whole-volume PSNR at the allocator's per-chunk q-field (per-chunk
+// granularity). `cs` is vc_chunk_side(). Returns achieved ratio + true PSNR.
+static void variable_q_perchunk(const u8 *vol,u32 d,u32 h,u32 w,
+                                const vc_rc_unit *units,double *ratio,double *psnr){
+    u32 cs=vc_chunk_side();
+    u32 ncz=(d+cs-1)/cs, ncy=(h+cs-1)/cs, ncx=(w+cs-1)/cs;
+    u8 *rec=calloc((size_t)d*h*w,1);
+    u8 *cbuf=malloc((size_t)cs*cs*cs);
+    size_t total_bytes=0; u32 ui=0;
+    for(u32 cz=0;cz<ncz;++cz)for(u32 cy=0;cy<ncy;++cy)for(u32 cx=0;cx<ncx;++cx,++ui){
+        // gather chunk (zero-pad edges) into a cs^3 sub-volume
+        for(u32 z=0;z<cs;++z)for(u32 y=0;y<cs;++y)for(u32 x=0;x<cs;++x){
+            u32 vz=cz*cs+z,vy=cy*cs+y,vx=cx*cs+x;
+            cbuf[(size_t)(z*cs+y)*cs+x]=(vz<d&&vy<h&&vx<w)?vol[((size_t)vz*h+vy)*w+vx]:0;
+        }
+        u8 *arc=NULL; size_t alen=0;
+        vc_encode_volume(cbuf,cs,cs,cs,units[ui].step,&arc,&alen);
+        total_bytes+=alen;
+        u8 *crec=NULL; u32 rd,rh,rw; vc_decode_volume(arc,alen,&crec,&rd,&rh,&rw);
+        for(u32 z=0;z<cs;++z)for(u32 y=0;y<cs;++y)for(u32 x=0;x<cs;++x){
+            u32 vz=cz*cs+z,vy=cy*cs+y,vx=cx*cs+x;
+            if(vz<d&&vy<h&&vx<w) rec[((size_t)vz*h+vy)*w+vx]=crec[(size_t)(z*cs+y)*cs+x];
+        }
+        free(arc); free(crec);
+    }
+    *ratio=(double)((size_t)d*h*w)/(double)total_bytes;
+    *psnr=psnr_of(mse(vol,rec,(size_t)d*h*w));
+    free(rec); free(cbuf);
 }
 
 static void run(const char *label, const u8 *vol, u32 d, u32 h, u32 w){
@@ -68,7 +103,7 @@ static void run(const char *label, const u8 *vol, u32 d, u32 h, u32 w){
     for(int ti=0; ti<3; ++ti){
         for(int gi=0; gi<2; ++gi){
             vc_rc_gran gran = gi==0?VC_RC_PER_CHUNK:VC_RC_PER_BLOCK;
-            vc_rc_config cfg = { gran, VC_RC_DIST_PARSEVAL, VC_RC_MODEL_PROBE, targets[ti], 0 };
+            vc_rc_config cfg = { .gran=gran, .dist=VC_RC_DIST_PARSEVAL, .model=VC_RC_MODEL_PROBE, .target_ratio=targets[ti], .step_window=0.0 };
             u32 nu = vc_rc_count_units(d,h,w,gran);
             vc_rc_unit *u = malloc((size_t)nu*sizeof(vc_rc_unit));
             vc_rc_result res;
@@ -86,7 +121,7 @@ static void run(const char *label, const u8 *vol, u32 d, u32 h, u32 w){
     printf("target | achieved | mean parMSE | mean truMSE | ratio par/tru\n");
     printf("-------+----------+-------------+-------------+--------------\n");
     for(int ti=0; ti<3; ++ti){
-        vc_rc_config cfg = { VC_RC_PER_BLOCK, VC_RC_DIST_TRUEMSE, VC_RC_MODEL_PROBE, targets[ti], 0 };
+        vc_rc_config cfg = { .gran=VC_RC_PER_BLOCK, .dist=VC_RC_DIST_TRUEMSE, .model=VC_RC_MODEL_PROBE, .target_ratio=targets[ti], .step_window=0.0 };
         u32 nu = vc_rc_count_units(d,h,w,VC_RC_PER_BLOCK);
         vc_rc_unit *u = malloc((size_t)nu*sizeof(vc_rc_unit));
         vc_rc_result res; vc_rc_allocate(vol,d,h,w,&cfg,u,&res);
@@ -101,10 +136,10 @@ static void run(const char *label, const u8 *vol, u32 d, u32 h, u32 w){
     {
         u32 nu = vc_rc_count_units(d,h,w,VC_RC_PER_BLOCK);
         vc_rc_unit *u = malloc((size_t)nu*sizeof(vc_rc_unit)); vc_rc_result res;
-        vc_rc_config cp = { VC_RC_PER_BLOCK, VC_RC_DIST_PARSEVAL, VC_RC_MODEL_PROBE, 20.0, 0 };
+        vc_rc_config cp = { .gran=VC_RC_PER_BLOCK, .dist=VC_RC_DIST_PARSEVAL, .model=VC_RC_MODEL_PROBE, .target_ratio=20.0, .step_window=0.0 };
         double t0=now_sec(); vc_rc_allocate(vol,d,h,w,&cp,u,&res); double t1=now_sec();
         double r_probe=res.achieved_ratio;
-        vc_rc_config cl = { VC_RC_PER_BLOCK, VC_RC_DIST_PARSEVAL, VC_RC_MODEL_LAPLACIAN, 20.0, 0 };
+        vc_rc_config cl = { .gran=VC_RC_PER_BLOCK, .dist=VC_RC_DIST_PARSEVAL, .model=VC_RC_MODEL_LAPLACIAN, .target_ratio=20.0, .step_window=0.0 };
         double t2=now_sec(); vc_rc_allocate(vol,d,h,w,&cl,u,&res); double t3=now_sec();
         printf("  probe     : %.1f ms  achieved %.2fx\n", (t1-t0)*1e3, r_probe);
         printf("  laplacian : %.1f ms  achieved %.2fx  (%.2fx faster)\n",
@@ -115,36 +150,39 @@ static void run(const char *label, const u8 *vol, u32 d, u32 h, u32 w){
     // (vi) per-unit step distribution on the volume (per-16^3, 20x).
     printf("\n(vi) Per-16^3 step distribution at 20x target (histogram over step grid)\n");
     {
-        vc_rc_config cfg = { VC_RC_PER_BLOCK, VC_RC_DIST_PARSEVAL, VC_RC_MODEL_PROBE, 20.0, 0 };
+        vc_rc_config cfg = { .gran=VC_RC_PER_BLOCK, .dist=VC_RC_DIST_PARSEVAL, .model=VC_RC_MODEL_PROBE, .target_ratio=20.0, .step_window=0.0 };
         u32 nu = vc_rc_count_units(d,h,w,VC_RC_PER_BLOCK);
         vc_rc_unit *u = malloc((size_t)nu*sizeof(vc_rc_unit)); vc_rc_result res;
         vc_rc_allocate(vol,d,h,w,&cfg,u,&res);
-        // bucket by step value
-        const f32 grid[]={1.5f,3.f,6.f,12.f,24.f,48.f,96.f}; int cnt[7]={0};
+        // bucket by step value (matches lagrangian.c STEP_GRID)
+        const f32 grid[]={1.f,1.5f,2.f,3.f,4.f,6.f,8.f,12.f,16.f,24.f,32.f,48.f,64.f,90.f,128.f,180.f};
+        const int NG=16; int *cnt=calloc(NG,sizeof(int));
         f32 smin=1e9f,smax=0; for(u32 i=0;i<nu;++i){ if(u[i].step<smin)smin=u[i].step; if(u[i].step>smax)smax=u[i].step;
-            for(int g=0;g<7;++g) if(fabsf(u[i].step-grid[g])<0.01f){cnt[g]++;break;} }
-        printf("  step:");for(int g=0;g<7;++g)printf(" %6.1f",grid[g]); printf("\n");
-        printf("  cnt :");for(int g=0;g<7;++g)printf(" %6d",cnt[g]); printf("   (min=%.1f max=%.1f spread=%.1fx)\n",smin,smax,smax/smin);
+            for(int g=0;g<NG;++g) if(fabsf(u[i].step-grid[g])<0.01f){cnt[g]++;break;} }
+        printf("  step:");for(int g=0;g<NG;++g)printf(" %5.0f",grid[g]); printf("\n");
+        printf("  cnt :");for(int g=0;g<NG;++g)printf(" %5d",cnt[g]); printf("\n  (min=%.1f max=%.1f spread=%.1fx over %u blocks)\n",smin,smax,smax/smin,nu);
         printf("  => easy/air units take coarse steps (high ratio), busy/structure units stay fine.\n");
-        free(u);
+        free(cnt); free(u);
     }
 
-    // (ii) variable-q quality buy: at the per-chunk 20x achieved ratio, compare
-    // fixed-q (uniform step) PSNR to the allocator's mean true-MSE PSNR proxy.
-    printf("\n(ii) Variable-q vs fixed-q at matched ratio (~20x)\n");
-    {
-        // find uniform step giving ~20x
-        double r=0,p=0; f32 lo=1,hi=200,step=20;
-        for(int it=0;it<24;++it){ step=sqrtf(lo*hi); fixed_q(vol,d,h,w,step,&r,&p); if(r<20.0) lo=step; else hi=step; if(fabs(r-20.0)<0.3) break; }
-        printf("  fixed-q  : step=%.1f achieved %.2fx PSNR=%.2f dB\n", step, r, p);
-        // allocator per-16^3 at 20x, report mean true-MSE -> PSNR proxy
-        vc_rc_config cfg={VC_RC_PER_BLOCK,VC_RC_DIST_TRUEMSE,VC_RC_MODEL_PROBE,20.0,0};
-        u32 nu=vc_rc_count_units(d,h,w,VC_RC_PER_BLOCK);
+    // (ii) variable-q quality buy: fixed-q vs allocator per-chunk variable-q,
+    // BOTH measured through the real codec as true whole-volume PSNR, matched at
+    // ~the allocator's achieved ratio. Per-chunk variable-q is what the unmodified
+    // codec can express today (one step per chunk header); per-16^3 needs the
+    // q-field stored in the chunk header (future codec lever).
+    printf("\n(ii) Variable-q (per-chunk, real codec) vs fixed-q at matched ratio\n");
+    for(double tgt=10.0; tgt<=50.0; tgt*=sqrt(5.0)){
+        // allocate per-chunk steps at this target, then encode each chunk at its step
+        vc_rc_config cfg={ .gran=VC_RC_PER_CHUNK, .dist=VC_RC_DIST_TRUEMSE, .model=VC_RC_MODEL_PROBE, .target_ratio=tgt, .step_window=0.0 };
+        u32 nu=vc_rc_count_units(d,h,w,VC_RC_PER_CHUNK);
         vc_rc_unit *u=malloc((size_t)nu*sizeof(vc_rc_unit)); vc_rc_result res;
         vc_rc_allocate(vol,d,h,w,&cfg,u,&res);
-        printf("  variable : per-16^3 achieved %.2fx  mean-block true-MSE=%.2f -> PSNR proxy=%.2f dB\n",
-               res.achieved_ratio, res.true_mse, psnr_of(res.true_mse));
-        printf("  (PSNR proxy is the mean per-block decode-MSE; allocator minimizes total distortion at rate.)\n");
+        double vr,vp; variable_q_perchunk(vol,d,h,w,u,&vr,&vp);
+        // fixed-q uniform step matched to the SAME achieved ratio vr
+        double fr=0,fp=0; f32 lo=1,hi=250,step=20;
+        for(int it=0;it<28;++it){ step=sqrtf(lo*hi); fixed_q(vol,d,h,w,step,&fr,&fp); if(fr<vr) lo=step; else hi=step; if(fabs(fr-vr)<vr*0.02) break; }
+        printf("  target %4.0fx | variable %.2fx PSNR=%.2f dB  vs  fixed %.2fx PSNR=%.2f dB  (delta %+.2f dB)\n",
+               tgt, vr, vp, fr, fp, vp-fp);
         free(u);
     }
 }

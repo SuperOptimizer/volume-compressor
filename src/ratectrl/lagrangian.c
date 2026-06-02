@@ -31,6 +31,7 @@
 // counts nor the 8^3 subband scan; it calls the real entropy coder for rate.
 // All scratch is heap (PLAN §7). Encode-side tool; never on the decode path.
 #include "ratectrl.h"
+#include "../../include/vc/vc.h"
 #include "../config.h"
 #include "../blocks.h"
 #include "../core/chunk.h"
@@ -259,14 +260,85 @@ static int build_hull(rd_pt *p, int n) {
     return h;
 }
 
-static const rd_pt *pick(const rd_pt *hull, int h, f64 lambda) {
-    const rd_pt *best = &hull[0];
-    f64 bc = hull[0].d + lambda * hull[0].r;
-    for (int i = 1; i < h; ++i) { f64 c = hull[i].d + lambda * hull[i].r; if (c < bc) { bc = c; best = &hull[i]; } }
+// Lagrangian pick restricted to hull points with step in [smin, smax]. If none
+// qualify (a unit's hull has no vertex in the window), snap to the hull vertex
+// whose step is nearest the window so the unit still respects the bound.
+static const rd_pt *pick_window(const rd_pt *hull, int h, f64 lambda, f32 smin, f32 smax) {
+    const rd_pt *best = NULL; f64 bc = 0;
+    for (int i = 0; i < h; ++i) {
+        if (hull[i].step < smin || hull[i].step > smax) continue;
+        f64 c = hull[i].d + lambda * hull[i].r;
+        if (!best || c < bc) { bc = c; best = &hull[i]; }
+    }
+    if (best) return best;
+    best = &hull[0]; f64 bd = 1e300;
+    for (int i = 0; i < h; ++i) {
+        f32 s = hull[i].step, cl = s < smin ? smin : (s > smax ? smax : s);
+        f64 d = fabs((f64)s - (f64)cl);
+        if (d < bd) { bd = d; best = &hull[i]; }
+    }
     return best;
 }
 
 typedef struct { int n; rd_pt hull[NSTEP]; } unit_curve;
+
+// Bytes of a unit if it were quantized at exactly `step`, linearly interpolated
+// between the unit's bracketing hull vertices in step (R monotone in step). Used
+// only to find the uniform base step; the final allocation snaps to real hull
+// vertices. The hull is sorted ascending by R (descending by step).
+static f64 unit_bytes_at_step(const rd_pt *hull, int h, f32 step) {
+    // find vertices bracketing `step` by step value
+    const rd_pt *lo_s = NULL, *hi_s = NULL;   // lo_s.step <= step <= hi_s.step
+    for (int i = 0; i < h; ++i) {
+        if (hull[i].step <= step && (!lo_s || hull[i].step > lo_s->step)) lo_s = &hull[i];
+        if (hull[i].step >= step && (!hi_s || hull[i].step < hi_s->step)) hi_s = &hull[i];
+    }
+    if (lo_s && hi_s) {
+        if (lo_s == hi_s) return lo_s->r;
+        f64 t = ((f64)step - lo_s->step) / ((f64)hi_s->step - lo_s->step);
+        return lo_s->r + t * (hi_s->r - lo_s->r);
+    }
+    return lo_s ? lo_s->r : (hi_s ? hi_s->r : 0.0);
+}
+
+// Bisect the continuous uniform step whose summed unit bytes == target_bytes.
+static f32 uniform_base_step(const unit_curve *cur, u32 nunits, f64 target_bytes) {
+    f64 lo = STEP_GRID[0], hi = STEP_GRID[NSTEP-1];
+    f32 base = (f32)sqrt(lo * hi);
+    for (int it = 0; it < 50; ++it) {
+        base = (f32)sqrt(lo * hi);
+        f64 bytes = 0;
+        for (u32 u = 0; u < nunits; ++u) bytes += unit_bytes_at_step(cur[u].hull, cur[u].n, base);
+        if (bytes > target_bytes) lo = base; else hi = base;  // coarser => fewer bytes
+        if (fabs(bytes - target_bytes) < target_bytes * 0.005) break;
+    }
+    return base;
+}
+
+// FAITHFUL per-chunk R-D: encode the chunk sub-volume with the REAL codec at
+// each candidate step and measure exact bytes + exact decode-MSE. This is the
+// only model guaranteed consistent with what the codec actually emits, so the
+// resulting per-chunk allocation provably matches-or-beats uniform-q (uniform is
+// a feasible point of the same hull). `cbuf` is a reusable VC_CS^3 voxel buffer.
+static void chunk_curve_real(unit_curve *uc, const u8 *restrict cbuf,
+                             f64 *par_acc, f64 *tru_acc, u32 *acc_n) {
+    const u32 cs = VC_CS;
+    for (int g = 0; g < NSTEP; ++g) {
+        u8 *arc = NULL; size_t alen = 0;
+        vc_encode_volume(cbuf, cs, cs, cs, STEP_GRID[g], &arc, &alen);
+        u8 *rec = NULL; u32 rd, rh, rw;
+        vc_decode_volume(arc, alen, &rec, &rd, &rh, &rw);
+        f64 s = 0.0;
+        for (size_t i = 0; i < VC_CVOX; ++i) { f64 e = (f64)rec[i] - (f64)cbuf[i]; s += e*e; }
+        f64 m = s / VC_CVOX;
+        uc->hull[g].r = (f64)alen;
+        uc->hull[g].d = m;
+        uc->hull[g].step = STEP_GRID[g];
+        if (acc_n && g == NSTEP/2) { *par_acc += m; *tru_acc += m; (*acc_n)++; }
+        free(arc); free(rec);
+    }
+    uc->n = build_hull(uc->hull, NSTEP);
+}
 
 // --- public ----------------------------------------------------------------
 u32 vc_rc_count_units(u32 dz, u32 dy, u32 dx, vc_rc_gran gran) {
@@ -297,20 +369,27 @@ int vc_rc_allocate(const u8 *vol, u32 dz, u32 dy, u32 dx,
     f64 par_acc = 0, tru_acc = 0; u32 acc_n = 0;
     u32 ui = 0;
 
+    const u32 nchunks = ncz * ncy * ncx;
     for (u32 cz = 0; cz < ncz; ++cz)
     for (u32 cy = 0; cy < ncy; ++cy)
     for (u32 cx = 0; cx < ncx; ++cx) {
         vc_chunk_gather(vox, vol, dz, dy, dx, cz, cy, cx);
 
-        // For each 16^3 block in the chunk, transform it standalone (DC=its mean)
-        // and build its raw (R,D) points across the step grid.
-        unit_curve chunk_curve; chunk_curve.n = NSTEP;
-        for (int g = 0; g < NSTEP; ++g) { chunk_curve.hull[g].r = 0; chunk_curve.hull[g].d = 0; chunk_curve.hull[g].step = STEP_GRID[g]; }
+        if (cfg->gran == VC_RC_PER_CHUNK) {
+            // FAITHFUL: build the chunk's R-D curve with the REAL codec (exact
+            // bytes incl. overhead, exact decode-MSE). One unit per chunk.
+            chunk_curve_real(&cur[ui++], vox, &par_acc, &tru_acc, &acc_n);
+            continue;
+        }
 
+        // PER_BLOCK: the codec cannot (yet) store a per-16^3 q-field in the chunk
+        // header, so per-block uses a self-contained 16^3-block model (standalone
+        // DCT + dead-zone + entropy probe) to RANK block difficulty and PROJECT
+        // the achievable ratio/quality of a q-field. Rate proxy subtracts the
+        // per-call entropy table overhead (shared per-chunk in reality).
         for (u32 bz = 0; bz < BPA; ++bz)
         for (u32 by = 0; by < BPA; ++by)
         for (u32 bx = 0; bx < BPA; ++bx) {
-            // slice the 16^3 block voxels
             const u32 oz = bz*RB, oy = by*RB, ox = bx*RB;
             for (u32 z = 0; z < RB; ++z) for (u32 y = 0; y < RB; ++y)
                 memcpy(bvx + (z*RB+y)*RB,
@@ -323,44 +402,60 @@ int vc_rc_allocate(const u8 *vol, u32 dz, u32 dy, u32 dx,
             for (int g = 0; g < NSTEP; ++g)
                 raw_point(&bcur.hull[g], cb, cfg, STEP_GRID[g], qb, cbq, v0, v1, ebuf,
                           &par_acc, &tru_acc, &acc_n);
-
-            if (cfg->gran == VC_RC_PER_BLOCK) {
-                bcur.n = build_hull(bcur.hull, NSTEP);
-                cur[ui++] = bcur;
-            } else {
-                for (int g = 0; g < NSTEP; ++g) { chunk_curve.hull[g].r += bcur.hull[g].r; chunk_curve.hull[g].d += bcur.hull[g].d; }
-            }
-        }
-        if (cfg->gran == VC_RC_PER_CHUNK) {
-            chunk_curve.n = build_hull(chunk_curve.hull, NSTEP);
-            cur[ui++] = chunk_curve;
+            bcur.n = build_hull(bcur.hull, NSTEP);
+            cur[ui++] = bcur;
         }
     }
 
     f64 raw = (f64)((size_t)dz * dy * dx);
-    // Per-chunk fixed overhead (entropy table + chunk header) is NOT part of the
-    // content-rate the allocator equalizes; subtract it from the target so the
-    // content budget is correct, then add it back when reporting the ratio.
-    const u32 nchunks = ncz * ncy * ncx;
-    f64 fixed_overhead = (f64)nchunks * VC_RC_CHUNK_OVERHEAD;
+    // Per-CHUNK curves already include all codec overhead (real encode), so no
+    // extra fixed_overhead. Per-BLOCK proxies exclude the shared per-chunk table,
+    // so add ONE table+header back per chunk when reporting the ratio.
+    f64 fixed_overhead = (cfg->gran == VC_RC_PER_CHUNK)
+                         ? 0.0 : (f64)nchunks * VC_RC_CHUNK_OVERHEAD;
     f64 target_bytes = raw / cfg->target_ratio - fixed_overhead;
     if (target_bytes < (f64)nchunks) target_bytes = (f64)nchunks;  // sane floor
 
-    f64 lo = 1e-6, hi = 1e9, lam = sqrt(lo*hi);
-    for (int it = 0; it < 80; ++it) {
+    // Single global-lambda bisection (equal-slope condition): each unit picks the
+    // hull point minimizing D + lambda*R; raising lambda compresses harder. This
+    // hits ANY feasible target ratio precisely (the allocator's core job).
+    //
+    // step_window (>=1) optionally bounds each unit to [base/W, base*W] around the
+    // uniform base step that hits the target. NOTE (empirical, this scroll data):
+    // a bounded window does NOT recover a PSNR win, because the MSE-optimal
+    // allocation here is genuinely "bang-bang" (structure units want near-lossless
+    // step ~1-4, air units want the coarsest) — exactly PLAN §2's "MSE-optimal
+    // allocation provably starves HF / blur is the optimizer working as designed".
+    // Any window wide enough to let structure stay fine is wide enough to be
+    // bang-bang; any narrower window over-compresses. So the field is honored for
+    // experimentation but the recommended use is unbounded (the target-hitting is
+    // the deliverable; the quality objective is the separate distortion-metric
+    // axis, PLAN §2 distortion row). `uniform_base_step` is still computed for the
+    // diagnostic base step. The HONEST result: variable MSE-allocation MATCHES
+    // uniform PSNR at a given ratio; the win is RATIO HEADROOM at fixed quality
+    // (per-16^3 reaches 50x where per-chunk/uniform plateau ~35x), not PSNR.
+    f64 W = cfg->step_window >= 1.0 ? cfg->step_window : 1e9;  // 1e9 ~= unbounded
+    f32 base = uniform_base_step(cur, nunits, target_bytes);
+    f32 smin = (f32)((f64)base / W), smax = (f32)((f64)base * W);
+    (void)base;
+
+    f64 lo = 1e-9, hi = 1e12, lam = sqrt(lo*hi);
+    #define PICK_WIN(u, L) pick_window(cur[(u)].hull, cur[(u)].n, (L), smin, smax)
+    for (int it = 0; it < 100; ++it) {
         lam = sqrt(lo * hi);
         f64 bytes = 0;
-        for (u32 u = 0; u < nunits; ++u) bytes += pick(cur[u].hull, cur[u].n, lam)->r;
+        for (u32 u = 0; u < nunits; ++u) bytes += PICK_WIN(u, lam)->r;
         if (bytes > target_bytes) lo = lam; else hi = lam;
         if (fabs(bytes - target_bytes) < target_bytes * 0.003) break;
     }
 
     f64 content = 0;
     for (u32 u = 0; u < nunits; ++u) {
-        const rd_pt *pt = pick(cur[u].hull, cur[u].n, lam);
+        const rd_pt *pt = PICK_WIN(u, lam);
         units[u].step = pt->step; units[u].bytes = pt->r; units[u].dist = pt->d;
         content += pt->r;
     }
+    #undef PICK_WIN
     f64 total = content + fixed_overhead;
     if (res) {
         res->lambda = lam; res->total_bytes = total; res->raw_bytes = raw;
