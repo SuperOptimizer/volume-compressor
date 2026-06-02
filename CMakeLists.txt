@@ -144,6 +144,13 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/harness/bench_hfdist.c)
   target_link_libraries(bench_hfdist PRIVATE m)
 endif()
 
+if(EXISTS ${CMAKE_SOURCE_DIR}/harness/bench_learned_tables.c)
+  add_executable(bench_learned_tables harness/bench_learned_tables.c
+                 src/entropy/rlgr.c src/metrics/metrics.c)
+  target_include_directories(bench_learned_tables PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_link_libraries(bench_learned_tables PRIVATE m)
+endif()
+
 if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_qmatrix16.c)
   add_executable(vc_test_qmatrix16 tests/test_qmatrix16.c src/entropy/rlgr.c)
   target_include_directories(vc_test_qmatrix16 PRIVATE ${CMAKE_SOURCE_DIR}/include)
