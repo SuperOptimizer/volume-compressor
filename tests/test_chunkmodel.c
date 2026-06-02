@@ -168,6 +168,39 @@ int main(void) {
         c.dc_pred_curve=1;
         CHECK(one(128,128,128,0,c,"curve full-stack rans")==0,"full-stack");
 
+    // --- EG2024 experiment: per-band shared tables, sparse prepass, skip-meta.
+    // All on the box rANS-shared path (band split is a no-op under RLGR). Each
+    // must round-trip + keep random-access touched==1 (stencil NONE).
+    // (1) DC|AC split (2 tables)
+    c=base; c.entropy=VC_ENT_RANS_SHARED; c.chunk_atoms=8; c.band_split=VC_BAND_DC_AC;
+        CHECK(one(128,128,128,0,c,"EG band DC|AC rans")==0,"eg-band-2");
+    // (1) DC|lowAC|hiAC split (3 tables)
+    c=base; c.entropy=VC_ENT_RANS_SHARED; c.chunk_atoms=8; c.band_split=VC_BAND_DC_LO_HI;
+        CHECK(one(128,128,128,1,c,"EG band DC|lo|hi rans")==0,"eg-band-3");
+    c=base; c.entropy=VC_ENT_RANS_SHARED; c.band_split=VC_BAND_DC_LO_HI;
+        CHECK(one(100,70,53,1,c,"EG band DC|lo|hi unaligned")==0,"eg-band-3-unaligned");
+    // (3) sparse prepass (stride 8) — table from a sample, payload codes all atoms
+    c=base; c.entropy=VC_ENT_RANS_SHARED; c.chunk_atoms=8; c.sparse_prepass=8;
+        CHECK(one(128,128,128,0,c,"EG sparse-prepass/8 rans")==0,"eg-sparse");
+    // (3)+(1) sparse prepass + band split together
+    c=base; c.entropy=VC_ENT_RANS_SHARED; c.band_split=VC_BAND_DC_LO_HI; c.sparse_prepass=16;
+        CHECK(one(128,128,128,1,c,"EG band3 + sparse/16")==0,"eg-band3-sparse");
+    // (4) skip-meta on uniform (constant) volume -> uniform chunks, RA constant.
+    {
+        u32 d=128,h=128,w=128; u8 *uv=malloc((size_t)d*h*w); memset(uv,77,(size_t)d*h*w);
+        vc_bg_cfg cu=base; cu.entropy=VC_ENT_RANS_SHARED; cu.chunk_atoms=8; cu.skip_meta=1;
+        vc_bg_archive *ua=NULL; vc_bg_stats us;
+        int ok = (vc_bg_encode(uv,d,h,w,&cu,&ua,&us)==0);
+        u8 *ur=calloc((size_t)d*h*w,1); if(ok) vc_bg_decode(ua,ur);
+        int same=1; for(size_t i=0;i<(size_t)d*h*w;++i) if(ur[i]!=77){same=0;break;}
+        u32 tch=0; u8 at1[4096]; if(ok) vc_bg_decode_atom(ua,1,1,1,at1,&tch);
+        int constok=1; for(int i=0;i<4096;++i) if(at1[i]!=77){constok=0;break;}
+        printf("  EG skip-meta uniform: uniform_chunks=%u skip_meta_bytes=%zu RA_match=%d touched=%u\n",
+               us.n_uniform_chunks, us.skip_meta_bytes, (same&&constok), tch);
+        CHECK(ok && same && constok && us.n_uniform_chunks>0 && tch==1,"eg-skip-meta-uniform");
+        vc_bg_free(ua); free(uv); free(ur);
+    }
+
     printf(fail ? "\nSOME TESTS FAILED\n" : "\nALL TESTS PASSED\n");
     return fail;
 }

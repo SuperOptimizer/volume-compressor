@@ -103,6 +103,24 @@ typedef enum {
     VC_TABLE_BASE  = 2,
 } vc_table_coding;
 
+// --- EG2024 (Fast Compressed Segmentation Volumes) experiment knobs ----------
+// (1) ★ SPLIT shared entropy tables by SYMBOL ROLE (DC vs AC bands). Currently
+// ALL 4096 freq-scanned coefficients of an atom pool into ONE shared rANS table.
+// DC, low-AC and high-AC have very different level distributions; pooling them
+// wastes bits. Code each band of coefficients against its OWN shared table. The
+// band of a coefficient is decided by its frequency-scan position's u+v+w sum
+// (g_fsum): NONE = one table (old behaviour); DC_AC = {DC(fsum 0), AC(rest)};
+// DC_LO_HI = {DC, low-AC (fsum 1..VC_BAND_LO), high-AC}. Only consulted in the
+// VC_ENT_RANS_SHARED box path; RLGR is table-free (band split is a no-op there).
+typedef enum {
+    VC_BAND_NONE   = 0,    // one pooled table (baseline)
+    VC_BAND_DC_AC  = 1,    // 2 tables: DC | AC
+    VC_BAND_DC_LO_HI = 2,  // 3 tables: DC | low-AC | high-AC
+} vc_band_split;
+
+#define VC_BAND_LO 8u      // fsum<=VC_BAND_LO (and >0) is "low-AC"; >LO is "high-AC"
+#define VC_NBAND_MAX 3u
+
 typedef struct {
     vc_stencil      stencil;
     vc_traversal    traversal;
@@ -138,6 +156,14 @@ typedef struct {
                                    //     group into sub-runs that each carry a small
                                    //     DC-base delta on top of the group DC mean
                                    //     (intra-group two-level DC model). 0 = off.
+    // --- EG2024 knobs (box rANS-shared path) ---------------------------------
+    vc_band_split   band_split;    // (1) per-band (DC/AC) shared tables. 0 = pooled.
+    u32             sparse_prepass;// (3) build the shared table from every Nth atom
+                                   //     (sample stride). 0 or 1 = scan ALL atoms.
+    int             skip_meta;     // (4) per-chunk min/max + uniform-flag skip index
+                                   //     (ORC/Parquet 3-tier). Charges the tiny index
+                                   //     bytes and lets near-constant (single-value)
+                                   //     chunks store ONE byte instead of atom blobs.
 } vc_bg_cfg;
 
 // Encoded archive (in-memory): a sequence of chunk records, each with a header
@@ -155,6 +181,9 @@ typedef struct {
     u32    n_atoms;          // total atoms in the lattice
     u32    n_chunks;
     u32    n_absent_atoms;   // all-zero atoms (directory flag only)
+    size_t skip_meta_bytes;  // (4) skip-index bytes (min/max+uniform flag per chunk)
+    size_t skip_saved_bytes; // (4) payload+directory bytes skipped on uniform chunks
+    u32    n_uniform_chunks;  // chunks flagged uniform (single value) and skipped
 } vc_bg_stats;
 
 // Encode a full u8 volume into a block-grid archive under cfg. Returns 0 on ok.
