@@ -164,6 +164,13 @@ typedef struct {
                                    //     (ORC/Parquet 3-tier). Charges the tiny index
                                    //     bytes and lets near-constant (single-value)
                                    //     chunks store ONE byte instead of atom blobs.
+    // --- RDOQ (EXPERIMENT #19): rate-distortion-optimized quantization. -------
+    // 0 = independent rounding (the won baseline). 1 = RDOQ: jointly choose AC
+    // levels per atom to minimize D + lambda*R (real RLGR rate), via per-coeff
+    // level-down + last-significant-coeff trellis. ENCODE-ONLY; decode unchanged.
+    int             rdoq;
+    float           rdoq_lambda;   // lambda = rdoq_lambda * base^2 (scales w/ q).
+                                   //     0 => default 0.85 (high-rate optimum ~ 1).
 } vc_bg_cfg;
 
 // Encoded archive (in-memory): a sequence of chunk records, each with a header

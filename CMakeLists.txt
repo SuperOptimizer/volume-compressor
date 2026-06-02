@@ -133,6 +133,11 @@ add_executable(bench_chunkmodel harness/bench_chunkmodel.c ${VC_CM_SRC})
 target_include_directories(bench_chunkmodel PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(bench_chunkmodel PRIVATE m)
 
+# --- RDOQ bake-off (EXPERIMENT #19): rate-distortion-optimized quantization --
+add_executable(bench_rdoq harness/bench_rdoq.c ${VC_CM_SRC})
+target_include_directories(bench_rdoq PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(bench_rdoq PRIVATE m)
+
 # --- HF / perceptual distortion-path bake-off (src/quant/ work; self-contained) -
 # Includes the won DCT-16 transform + the 16^3 quant matrix directly, links the
 # won RLGR + metrics. Does NOT touch codec.c / ratectrl / chunkmodel. Guarded so

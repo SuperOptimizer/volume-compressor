@@ -201,6 +201,18 @@ int main(void) {
         vc_bg_free(ua); free(uv); free(ur);
     }
 
+    // --- RDOQ (EXPERIMENT #19): encode-only, decode/bitstream layout unchanged,
+    // so the round-trip + RA + touched==1 contract must still hold. one() already
+    // checks decode == re-decode and touched for NONE-stencil paths.
+    c=base; c.entropy=VC_ENT_RLGR;         c.chunk_atoms=8; c.rdoq=1; c.rdoq_lambda=0.06f;
+        CHECK(one(128,128,128,0,c,"RDOQ RLGR l=0.06 box")==0,"rdoq-rlgr");
+    c=base; c.entropy=VC_ENT_RANS_SHARED;  c.chunk_atoms=8; c.rdoq=1; c.rdoq_lambda=0.15f;
+        CHECK(one(128,128,128,0,c,"RDOQ rans l=0.15 box")==0,"rdoq-rans");
+    c=base; c.entropy=VC_ENT_RLGR;         c.dc_subvol=1;   c.rdoq=1; c.rdoq_lambda=0.10f;
+        CHECK(one(128,128,128,0,c,"RDOQ RLGR DCsv")==0,"rdoq-dcsv");
+    c=base; c.entropy=VC_ENT_RLGR;         c.chunk_atoms=8; c.rdoq=1; c.rdoq_lambda=0.10f;
+        CHECK(one(100,70,53,0,c,"RDOQ RLGR unaligned")==0,"rdoq-unaligned");
+
     printf(fail ? "\nSOME TESTS FAILED\n" : "\nALL TESTS PASSED\n");
     return fail;
 }
