@@ -15,10 +15,12 @@ flexible", "safer", or "standard practice". The single frozen pipeline is intent
 - **EG2024 3-band (DC/low-AC/high-AC) table split** — was rANS-only; dead under table-free context coder.
 - **LFNST / secondary transforms** — cut (needs a per-atom flag → violates single-pipeline).
 - **Sparse prepass** — fit rANS tables; nothing to prepass under table-free coder.
+- **Inter-LOD residual coding / cross-LOD prediction / Laplacian-pyramid residuals / LOD anchor+residual chains** — NIXED. All 8 LODs are TOTALLY INDEPENDENT (each LOD compressed standalone with the same pipeline). No residual coder, no upsample-predict, no anchor, no cascade. Do NOT rewrite the codec to handle multi-LOD generically — the pyramid is just 8 independent single-volume encodes; each LOD atom decodes standalone (touched=1, no ancestor chain).
 - **Curve-groups, cross-atom prediction (6/18/26-conn), DC sub-volume / DC-DPCM** — all ratio-neutral or worse; cut.
 - **9/7 wavelet, lapped/POT transform, directional/oriented basis, adaptive per-atom transform mode** — cut; transform is integer DCT-16³ ONLY.
 - **CDEF, content-adaptive quant, perceptual-in-loop quant, sign-bit modeling, z-anisotropy / per-axis anisotropic quant, learned/trained tables** — all cut.
-- **multi-q-probe / analytical-Laplacian / single-pass-feedback rate control** — rate control is closed-form q-from-λ ONLY.
+- **per-16³ q-field / per-block q / within-chunk variable quality** — CUT. Quantizer q is PER-CHUNK only (one q per chunk). No per-atom/per-block q, no q-field in the chunk format, no within-chunk allocation.
+- **Lagrangian λ rate allocation / closed-form q-from-λ / λ-bisection / convex-hull R-D probing / equal-slope allocator / multi-q-probe / analytical-Laplacian / single-pass-feedback** — ALL CUT. Rate control is a TRIVIAL calibrated q→ratio mapping: pick the per-chunk q (or a global q) that hits the target ratio. No allocation algorithm. "Variable quality" = different chunks may use different q (per-chunk granularity), nothing more.
 - **Near-lossless tier, lossless tier, bit-plane / SNR-scalable coding** — lossy-only, no quality-layer scalability. (Resolution pyramid serves progressive quality.)
 - **fast-rc as a separate optional profile** — closed-form q-from-λ is THE single rate controller, not an option.
 
@@ -30,10 +32,11 @@ flexible", "safer", or "standard practice". The single frozen pipeline is intent
 - **NO ink-detection / downstream-task gating.** Quality judged on proxy metrics (PSNR/MS-SSIM/GMSD/HaarPSI); do not build a task harness.
 - **NO broader-corpus / robustness / multithread / SIMD-tuning work yet** — punted post-freeze; not part of the integration.
 
-## THE ONLY THINGS THAT ARE IN (the frozen pipeline)
-16³ atom · integer DCT-16³ · HF-matrix + scalar dead-zone(0.80/0.40) quant · frequency-scan + EOB ·
-context coder (sole, table-free, per-atom reset) · closed-form q-from-λ per-16³ q-field rate control ·
-chunk = region grouping (I/O/index) · raster order · 8 fixed LODs (0-7) · inter-LOD residual (always-on,
-L7 independent anchor) · deblock (decode post-filter, 0.3-0.5) · per-chunk xxHash · uniform-flag fast-path ·
-u64 offsets · positional index. Pure C23, CPU, no GPU, no hand intrinsics, single-threaded reentrant,
-lossy-only, u8, 3D, 10-100×, 16³ random access (touched=1). Nothing else.
+## THE ONLY THINGS THAT ARE IN (the frozen pipeline) — FINAL, ruthlessly minimal
+16³ atom · integer DCT-16³ (for SPEED, no determinism machinery) · HF-matrix + scalar dead-zone(0.80/0.40) quant ·
+frequency-scan + EOB · context coder (sole entropy, table-free, per-atom reset) · **PER-CHUNK q via a trivial
+q→ratio mapping (no allocation algorithm, no λ, no per-block q)** · chunk = region grouping (I/O/index, NO shared
+tables) · raster (z,y,x) order · 8 fixed LODs (0-7), EACH FULLY INDEPENDENT (same pipeline per LOD, no inter-LOD
+coding, no residual/anchor/cascade) · deblock (decode post-filter, 0.3-0.5) · uniform-flag fast-path ·
+u64 offsets · positional index. **NO checksums/integrity (rely on storage).** Pure C23, CPU, no GPU, no hand
+intrinsics, single-threaded reentrant, lossy-only, u8, 3D, 10-100×, 16³ random access (touched=1). Nothing else.
