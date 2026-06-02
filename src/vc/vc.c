@@ -714,7 +714,7 @@ static float pick_q_for_ratio(const u8 *vol, vc_dims d, float target_ratio) {
     float lo = 0.10f, hi = 4096.0f;
     // bisection on log(q): bigger q -> smaller size (monotone).
     float best = 8.0f; u64 best_sz = measure_member_size(vol, d, best);
-    for (int it = 0; it < 16; ++it) {
+    for (int it = 0; it < 10; ++it) {
         float mid = sqrtf(lo * hi);
         u64 sz = measure_member_size(vol, d, mid);
         if (sz > target_bytes) lo = mid; else hi = mid;
