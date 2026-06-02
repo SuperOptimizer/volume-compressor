@@ -144,6 +144,16 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/harness/bench_hfdist.c)
   target_link_libraries(bench_hfdist PRIVATE m)
 endif()
 
+# --- Experiment #17: inter-LOD (Laplacian-pyramid) prediction bake-off -------
+# Self-contained like bench_hfdist: includes the won DCT-16 + qmatrix16 directly,
+# links won RLGR + metrics. Does NOT touch codec.c.
+if(EXISTS ${CMAKE_SOURCE_DIR}/harness/bench_inter_lod.c)
+  add_executable(bench_inter_lod harness/bench_inter_lod.c
+                 src/entropy/rlgr.c src/metrics/metrics.c)
+  target_include_directories(bench_inter_lod PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_link_libraries(bench_inter_lod PRIVATE m)
+endif()
+
 if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_qmatrix16.c)
   add_executable(vc_test_qmatrix16 tests/test_qmatrix16.c src/entropy/rlgr.c)
   target_include_directories(vc_test_qmatrix16 PRIVATE ${CMAKE_SOURCE_DIR}/include)
