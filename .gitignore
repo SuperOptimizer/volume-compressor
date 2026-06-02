@@ -57,3 +57,7 @@ dkms.conf
 # build dirs
 /build/
 /data/
+
+# bake-off build dirs + reference builds
+/build_*/
+harness/refbuild/

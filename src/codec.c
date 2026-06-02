@@ -52,32 +52,10 @@ static void vc_scratch_free(vc_scratch *s) {
     free(s->vox); free(s->coef); free(s->qlev); free(s->payload);
 }
 
-// Dead-zone scalar quantizer (PLAN §3): central [-step/2,step/2) bin -> 0,
-// outer bins uniform width `step`. Branchless-friendly, autovectorizable.
-static inline void dead_zone_quantize(const i16 *restrict coef, i16 *restrict q,
-                                      size_t n, f32 step) {
-    const f32 inv = 1.f / step;
-    for (size_t i = 0; i < n; ++i) {
-        f32 c = (f32)coef[i];
-        f32 a = fabsf(c);
-        i32 lvl = 0;
-        if (a >= 0.5f * step) lvl = (i32)(a * inv - 0.5f) + 1;
-        q[i] = (i16)(c < 0.f ? -lvl : lvl);
-    }
-}
-
-// Dequantize: reconstruct coefficient at the bin's representative magnitude.
-static inline void dead_zone_dequantize(const i16 *restrict q, i16 *restrict coef,
-                                        size_t n, f32 step) {
-    for (size_t i = 0; i < n; ++i) {
-        i32 l = (i32)q[i];
-        i32 a = l < 0 ? -l : l;
-        f32 r = (a == 0) ? 0.f : (f32)a * step;
-        i32 v = (i32)lrintf(l < 0 ? -r : r);
-        if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
-        coef[i] = (i16)v;
-    }
-}
+// Quantization + frequency scan is the VC_QUANT block (quant/subband.c): a
+// per-subband HF-weighted dead-zone quantizer that also reorders coefficients
+// low->high frequency so HF zero-runs are long and contiguous for the entropy
+// coder. Phase-0's inline flat dead-zone is now VC_QWEIGHT_FLAT in that block.
 
 // Encode one chunk into scratch->payload; returns payload length (0 => ABSENT).
 static size_t encode_chunk(vc_scratch *s, f32 step) {
@@ -98,7 +76,7 @@ static size_t encode_chunk(vc_scratch *s, f32 step) {
     i32 dc = (i32)((sum + VC_CVOX / 2) / VC_CVOX);
 
     VC_TRANSFORM_FWD(s->coef, s->vox, dc);
-    dead_zone_quantize(s->coef, s->qlev, VC_CVOX, step);
+    VC_QUANT_FWD(s->qlev, s->coef, step);
 
     u8 *p = s->payload;
     size_t pos = 0;
@@ -123,7 +101,7 @@ static void decode_chunk(vc_scratch *s, const u8 *p, size_t plen) {
     f32 step;  memcpy(&step, p + pos, 4); pos += 4;
     u32 rlen;  memcpy(&rlen, p + pos, 4); pos += 4;
     VC_ENTROPY_DEC(s->qlev, VC_CVOX, p + pos, rlen);
-    dead_zone_dequantize(s->qlev, s->coef, VC_CVOX, step);
+    VC_QUANT_INV(s->coef, s->qlev, step);
     VC_TRANSFORM_INV(s->vox, s->coef, (i32)dc16);
     (void)plen;
 }

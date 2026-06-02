@@ -29,8 +29,24 @@
 #define VC_TRANSFORM_FWD  vc_dct_int8_fwd
 #define VC_TRANSFORM_INV  vc_dct_int8_inv
 
-// --- Quantizer (quant/*.c, but Phase 0 inlines dead-zone in the pipeline) ---
-// Dead-zone scalar quantizer; see transform/pipeline usage.
+// --- Quantizer + scan (quant/*.c) ------------------------------------------
+// Contract:
+//   void VC_QUANT_FWD(i16 *restrict qscan, const i16 *restrict coef, f32 step);
+//   void VC_QUANT_INV(i16 *restrict coef, const i16 *restrict qscan, f32 step);
+// Quantizes a chunk's transform coefficients to a flat signed-level array using
+// a per-subband-weighted dead-zone step, emitting them in increasing-frequency
+// SCAN order so quantized-to-zero HF coefficients form long contiguous runs the
+// entropy coder exploits. VC_QWEIGHT picks the weighting policy:
+//   0 = VC_QWEIGHT_FLAT     (flat step, == Phase-0 distortion profile)
+//   1 = VC_QWEIGHT_HF       (HF-protecting: finer step for high-frequency bands)
+//   2 = VC_QWEIGHT_ADAPT    (content-adaptive: finer step in busy/high-AC blocks)
+#ifndef VC_QUANT_FWD
+#define VC_QUANT_FWD  vc_quant_subband_fwd
+#define VC_QUANT_INV  vc_quant_subband_inv
+#endif
+#ifndef VC_QWEIGHT
+#define VC_QWEIGHT 0   /* default flat; configs override to 1 or 2 */
+#endif
 
 // --- Entropy coder (entropy/*.c) -------------------------------------------
 // Contract:
@@ -40,8 +56,11 @@
 //                         const u8 *restrict in, size_t len);
 // Encodes/decodes a flat array of n signed quantized levels. Returns bytes
 // written (encode) / consumes `len` bytes (decode). Caller sizes `cap`.
+// The build (CMake VC_ENTROPY) may override these; default is the Phase-0 Rice.
+#ifndef VC_ENTROPY_ENC
 #define VC_ENTROPY_ENC  vc_rice_encode
 #define VC_ENTROPY_DEC  vc_rice_decode
+#endif
 
 // --- Chunk dependency model (chunkmodel/*.c) -------------------------------
 // Phase 0: independent chunks. The model wraps per-chunk encode/decode; for
@@ -61,6 +80,9 @@
 // --- Codec tag recorded in the archive header ------------------------------
 // Identifies the active pipeline so a decoder validates it matches the build.
 #define VC_CODEC_TAG_TRANSFORM 1   /* int-DCT 8^3 */
-#define VC_CODEC_TAG_ENTROPY   1   /* Golomb-Rice */
+#ifndef VC_CFG_ENTROPY_TAG
+#define VC_CFG_ENTROPY_TAG 1       /* 1=Rice 2=RLGR 3=rANS (set by CMake) */
+#endif
+#define VC_CODEC_TAG_ENTROPY   VC_CFG_ENTROPY_TAG
 
 #endif // VC_CONFIG_H
