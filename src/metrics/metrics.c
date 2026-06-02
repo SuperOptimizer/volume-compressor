@@ -316,3 +316,110 @@ double vc_haarpsi(const u8 *ref, const u8 *rec, u32 dz, u32 dy, u32 dx) {
     if (hp > 1.0) hp = 1.0;
     return hp * hp;
 }
+
+// --- Edge-MAE ---------------------------------------------------------------
+// Mean |grad_mag(ref) - grad_mag(rec)| over interior pixels (Prewitt, 2.5D).
+static void edgemae_slice(const u8 *restrict a, const u8 *restrict b,
+                          u32 h, u32 w, f64 *acc, u64 *cnt) {
+    if (h < 3 || w < 3) return;
+    f64 s = 0.0; u64 c = 0;
+    for (u32 y = 1; y + 1 < h; ++y) {
+        const u8 *r0 = a + (size_t)(y-1)*w, *r1 = a + (size_t)y*w, *r2 = a + (size_t)(y+1)*w;
+        const u8 *s0 = b + (size_t)(y-1)*w, *s1 = b + (size_t)y*w, *s2 = b + (size_t)(y+1)*w;
+        for (u32 x = 1; x + 1 < w; ++x) {
+            i32 ah = (i32)r0[x+1]+r1[x+1]+r2[x+1]-r0[x-1]-r1[x-1]-r2[x-1];
+            i32 av = (i32)r2[x-1]+r2[x]+r2[x+1]-r0[x-1]-r0[x]-r0[x+1];
+            i32 bh = (i32)s0[x+1]+s1[x+1]+s2[x+1]-s0[x-1]-s1[x-1]-s2[x-1];
+            i32 bv = (i32)s2[x-1]+s2[x]+s2[x+1]-s0[x-1]-s0[x]-s0[x+1];
+            f32 gr = sqrtf((f32)(ah*ah + av*av));
+            f32 gd = sqrtf((f32)(bh*bh + bv*bv));
+            f32 e = gr - gd; s += e < 0.f ? -e : e; ++c;
+        }
+    }
+    *acc += s; *cnt += c;
+}
+
+double vc_edge_mae(const u8 *ref, const u8 *rec, u32 dz, u32 dy, u32 dx) {
+    const size_t pmax = (size_t)dz * (dx > dy ? dx : dy);
+    u8 *pa = (u8 *)malloc(pmax ? pmax : 1);
+    u8 *pb = (u8 *)malloc(pmax ? pmax : 1);
+    if (!pa || !pb) { free(pa); free(pb); return -1.0; }
+    f64 acc = 0.0; u64 cnt = 0;
+    for (u32 z = 0; z < dz; ++z)
+        edgemae_slice(ref + (size_t)z*dy*dx, rec + (size_t)z*dy*dx, dy, dx, &acc, &cnt);
+    for (u32 y = 0; y < dy; ++y) {
+        for (u32 z = 0; z < dz; ++z) {
+            memcpy(pa + (size_t)z*dx, ref + ((size_t)z*dy + y)*dx, dx);
+            memcpy(pb + (size_t)z*dx, rec + ((size_t)z*dy + y)*dx, dx);
+        }
+        edgemae_slice(pa, pb, dz, dx, &acc, &cnt);
+    }
+    for (u32 x = 0; x < dx; ++x) {
+        for (u32 z = 0; z < dz; ++z)
+        for (u32 y = 0; y < dy; ++y) {
+            pa[(size_t)z*dy + y] = ref[((size_t)z*dy + y)*dx + x];
+            pb[(size_t)z*dy + y] = rec[((size_t)z*dy + y)*dx + x];
+        }
+        edgemae_slice(pa, pb, dz, dy, &acc, &cnt);
+    }
+    free(pa); free(pb);
+    return cnt ? acc / (f64)cnt : 0.0;
+}
+
+// --- Seam-step --------------------------------------------------------------
+// Mean |err(face) - err(face-1)| across block-grid walls, where err = rec-ref.
+// Looks only at columns/rows that straddle a multiple-of-`grid` boundary, so it
+// isolates the discontinuity a per-block quant step introduces (blocking/
+// banding) from ordinary in-block error. 2.5D over all three axes.
+static void seam_slice(const u8 *restrict a, const u8 *restrict b,
+                       u32 h, u32 w, u32 grid, f64 *acc, u64 *cnt) {
+    if (grid == 0 || w < 2 || h < 2) return;
+    f64 s = 0.0; u64 c = 0;
+    // vertical walls: x is a multiple of grid (x>=grid), compare err(x) vs err(x-1)
+    for (u32 y = 0; y < h; ++y) {
+        const u8 *ra = a + (size_t)y*w, *rb = b + (size_t)y*w;
+        for (u32 x = grid; x < w; x += grid) {
+            i32 e0 = (i32)rb[x]   - (i32)ra[x];
+            i32 e1 = (i32)rb[x-1] - (i32)ra[x-1];
+            i32 d = e0 - e1; s += d < 0 ? -d : d; ++c;
+        }
+    }
+    // horizontal walls: y a multiple of grid
+    for (u32 y = grid; y < h; y += grid) {
+        const u8 *ra = a + (size_t)y*w,     *rb = b + (size_t)y*w;
+        const u8 *ra1 = a + (size_t)(y-1)*w, *rb1 = b + (size_t)(y-1)*w;
+        for (u32 x = 0; x < w; ++x) {
+            i32 e0 = (i32)rb[x]  - (i32)ra[x];
+            i32 e1 = (i32)rb1[x] - (i32)ra1[x];
+            i32 d = e0 - e1; s += d < 0 ? -d : d; ++c;
+        }
+    }
+    *acc += s; *cnt += c;
+}
+
+double vc_seam_step(const u8 *ref, const u8 *rec, u32 dz, u32 dy, u32 dx, u32 grid) {
+    const size_t pmax = (size_t)dz * (dx > dy ? dx : dy);
+    u8 *pa = (u8 *)malloc(pmax ? pmax : 1);
+    u8 *pb = (u8 *)malloc(pmax ? pmax : 1);
+    if (!pa || !pb) { free(pa); free(pb); return -1.0; }
+    f64 acc = 0.0; u64 cnt = 0;
+    for (u32 z = 0; z < dz; ++z)
+        seam_slice(ref + (size_t)z*dy*dx, rec + (size_t)z*dy*dx, dy, dx, grid, &acc, &cnt);
+    for (u32 y = 0; y < dy; ++y) {
+        for (u32 z = 0; z < dz; ++z) {
+            memcpy(pa + (size_t)z*dx, ref + ((size_t)z*dy + y)*dx, dx);
+            memcpy(pb + (size_t)z*dx, rec + ((size_t)z*dy + y)*dx, dx);
+        }
+        seam_slice(pa, pb, dz, dx, grid, &acc, &cnt);
+    }
+    for (u32 x = 0; x < dx; ++x) {
+        for (u32 z = 0; z < dz; ++z)
+        for (u32 y = 0; y < dy; ++y) {
+            pa[(size_t)z*dy + y] = ref[((size_t)z*dy + y)*dx + x];
+            pb[(size_t)z*dy + y] = rec[((size_t)z*dy + y)*dx + x];
+        }
+        seam_slice(pa, pb, dz, dy, grid, &acc, &cnt);
+    }
+    free(pa); free(pb);
+    return cnt ? acc / (f64)cnt : 0.0;
+}

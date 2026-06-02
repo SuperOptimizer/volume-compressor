@@ -18,9 +18,21 @@ typedef struct {
 void vc_compute_metrics(const u8 *ref, const u8 *rec, u32 dz, u32 dy, u32 dx,
                         vc_metrics *m);
 
-// --- TODO (later agent): edge-sensitive perceptual metrics (PLAN §4) -------
-// GMSD and HaarPSI catch the blocking/seam artifacts PSNR hides. Stubbed.
-double vc_gmsd(const u8 *ref, const u8 *rec, u32 dz, u32 dy, u32 dx);     // TODO
-double vc_haarpsi(const u8 *ref, const u8 *rec, u32 dz, u32 dy, u32 dx);  // TODO
+// --- Edge-sensitive perceptual metrics (PLAN §4) ---------------------------
+// GMSD and HaarPSI catch the blocking/seam artifacts PSNR hides. Implemented in
+// metrics.c (2.5D: per-axis-slice mean over all three axes).
+double vc_gmsd(const u8 *ref, const u8 *rec, u32 dz, u32 dy, u32 dx);
+double vc_haarpsi(const u8 *ref, const u8 *rec, u32 dz, u32 dy, u32 dx);
+
+// Edge-MAE: mean absolute error of the Prewitt gradient MAGNITUDE between ref
+// and rec (2.5D, all three axes). Directly measures how much the codec disrupts
+// edge/ink/fiber structure — the gradient is where ink lives. Larger = worse.
+double vc_edge_mae(const u8 *ref, const u8 *rec, u32 dz, u32 dy, u32 dx);
+
+// Seam-step: mean absolute first-difference of the ERROR (rec-ref) across block
+// faces on a `grid`-voxel lattice (e.g. 16 for DCT-16 atoms), 2.5D over all
+// axes. A blocking/banding face produces a step in the error at the grid wall;
+// this isolates that step. 0 = no seam discontinuity. Larger = worse blocking.
+double vc_seam_step(const u8 *ref, const u8 *rec, u32 dz, u32 dy, u32 dx, u32 grid);
 
 #endif // VC_METRICS_H
