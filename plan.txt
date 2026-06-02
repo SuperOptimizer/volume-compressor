@@ -1,0 +1,247 @@
+================================================================================
+ volume-compressor — COMPLETE IMPLEMENTATION PLAN
+================================================================================
+A frozen, single-pipeline, lossy compression codec for dense u8 3D X-ray
+volumetric data (Herculaneum / Vesuvius scroll micro-CT). Pure C23, CPU-only,
+compiler-autovectorized, single .h + .c style, drop-in.
+
+This document is SELF-CONTAINED: it specifies the entire codec to be built from
+scratch. It is the distillation of ~26 experiments + literature + an audit; the
+experiment history is NOT needed to implement this. The companion file
+docs/DO_NOT_IMPLEMENT.md lists everything that was deliberately CUT — do not
+re-add any of it.
+
+--------------------------------------------------------------------------------
+0. HARD CONSTRAINTS (non-negotiable)
+--------------------------------------------------------------------------------
+- Pure C23. One library (vc.h public header + vc.c implementation; internal
+  helpers may be split but ship as a small, drop-in unit). Deps: libc + libm only.
+- CPU only. No GPU. NO hand-written SIMD intrinsics — write
+  compiler-autovectorizable code (straight-line loops over contiguous aligned
+  arrays, restrict pointers, compile-time-constant trip counts, branchless inner
+  loops, SoA layout). Verify vectorization with -fopt-info-vec / -Rpass.
+- Lossy only. No lossless or near-lossless mode, ever.
+- Data: u8, single channel, 3D only. (No u16/u32/u64, no 1D/2D, no n-D, no video.)
+- Operating range: 10x - 100x compression (primary). Tune defaults for this band.
+- SINGLE PIPELINE. No optional features, no selectable paths, no profiles, no
+  config knobs, no runtime dispatch, no compile-time block selection. ONE code
+  path. (The toolkit/composable framing was for exploration only — it is dead.)
+- Integer math is for SPEED (16-bit SIMD lane density), NOT determinism.
+  Cross-CPU bit-exactness is a NON-GOAL. -ffast-math is fine; do not add rounding-
+  mode / fixed-point bookkeeping for reproducibility.
+- Single-threaded reentrant core. The caller parallelizes across chunks/atoms via
+  its own pool. No internal threading / OpenMP.
+- Quality judged on proxy metrics (PSNR / MAE / Linf / p99 / MS-SSIM / GMSD /
+  HaarPSI). No downstream ink-detection / task harness.
+- Heap/arena for chunk-sized scratch — NEVER chunk-sized buffers on the stack.
+- Fail-fast on malformed input (assert/abort + one overridable panic hook); no
+  graceful-degradation machinery.
+- Build flags: -O3 -ffp-contract=fast (-ffast-math acceptable). Portable across
+  x86-64 / ARM via the COMPILER, not per-ISA code.
+
+--------------------------------------------------------------------------------
+1. THE STRUCTURAL HIERARCHY
+--------------------------------------------------------------------------------
+ATOM   = 16x16x16 voxels. THE fundamental unit: transform unit, quant unit,
+         entropy unit, cache unit, and the random-access decode unit. Every atom
+         is INDEPENDENTLY DECODABLE: decoding one atom touches exactly that atom
+         (touched == 1), needs only its chunk header + its own byte range.
+CHUNK  = a bundle of atoms = the storage / I/O / index unit (a "region"). Pure
+         grouping for fetch + indexing. NOT a coding boundary, NOT a shared-table
+         scope (the entropy coder is table-free). Chunk dimension is a
+         compile-time constant; default 128^3 voxels = 8x8x8 atoms (tune if
+         desired — ratio is insensitive to chunk size, pick for I/O granularity).
+LOD    = a resolution level. 8 fixed levels, 0..7. LOD0 = full res; LOD k+1 is a
+         2x-per-axis downsample. EACH LOD IS FULLY INDEPENDENT — encoded with the
+         exact same pipeline applied to that level's volume. NO inter-LOD coding
+         (no residual / prediction / anchor / cascade). The pyramid is just 8
+         independent single-volume encodes.
+ARCHIVE= one single-file container holding all members (the 8 LOD volumes), each
+         with its own chunk grid + positional index, plus a footer.
+
+Voxel/atom ordering everywhere: Z, Y, X (Z outermost), little-endian. Atoms are
+laid out / indexed in RASTER order (z,y,x) — NOT Morton/Hilbert.
+
+--------------------------------------------------------------------------------
+2. THE ENCODE PIPELINE (per atom)
+--------------------------------------------------------------------------------
+For each 16^3 atom, in order:
+
+(2.1) Uniform fast-path. If all 4096 voxels are equal, emit a 'uniform' flag +
+      the single value (decodes to memset). Skip everything else. (Air / constant
+      regions — common after the volume's air is windowed to a fill value.)
+
+(2.2) Ingest. Widen u8 -> working type, subtract a per-atom DC mean (store the DC).
+      (DC is carried with the atom; it is NOT predicted across atoms.)
+
+(2.3) Transform: integer DCT-16 (3D separable DCT-II, 16-point, applied along
+      Z then Y then X over the 16^3 cube). Integer 16-bit-friendly kernel (e.g.
+      HEVC-style scaled-integer matrix) for SIMD lane density and speed. The
+      inverse is the transpose / inverse-DCT. Implement as straight-line
+      matrix-vector products with compile-time trip count 16 so the compiler
+      autovectorizes; do the three axis passes over a heap scratch buffer.
+
+(2.4) Quantize: dead-zone scalar quantizer with a 1-PARAMETER HF-boost curve.
+      - step(coef) = base_q * hf_weight(freq), where hf_weight is a single
+        analytic curve, e.g. proportional to freq^p (freq = u+v+w, the coefficient
+        position's L1 frequency; p a single tuned exponent that PROTECTS high
+        frequencies = coarser-near-DC is wrong; we want to NOT over-crush HF, so
+        choose the curve so HF coefficients keep relatively finer steps than a
+        flat quantizer would give them). NO 4096-entry hand-tuned matrix — one
+        parameter (plus optionally a small handful of per-band values if a single
+        exponent proves insufficient; keep it minimal).
+      - Dead-zone: zero-bin width = 0.80 * step (wider zero bin kills more
+        near-zero coefficients). Forward: q = (|c| < dz) ? 0 :
+        sign(c)*floor((|c|-dz)/step + 1)  (or equivalent dead-zone form).
+      - Dequant reconstruction offset = 0.40 (reconstruct at
+        sign(q)*(|q| - 1 + 0.40 + dz/step)*step or the standard mid-bin-with-bias
+        form; the 0.40 sub-center offset is Laplacian-near-optimal, ~+0.25 dB).
+      Branchless, unit-stride -> autovectorizes.
+
+(2.5) Frequency scan + EOB. Reorder the 4096 quantized coefficients into a
+      low->high frequency scan (3D zig-zag by u+v+w; precomputed constant
+      permutation table). Find the LAST significant (nonzero) coefficient along
+      the scan; code its position (EOB / last-significant-position). All
+      coefficients after it are implicitly zero and cost nothing. This is the
+      primary ratio + decode-speed lever (decode stops at EOB instead of grinding
+      all 4096).
+
+(2.6) Entropy code: the COEFFICIENT CONTEXT CODER (the sole entropy stage).
+      A binary range / arithmetic coder that codes, for each coefficient up to
+      EOB, a significance flag + magnitude + sign, each conditioned on already-
+      decoded CAUSAL context WITHIN the atom (e.g. neighbor-significance for the
+      significance flag, prior-decoded-level magnitude for the level bins, and a
+      coarse frequency-band/position context). The coder is:
+      - ADAPTIVE (probabilities update per symbol) and TABLE-FREE (no transmitted
+        frequency tables).
+      - RESET PER ATOM (contexts re-seed at each atom -> preserves independent
+        random access / touched=1).
+      - Serial bit-by-bit (like CABAC); decode is recovered to throughput via
+        per-atom parallelism in the CALLER (thread/lane per atom), not in the
+        core. Magnitude LSBs + signs may ride a raw bypass bitstream.
+      This is the biggest ratio win (~30% vs a table-free Golomb/RLGR baseline)
+      and the most complex component — keep it tight.
+
+(2.7) Rate control: PER-CHUNK q via a trivial q->ratio mapping.
+      The user requests a target ratio (10-100x). The encoder picks the per-chunk
+      (or global) base_q that hits the target — by a calibrated q<->ratio curve
+      or a quick encode-measure-adjust loop. ONE q PER CHUNK. NO per-atom/per-
+      block q-field, NO Lagrangian / lambda allocation, NO convex-hull / R-D
+      probing, NO closed-form q-from-lambda. "Variable quality" = different chunks
+      may end up with different q; there is no per-block allocation algorithm.
+
+--------------------------------------------------------------------------------
+3. THE DECODE PIPELINE
+--------------------------------------------------------------------------------
+Exact inverse of encode, per atom:
+  read atom byte range -> context-decode coefficients up to EOB (rest = 0) ->
+  inverse frequency scan -> dequantize (dead-zone reconstruction, offset 0.40) ->
+  inverse integer DCT-16 -> add DC -> round/clamp to u8.
+Uniform atoms: memset to the stored value.
+Random access: to decode atom (lod, cx,cy,cz, ax,ay,az): locate its chunk via the
+member's positional index, read the chunk header, look up the atom's byte offset
+in the chunk's per-atom directory, decode that one atom. touched == 1.
+
+DEBLOCK (decode post-filter, IMPORTANT — keep): after reconstructing a region,
+apply an adaptive deblocking filter across ATOM/CHUNK faces (HEVC/AV1-style:
+boundary strength keyed on the quantizer step + local gradient; filter flat
+regions where a step is likely a quant artifact, clip the per-sample delta so real
+edges/ink are preserved; modify <=3 samples/side). Strength ~0.3-0.5. Decode-side
+only (no bitstream change, preserves independence). It runs when atoms are
+stitched for viewing/use, using already-decoded neighbor samples. (There are no
+intra-atom sub-block faces — the transform block IS the 16^3 atom.)
+
+--------------------------------------------------------------------------------
+4. THE ARCHIVE FORMAT (single file)
+--------------------------------------------------------------------------------
+Low->high offset:
+  [ atom/chunk payloads, concatenated ]   (all members)
+  [ per-member chunk indexes ]            (positional, fixed-width)
+  [ member directory ]                    (8 LOD members + their shapes/grids)
+  [ footer / trailer ]                    (magic, version, dir offset+len, EOF magic)
+
+Rules:
+- u64 for all offsets and lengths everywhere (volumes up to ~2^60 voxels). Reserve
+  an all-ones sentinel for ABSENT (all-zero / fill) chunks -> 0 payload bytes.
+- Per-chunk header: chunk dims, per-atom directory of {byte offset, length, flags
+  (ABSENT / uniform)}. Atom coordinate is IMPLICIT by position in the directory
+  (raster order). DC and q are carried per atom/chunk in the payload/header as
+  needed. NO shared entropy tables (coder is table-free). NO per-atom checksums,
+  NO integrity/xxHash (rely on storage/transport; may add later).
+- Member = one LOD volume (0..7), each fully independent with its own chunk grid +
+  index. The footer enumerates the 8 members; reader does a tail read -> footer ->
+  directory -> member index -> range-GET the atoms it wants.
+- Alignment: align atom payloads to 64 bytes (SIMD/cache), footer + chunk
+  directories to a friendly boundary (e.g. 4 KiB) for mmap. (Lock once, document.)
+- Footer metadata: a small versioned, tag/length-delimited block (skippable
+  unknown fields) — NOT a fixed C-struct — so the format can evolve. One magic at
+  each end + a trailing footer-length so the footer is found in one tail read.
+- Edge volumes / non-multiples of 16: pad edge atoms to full 16^3 with the fill
+  value (or edge-replicate); record the true logical extent in member metadata;
+  cropping is a consumer op.
+
+--------------------------------------------------------------------------------
+5. LOD PYRAMID GENERATION
+--------------------------------------------------------------------------------
+- 8 LODs, 0..7. LOD k+1 = LOD k downsampled 2x per axis (box filter is the simple
+  default; document the choice). Each LOD is then encoded INDEPENDENTLY with the
+  full pipeline above and stored as its own archive member.
+- Storage cost of the whole pyramid over LOD0 alone ~= 8/7 ~= +14% raw voxels
+  (geometric series), less compressed (coarse levels are smoother). Negligible.
+- Pyramid generation is the PRODUCER'S job conceptually, but the codec ships the
+  loop (downsample-then-encode x8). Downsample from the level above is fine since
+  each level is encoded independently (no error-accumulation concern across the
+  CODEC — though if the producer has the original at each scale, prefer that).
+
+--------------------------------------------------------------------------------
+6. PUBLIC API (sketch)
+--------------------------------------------------------------------------------
+  // encode one u8 volume (all 8 LODs) to an archive in memory, at a target ratio
+  vc_status vc_encode(const u8 *vol, vc_dims dims, float target_ratio,
+                      u8 **out_archive, size_t *out_len);
+  // open an archive (parse footer/directory) for random access
+  vc_archive *vc_open(const u8 *archive, size_t len);
+  // decode a whole LOD volume
+  vc_status vc_decode_lod(vc_archive*, int lod, u8 *out_vol, vc_dims *out_dims);
+  // decode ONE 16^3 atom (random access; touched==1)
+  vc_status vc_decode_atom(vc_archive*, int lod, int ax,int ay,int az, u8 out[16*16*16]);
+  // decode an arbitrary sub-box (gathers the atoms it overlaps; deblock applied)
+  vc_status vc_decode_region(vc_archive*, int lod, vc_box, u8 *out);
+  void vc_close(vc_archive*);
+  void vc_set_panic_hook(void(*)(const char*));
+Fail-fast; opaque archive handle; bytes-in/bytes-out (caller owns I/O).
+
+--------------------------------------------------------------------------------
+7. BUILD ORDER (minimal-first; commit each working step)
+--------------------------------------------------------------------------------
+1. MINIMAL CORE: integer DCT-16 + dead-zone quant (1-param HF curve) + context
+   coder + chunk/archive, FIXED q, single LOD. Round-trip exact-ish (lossy);
+   single-atom decode (touched==1). Commit.
+2. + Frequency scan + EOB. Commit.
+3. + Deblock decode post-filter. Commit.
+4. + Per-chunk q -> target-ratio mapping (encode-measure-adjust). Commit.
+5. + Uniform-atom fast-path + ABSENT-chunk handling. Commit.
+6. + 8 independent LODs (loop the codec over downsampled volumes; archive members).
+   Commit.
+7. + Archive footer/index polish, alignment, versioned metadata. Commit.
+Each step: builds green, round-trip + random-access tests pass, autovectorization
+verified, measured on real PHerc Paris 4 (hires + coarse) at 10/20/50/100x:
+report ratio vs target, PSNR/MS-SSIM/GMSD, encode + decode MB/s, pyramid size.
+
+--------------------------------------------------------------------------------
+8. WHAT IS DELIBERATELY NOT HERE (see docs/DO_NOT_IMPLEMENT.md)
+--------------------------------------------------------------------------------
+NIX'd: inter-LOD residual/prediction; Lagrangian/lambda rate control; per-block
+q-field; D4-lattice/vector quant; RDOQ/trellis; the 4096-entry quant matrix;
+Morton/Hilbert order; shared entropy tables; per-atom & all checksums/xxHash;
+min/max skip stats; RLGR/rANS/Rice/any alt entropy coder; EG2024 3-band split;
+LFNST/secondary transforms; sparse prepass; curve-groups; cross-atom prediction;
+DC sub-volume/DC-DPCM; 9/7 wavelet; lapped/POT; directional basis; adaptive
+per-atom transform mode; CDEF; content-adaptive & perceptual-in-loop quant; sign
+modeling; z-anisotropy; learned tables; bitplane/SNR-scalable; lossless/near-
+lossless tier; determinism machinery; GPU; hand intrinsics; selectable
+modes/profiles/config; the toolkit-config layer; 8^3 sub-block logic.
+
+================================================================================
+ END — one pipeline, no knobs. Build exactly this.
+================================================================================
