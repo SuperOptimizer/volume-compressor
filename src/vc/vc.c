@@ -44,125 +44,205 @@ static void *vc_xcalloc(size_t n, size_t sz) {
 // ---------------------------------------------------------------------------
 // Compile-time layout constants (plan.txt §1)
 // ---------------------------------------------------------------------------
-#define A      16u                 // atom edge
-#define A3     (A*A*A)             // 4096
-#define CHUNK_ATOMS 8u             // atoms per axis per chunk
-#define CHUNK_SIDE  (CHUNK_ATOMS*A) // 128 voxels
+#define A      VC_ATOM             // atom edge (derives from the public header)
+#define A3     VC_ATOM3            // A*A*A
+#define CHUNK_ATOMS 4u             // atoms per axis per chunk
+#define CHUNK_SIDE  (CHUNK_ATOMS*A) // 128 voxels (4 * 32)
 
 #define Q14    14u                 // DCT fixed-point shift
 
 // ---------------------------------------------------------------------------
-// Integer DCT-16 (orthonormal scaled-cosine Q14 matrix; inverse = transpose).
-// plan.txt §2.3. Straight-line trip-count-16 kernels for autovectorization.
+// Integer DCT-A (orthonormal scaled-cosine Q14 matrix; inverse = transpose).
+// plan.txt §2.3. The A×A matrix is generated once at runtime (build_tables) so
+// the codec is atom-size agnostic; the trip-count-A kernels autovectorize.
+//   CMATA[k][n] = round( c_k * cos(pi*(2n+1)*k/(2A)) * 2^Q14 ),
+//   c_0 = sqrt(1/A), c_k>0 = sqrt(2/A)  → orthonormal, inverse = transpose.
 // ---------------------------------------------------------------------------
-static const i32 CMAT16[16][16] = {
-  {  4096,  4096,  4096,  4096,  4096,  4096,  4096,  4096,  4096,  4096,  4096,  4096,  4096,  4096,  4096,  4096},
-  {  5765,  5543,  5109,  4478,  3675,  2731,  1682,   568,  -568, -1682, -2731, -3675, -4478, -5109, -5543, -5765},
-  {  5681,  4816,  3218,  1130, -1130, -3218, -4816, -5681, -5681, -4816, -3218, -1130,  1130,  3218,  4816,  5681},
-  {  5543,  3675,   568, -2731, -5109, -5765, -4478, -1682,  1682,  4478,  5765,  5109,  2731,  -568, -3675, -5543},
-  {  5352,  2217, -2217, -5352, -5352, -2217,  2217,  5352,  5352,  2217, -2217, -5352, -5352, -2217,  2217,  5352},
-  {  5109,   568, -4478, -5543, -1682,  3675,  5765,  2731, -2731, -5765, -3675,  1682,  5543,  4478,  -568, -5109},
-  {  4816, -1130, -5681, -3218,  3218,  5681,  1130, -4816, -4816,  1130,  5681,  3218, -3218, -5681, -1130,  4816},
-  {  4478, -2731, -5543,   568,  5765,  1682, -5109, -3675,  3675,  5109, -1682, -5765,  -568,  5543,  2731, -4478},
-  {  4096, -4096, -4096,  4096,  4096, -4096, -4096,  4096,  4096, -4096, -4096,  4096,  4096, -4096, -4096,  4096},
-  {  3675, -5109, -1682,  5765,  -568, -5543,  2731,  4478, -4478, -2731,  5543,   568, -5765,  1682,  5109, -3675},
-  {  3218, -5681,  1130,  4816, -4816, -1130,  5681, -3218, -3218,  5681, -1130, -4816,  4816,  1130, -5681,  3218},
-  {  2731, -5765,  3675,  1682, -5543,  4478,   568, -5109,  5109,  -568, -4478,  5543, -1682, -3675,  5765, -2731},
-  {  2217, -5352,  5352, -2217, -2217,  5352, -5352,  2217,  2217, -5352,  5352, -2217, -2217,  5352, -5352,  2217},
-  {  1682, -4478,  5765, -5109,  2731,   568, -3675,  5543, -5543,  3675,  -568, -2731,  5109, -5765,  4478, -1682},
-  {  1130, -3218,  4816, -5681,  5681, -4816,  3218, -1130, -1130,  3218, -4816,  5681, -5681,  4816, -3218,  1130},
-  {   568, -1682,  2731, -3675,  4478, -5109,  5543, -5765,  5765, -5543,  5109, -4478,  3675, -2731,  1682,  -568},
-};
-
-static inline void dct16_fwd(const i32 *restrict in, i32 *restrict out) {
-    const i32 rnd = (i32)1 << (Q14 - 1);
-    for (u32 k = 0; k < 16; ++k) {
-        i32 acc = 0;
-        for (u32 n = 0; n < 16; ++n) acc += CMAT16[k][n] * in[n];
-        out[k] = (acc + rnd) >> Q14;
-    }
-}
-static inline void dct16_inv(const i32 *restrict in, i32 *restrict out) {
-    const i32 rnd = (i32)1 << (Q14 - 1);
-    for (u32 n = 0; n < 16; ++n) {
-        i32 acc = 0;
-        for (u32 k = 0; k < 16; ++k) acc += CMAT16[k][n] * in[k];
-        out[n] = (acc + rnd) >> Q14;
-    }
-}
-
-// Forward 3D DCT of one atom. vox = 4096 u8 (raster z,y,x). dc subtracted first.
-// Output: 4096 i32 coefficients in raster (cz,cy,cx) order, scratch caller-owned.
-static void atom_dct_fwd(const u8 *restrict vox, i32 dc, i32 *restrict coef) {
-    static const u32 N = A;
-    i32 *t = coef; // reuse coef as working buffer between passes
-    // load - dc
-    for (u32 i = 0; i < A3; ++i) t[i] = (i32)vox[i] - dc;
-    i32 tmp[A];
-    // Pass X (unit stride within a row of 16)
-    for (u32 z = 0; z < N; ++z)
-    for (u32 y = 0; y < N; ++y) {
-        i32 *row = t + (z*N + y)*N;
-        dct16_fwd(row, tmp);
-        for (u32 x = 0; x < N; ++x) row[x] = tmp[x];
-    }
-    // Pass Y
-    i32 col[A], outc[A];
-    for (u32 z = 0; z < N; ++z)
-    for (u32 x = 0; x < N; ++x) {
-        for (u32 y = 0; y < N; ++y) col[y] = t[(z*N + y)*N + x];
-        dct16_fwd(col, outc);
-        for (u32 y = 0; y < N; ++y) t[(z*N + y)*N + x] = outc[y];
-    }
-    // Pass Z
-    for (u32 y = 0; y < N; ++y)
-    for (u32 x = 0; x < N; ++x) {
-        for (u32 z = 0; z < N; ++z) col[z] = t[(z*N + y)*N + x];
-        dct16_fwd(col, outc);
-        for (u32 z = 0; z < N; ++z) t[(z*N + y)*N + x] = outc[z];
-    }
-}
-
-// Inverse 3D DCT. coef = 4096 i32, dc added back, clamp to u8 into vox.
-static void atom_dct_inv(const i32 *restrict coef, i32 dc, u8 *restrict vox) {
-    static const u32 N = A;
-    i32 *t = (i32 *)vc_xmalloc(A3 * sizeof(i32));
-    memcpy(t, coef, A3 * sizeof(i32));
-    i32 tmp[A], col[A], outc[A];
-    // Inverse along Z, Y, X (order does not matter for separable)
-    for (u32 y = 0; y < N; ++y)
-    for (u32 x = 0; x < N; ++x) {
-        for (u32 z = 0; z < N; ++z) col[z] = t[(z*N + y)*N + x];
-        dct16_inv(col, outc);
-        for (u32 z = 0; z < N; ++z) t[(z*N + y)*N + x] = outc[z];
-    }
-    for (u32 z = 0; z < N; ++z)
-    for (u32 x = 0; x < N; ++x) {
-        for (u32 y = 0; y < N; ++y) col[y] = t[(z*N + y)*N + x];
-        dct16_inv(col, outc);
-        for (u32 y = 0; y < N; ++y) t[(z*N + y)*N + x] = outc[y];
-    }
-    for (u32 z = 0; z < N; ++z)
-    for (u32 y = 0; y < N; ++y) {
-        i32 *row = t + (z*N + y)*N;
-        dct16_inv(row, tmp);
-        for (u32 x = 0; x < N; ++x) {
-            i32 v = tmp[x] + dc;
-            if (v < 0) v = 0; else if (v > 255) v = 255;
-            row[x] = v;
+// Function multiversioning for a PORTABLE single binary: with -DVC_PORTABLE the
+// hot DCT/quant kernels are cloned for AVX-512 (v4) / AVX2 (v3) / generic, and an
+// ifunc resolver picks the best at runtime — one .so runs optimally on any x86,
+// no -march needed (decode ~80% of native). Default build uses -march=native
+// instead (fastest, build-on-target). On ARM this is a no-op (use VC_MARCH).
+#if defined(VC_PORTABLE) && (defined(__x86_64__) || defined(__i386__))
+#define VC_MULTIVERSION __attribute__((target_clones("arch=x86-64-v4","arch=x86-64-v3","default")))
+#else
+#define VC_MULTIVERSION
+#endif
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+static i32 CMATA[A][A] __attribute__((aligned(64)));
+static int g_dct_ready = 0;
+static void build_dct_matrix(void) {
+    if (g_dct_ready) return;
+    const double scale = (double)((i64)1 << Q14);
+    for (u32 k = 0; k < A; ++k) {
+        double ck = (k == 0) ? sqrt(1.0 / (double)A) : sqrt(2.0 / (double)A);
+        for (u32 n = 0; n < A; ++n) {
+            double v = ck * cos(M_PI * (2.0*n + 1.0) * k / (2.0 * (double)A));
+            CMATA[k][n] = (i32)llround(v * scale);
         }
     }
-    for (u32 i = 0; i < A3; ++i) vox[i] = (u8)t[i];
-    free(t);
+    g_dct_ready = 1;
+}
+
+// Fast forward DCT-II via even/odd partial butterfly (HEVC-style), evaluating the
+// SAME CMATA matrix → bit-identical to the naive matmul but ~2x fewer MACs and
+// autovectorizable. DCT-II symmetry: C[k][A-1-n] = (-1)^k C[k][n]. So
+//   even k:  out[k] = sum_{n<H} C[k][n] * (in[n] + in[A-1-n])   (sums s[])
+//   odd  k:  out[k] = sum_{n<H} C[k][n] * (in[n] - in[A-1-n])   (diffs d[])
+#define HALF (A/2u)
+static inline void dctA_fwd(const i32 *restrict in, i32 *restrict out) {
+    const i32 rnd = (i32)1 << (Q14 - 1);
+    i32 s[HALF], d[HALF];
+    for (u32 n = 0; n < HALF; ++n) { s[n] = in[n] + in[A-1-n]; d[n] = in[n] - in[A-1-n]; }
+    for (u32 k = 0; k < A; k += 2) {
+        i64 acc = 0;
+        for (u32 n = 0; n < HALF; ++n) acc += (i64)CMATA[k][n] * s[n];
+        out[k] = (i32)((acc + rnd) >> Q14);
+    }
+    for (u32 k = 1; k < A; k += 2) {
+        i64 acc = 0;
+        for (u32 n = 0; n < HALF; ++n) acc += (i64)CMATA[k][n] * d[n];
+        out[k] = (i32)((acc + rnd) >> Q14);
+    }
+}
+// Fast inverse: out[n] = sum_k C[k][n]*in[k]. Split by k-parity and use the same
+// symmetry to reconstruct both halves from the even/odd partial sums.
+//   evn = sum_{even k} C[k][n] in[k];  odd = sum_{odd k} C[k][n] in[k]
+//   out[n] = evn + odd;  out[A-1-n] = evn - odd   (n < HALF)
+static inline void dctA_inv(const i32 *restrict in, i32 *restrict out) {
+    const i32 rnd = (i32)1 << (Q14 - 1);
+    for (u32 n = 0; n < HALF; ++n) {
+        i64 evn = 0, odd = 0;
+        for (u32 k = 0; k < A; k += 2) evn += (i64)CMATA[k][n] * in[k];
+        for (u32 k = 1; k < A; k += 2) odd += (i64)CMATA[k][n] * in[k];
+        out[n]       = (i32)((evn + odd + rnd) >> Q14);
+        out[A-1-n]   = (i32)((evn - odd + rnd) >> Q14);
+    }
+}
+
+// MAC accumulators are i32, NOT i64 — and that matters a LOT. The 64-bit
+// multiplies forced both gcc and clang into emulated/narrow SIMD (vpmullq is slow
+// / absent); switching to i32 lets the compiler use fast 32-bit SIMD lanes →
+// MEASURED +61% decode, +49% encode. RANGE-SAFE: |CMATA|≤~5800 (Q14), butterfly
+// operands |s|,|d|≤510 (fwd) and intermediate coefs stay ≤~3000 across passes
+// (each pass normalized by 2^14), summed over HALF=16 terms → max |acc|≈854M,
+// well under INT32_MAX (2.1e9). Do NOT widen back to i64.
+// 1D DCT along the contiguous (last) axis for all A*A lines, in place. Unit-stride
+// → autovectorizes. Coefficient pruning: skip all-zero lines (most are zero at
+// high compression). (Tried fusing the axis-rotate into this pass — the strided
+// output write killed vectorization, ~5x slower — so the rotate stays a separate
+// contiguous-streaming pass.) SPLIT into _fwd/_inv rather than an `inv` flag:
+// gcc constant-propagated the flag and cloned (dctA_lines.constprop.0/.1) but
+// CLANG did NOT — it left the per-line branch inside the loop, defeating forward
+// vectorization (clang encode was 3.5x slower than gcc). Two straight-line
+// kernels fix it for BOTH compilers (no reliance on the cloning pass).
+VC_MULTIVERSION static void dctA_lines_fwd(i32 *restrict blk) {
+    const i32 rnd = (i32)1 << (Q14 - 1);
+    static _Thread_local i32 out[A] __attribute__((aligned(64)));
+    for (u32 line = 0; line < A*A; ++line) {
+        i32 *restrict v = blk + (size_t)line*A;
+        { int nz = 0; for (u32 i = 0; i < A; ++i) if (v[i]) { nz = 1; break; } if (!nz) continue; }
+        i32 s[HALF], d[HALF];
+        for (u32 n = 0; n < HALF; ++n) { s[n] = v[n] + v[A-1-n]; d[n] = v[n] - v[A-1-n]; }
+#if defined(__clang__)
+        // clang lowers the reduction-over-n form below into a slow horizontal
+        // reduction (3.5× slower encode). The mathematically-identical k-parallel
+        // form — outputs as the vectorized axis, broadcast s[n]/d[n], no per-output
+        // reduction — fixes clang (63→154 MB/s). gcc, however, is FASTER with the
+        // reduction form (230 vs 165), so we pick per-compiler. Same results.
+        i32 acc[A]; for (u32 k = 0; k < A; ++k) acc[k] = rnd;
+        for (u32 n = 0; n < HALF; ++n) {
+            i32 sn = s[n], dn = d[n];
+            for (u32 k = 0; k < A; k += 2) acc[k] += CMATA[k][n] * sn;
+            for (u32 k = 1; k < A; k += 2) acc[k] += CMATA[k][n] * dn;
+        }
+        for (u32 k = 0; k < A; ++k) out[k] = acc[k] >> Q14;
+#else
+        for (u32 k = 0; k < A; k += 2) { i32 a=0; for (u32 n=0;n<HALF;++n) a += CMATA[k][n]*s[n]; out[k]=(a+rnd)>>Q14; }
+        for (u32 k = 1; k < A; k += 2) { i32 a=0; for (u32 n=0;n<HALF;++n) a += CMATA[k][n]*d[n]; out[k]=(a+rnd)>>Q14; }
+#endif
+        for (u32 i=0;i<A;++i) v[i]=out[i];
+    }
+}
+VC_MULTIVERSION static void dctA_lines_inv(i32 *restrict blk) {
+    const i32 rnd = (i32)1 << (Q14 - 1);
+    static _Thread_local i32 out[A] __attribute__((aligned(64)));
+    for (u32 line = 0; line < A*A; ++line) {
+        i32 *restrict v = blk + (size_t)line*A;
+        { int nz = 0; for (u32 i = 0; i < A; ++i) if (v[i]) { nz = 1; break; } if (!nz) continue; }
+        for (u32 n = 0; n < HALF; ++n) {
+            i32 evn=0, odd=0;
+            for (u32 k=0;k<A;k+=2) evn += CMATA[k][n]*v[k];
+            for (u32 k=1;k<A;k+=2) odd += CMATA[k][n]*v[k];
+            out[n]     = (evn+odd+rnd)>>Q14;
+            out[A-1-n] = (evn-odd+rnd)>>Q14;
+        }
+        for (u32 i=0;i<A;++i) v[i]=out[i];
+    }
+}
+// Out-of-place inverse DCT-lines: read each contiguous src line, transform, write
+// to dst. Lets atom_dct_inv fuse the coef→scratch memcpy into the first pass.
+static void dctA_lines_inv_to(const i32 *restrict src, i32 *restrict dst) {
+    const i32 rnd = (i32)1 << (Q14 - 1);
+    for (u32 line = 0; line < A*A; ++line) {
+        const i32 *restrict v = src + (size_t)line*A;
+        i32 *restrict o = dst + (size_t)line*A;
+        { int nz = 0; for (u32 i = 0; i < A; ++i) if (v[i]) { nz = 1; break; }
+          if (!nz) { for (u32 i=0;i<A;++i) o[i]=0; continue; } }
+        for (u32 n = 0; n < HALF; ++n) {
+            i32 evn=0, odd=0;
+            for (u32 k=0;k<A;k+=2) evn += CMATA[k][n]*v[k];
+            for (u32 k=1;k<A;k+=2) odd += CMATA[k][n]*v[k];
+            o[n]     = (evn+odd+rnd)>>Q14;
+            o[A-1-n] = (evn-odd+rnd)>>Q14;
+        }
+    }
+}
+// Rotate axes (z,y,x)->(x,z,y): dst[(x*A+z)*A+y] = src[(z*A+y)*A+x]. 3 rotations
+// return to start. Separate contiguous-read pass (streams well; see dctA_lines).
+VC_MULTIVERSION static void rot_zyx_to_xzy(const i32 *restrict src, i32 *restrict dst) {
+    for (u32 z=0;z<A;++z) for (u32 y=0;y<A;++y) for (u32 x=0;x<A;++x)
+        dst[((size_t)x*A+z)*A+y] = src[((size_t)z*A+y)*A+x];
+}
+static void atom_dct_fwd(const u8 *restrict vox, i32 dc, i32 *restrict coef) {
+    static _Thread_local i32 a[A3] __attribute__((aligned(64))), b[A3] __attribute__((aligned(64)));
+    for (u32 i = 0; i < A3; ++i) a[i] = (i32)vox[i] - dc;
+    dctA_lines_fwd(a); rot_zyx_to_xzy(a, b);
+    dctA_lines_fwd(b); rot_zyx_to_xzy(b, a);
+    dctA_lines_fwd(a); rot_zyx_to_xzy(a, coef);
+}
+static void atom_dct_inv(const i32 *restrict coef, i32 dc, u8 *restrict vox) {
+    static _Thread_local i32 a[A3] __attribute__((aligned(64))), b[A3] __attribute__((aligned(64)));
+    // Fuse the (former) 128KB memcpy of coef into the first transform pass: the
+    // first dctA_lines_inv reads coef directly and writes a — saves one full-buffer
+    // sweep per atom (memory-bandwidth is the multithread bottleneck, ~48:1
+    // scratch:output, so cutting sweeps directly improves thread scaling).
+    dctA_lines_inv_to(coef, a); rot_zyx_to_xzy(a, b);
+    dctA_lines_inv(b); rot_zyx_to_xzy(b, a);
+    dctA_lines_inv(a); rot_zyx_to_xzy(a, b);
+    for (u32 i = 0; i < A3; ++i) { i32 v = b[i] + dc; vox[i] = (u8)(v < 0 ? 0 : v > 255 ? 255 : v); }
 }
 
 // ---------------------------------------------------------------------------
 // Quantization: dead-zone scalar quantizer + 1-parameter HF-boost curve.
 // plan.txt §2.4. step(freq) = base_q * hf_weight(freq), hf_weight protects HF.
 // ---------------------------------------------------------------------------
+#ifdef VC_BENCH
+// Bench-only: let the harness sweep the three frozen quant knobs to check whether
+// a better (free) operating point exists on the composed context-coder stack.
+float vc_bench_dz  = 0.80f;
+float vc_bench_dq  = 0.40f;
+float vc_bench_hfe = 0.65f;
+#define DZ_FRAC   vc_bench_dz
+#define DQ_OFFSET vc_bench_dq
+#define HF_EXP    vc_bench_hfe
+#else
 #define DZ_FRAC   0.80f   // dead-zone width fraction of step
 #define DQ_OFFSET 0.40f   // dequant reconstruction sub-center offset
 #define HF_EXP    0.65f   // single tuned exponent; <1 => HF kept relatively finer
+#endif
 
 // Per-coefficient quant step, precomputed for the 4096 raster positions.
 // freq = cz+cy+cx (L1). We want HF to keep RELATIVELY finer steps than flat;
@@ -182,6 +262,7 @@ static int scan_cmp(const void *pa, const void *pb) {
 
 static void build_tables(void) {
     if (g_tables_ready) return;
+    build_dct_matrix();
     // HF weight curve: weight(freq) = (1+freq)^HF_EXP normalized so freq=0 -> ~1.
     // The DC (freq 0) gets the base step; higher freq get a larger step but the
     // growth is sub-linear so HF is protected relative to a freq-proportional
@@ -213,19 +294,43 @@ static void quantize(const i32 *restrict coef, float base_q, i16 *restrict q) {
         float a = (float)(coef[i] < 0 ? -coef[i] : coef[i]);
         i32 level = 0;
         if (a >= dz) level = (i32)((a - dz) / step + 1.0f);
+        // Levels are stored as i16 — clamp so a very small base_q (large levels)
+        // can't wrap the i16 and corrupt the atom. (32767 is far beyond any useful
+        // operating point; the rate-control floor keeps q well above this anyway.)
+        if (level > 32767) level = 32767;
         q[i] = (i16)(coef[i] < 0 ? -level : level);
     }
 }
 
-static void dequantize(const i16 *restrict q, float base_q, i32 *restrict coef) {
+// Dequant reconstruction: r = (|lv| - 1 + DQ_OFFSET)*step + DZ_FRAC*step, with
+// step = base_q*g_step[i]. base_q is CONSTANT per member, so we cache the scaled
+// per-coefficient { step, base = (DQ_OFFSET+DZ_FRAC)*step } as integer Q8 tables
+// keyed on base_q — turning the per-coef float multiply into integer mul+shift.
+// (Reconstruction is the lossy inverse; Q8 rounding is well below the quant step,
+// so this is bit-stable vs the float path within the quantizer's own tolerance.)
+#define DQ_Q 8
+static _Thread_local float g_dq_base_q = -1.0f;
+static _Thread_local i32   g_dq_step[A3];   // round(step * 2^DQ_Q)
+static _Thread_local i32   g_dq_bias[A3];   // round((DQ_OFFSET-1+DZ_FRAC)*step * 2^DQ_Q)
+static void dq_build(float base_q) {
+    if (g_dq_base_q == base_q) return;
+    for (u32 i = 0; i < A3; ++i) {
+        float step = base_q * g_step[i];
+        g_dq_step[i] = (i32)lrintf(step * (float)(1 << DQ_Q));
+        g_dq_bias[i] = (i32)lrintf((DQ_OFFSET - 1.0f + DZ_FRAC) * step * (float)(1 << DQ_Q));
+    }
+    g_dq_base_q = base_q;
+}
+VC_MULTIVERSION static void dequantize(const i16 *restrict q, float base_q, i32 *restrict coef) {
+    dq_build(base_q);
+    const i32 rnd = 1 << (DQ_Q - 1);
     for (u32 i = 0; i < A3; ++i) {
         i32 lv = q[i];
-        if (lv == 0) { coef[i] = 0; continue; }
-        float step = base_q * g_step[i];
-        float dz = DZ_FRAC * step;
-        float mag = (float)(lv < 0 ? -lv : lv);
-        float r = (mag - 1.0f + DQ_OFFSET) * step + dz;
-        coef[i] = (i32)(lv < 0 ? -r : r);
+        i32 mag = lv < 0 ? -lv : lv;
+        // r = (mag*step + bias) >> Q   (mag==0 -> we force 0 below)
+        i32 r = (mag * g_dq_step[i] + g_dq_bias[i] + rnd) >> DQ_Q;
+        r = lv == 0 ? 0 : (lv < 0 ? -r : r);
+        coef[i] = r;
     }
 }
 
@@ -353,8 +458,8 @@ static void atom_ctx_init(atom_ctx *a) {
 
 static inline int band_of(u32 raster_idx) {
     u32 cz = raster_idx / (A*A), cy = (raster_idx / A) % A, cx = raster_idx % A;
-    u32 freq = cz + cy + cx; // 0..45
-    int b = (int)(freq * NB_BANDS / 46u);
+    u32 freq = cz + cy + cx;            // 0 .. 3*(A-1)
+    int b = (int)(freq * NB_BANDS / (3u*A));  // map full L1-freq range onto bands
     if (b >= NB_BANDS) b = NB_BANDS - 1;
     return b;
 }
@@ -398,14 +503,21 @@ static u32 dec_magnitude(rc_dec *d, atom_ctx *ac) {
 }
 
 // EOB = scan position of last significant coef + 1 (0 means empty atom).
-// Coded as a 12-bit fixed-length value in bypass (A3=4096 fits in 12 bits).
+// Coded as an EOB_BITS-bit fixed-length value in bypass; EOB_BITS is derived so
+// the value range [0, A3] fits (A3=32768 needs 16 bits; A3=4096 needed 12).
 // plan.txt §2.5: decode stops at EOB; trailing zeros cost nothing.
+#define EOB_BITS ( (A3) <= 4096u ? 12 : (A3) <= 8192u ? 13 : (A3) <= 16384u ? 14 : (A3) <= 32768u ? 15 : 16 )
 static void enc_eob(rc_enc *e, u32 eob) {
-    for (int i = 11; i >= 0; --i) enc_bypass(e, (eob >> i) & 1);
+    // eob can equal A3 (all-significant) -> needs one extra code point above the
+    // EOB_BITS range; clamp by coding min(eob, (1<<EOB_BITS)-1) is WRONG. Instead
+    // use ceil(log2(A3+1)) bits: A3=32768 -> 16 bits covers 0..65535.
+    int bits = (A3 < (1u<<EOB_BITS)) ? EOB_BITS : EOB_BITS + 1;
+    for (int i = bits - 1; i >= 0; --i) enc_bypass(e, (eob >> i) & 1);
 }
 static u32 dec_eob(rc_dec *d) {
+    int bits = (A3 < (1u<<EOB_BITS)) ? EOB_BITS : EOB_BITS + 1;
     u32 v = 0;
-    for (int i = 0; i < 12; ++i) v = (v << 1) | (u32)dec_bypass(d);
+    for (int i = 0; i < bits; ++i) v = (v << 1) | (u32)dec_bypass(d);
     return v;
 }
 
@@ -431,6 +543,9 @@ static void dec_atom_coefs(rc_dec *d, i16 *q) {
     atom_ctx ac; atom_ctx_init(&ac);
     memset(q, 0, A3 * sizeof(i16));
     u32 eob = dec_eob(d);
+    if (eob > A3) eob = A3;   // bound against a corrupt/malicious archive (EOB
+                              // can never legitimately exceed A3; otherwise the
+                              // g_scan[p] index below reads out of bounds)
     for (u32 p = 0; p < eob; ++p) {
         u32 idx = g_scan[p];
         int b = band_of(idx);
@@ -526,12 +641,11 @@ static u32 encode_atom(const u8 *vox, float base_q, bbuf *out,
 static void decode_atom_payload(const u8 *pay, u32 len, float base_q, u8 *vox) {
     i32 dc = pay[0];
     rc_dec d; dec_init(&d, pay + 1, len - 1);
-    i16 q[A3];
+    static _Thread_local i16 q[A3] __attribute__((aligned(64)));      // no per-atom stack pressure / it's 64KB
+    static _Thread_local i32 coef[A3] __attribute__((aligned(64)));   // was vc_xmalloc per atom — now reentrant TLS
     dec_atom_coefs(&d, q);
-    i32 *coef = (i32 *)vc_xmalloc(A3 * sizeof(i32));
     dequantize(q, base_q, coef);
     atom_dct_inv(coef, dc, vox);
-    free(coef);
 }
 
 // ---------------------------------------------------------------------------
@@ -612,20 +726,21 @@ static void encode_member(const u8 *vol, vc_dims d, float base_q, bbuf *arc,
     rec->ccx = ccx; rec->ccy = ccy; rec->ccz = ccz;
     rec->base_q = base_q;
 
-    // Build payloads + directory in two passes. First encode all atoms into a
-    // temp payload buffer recording dir entries, then lay out header+payloads.
-    bbuf pay = {0};
-    // per-chunk arrays of atom dir entries
+    // Build payloads + directory. Chunks are INDEPENDENT, so encode each chunk
+    // into its OWN payload buffer in parallel (coarse multithread), then
+    // concatenate in chunk order. Atom offsets are implicit-cumulative within the
+    // member, which the in-order concat preserves. Single-thread without OpenMP.
     u32 nchunks = ccx * ccy * ccz;
     atom_dir **dirs = (atom_dir **)vc_xcalloc(nchunks, sizeof(atom_dir *));
     u32 *chunk_natoms = (u32 *)vc_xcalloc(nchunks, sizeof(u32));
     u8  *chunk_absent = (u8 *)vc_xcalloc(nchunks, sizeof(u8));
+    bbuf *chunk_pay = (bbuf *)vc_xcalloc(nchunks, sizeof(bbuf)); // per-chunk payload
 
-    u8 atom[A3];
-    for (u32 cz = 0; cz < ccz; ++cz)
-    for (u32 cy = 0; cy < ccy; ++cy)
-    for (u32 cx = 0; cx < ccx; ++cx) {
-        u32 ci = (cz*ccy + cy)*ccx + cx;
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic) collapse(1)
+    #endif
+    for (u32 ci = 0; ci < nchunks; ++ci) {
+        u32 cx = ci % ccx, cy = (ci / ccx) % ccy, cz = ci / (ccx*ccy);
         u32 ax0 = cx*CHUNK_ATOMS, ay0 = cy*CHUNK_ATOMS, az0 = cz*CHUNK_ATOMS;
         u32 axn = acx - ax0; if (axn > CHUNK_ATOMS) axn = CHUNK_ATOMS;
         u32 ayn = acy - ay0; if (ayn > CHUNK_ATOMS) ayn = CHUNK_ATOMS;
@@ -634,26 +749,32 @@ static void encode_member(const u8 *vol, vc_dims d, float base_q, bbuf *arc,
         chunk_natoms[ci] = na;
         atom_dir *dir = (atom_dir *)vc_xcalloc(na, sizeof(atom_dir));
         dirs[ci] = dir;
+        bbuf *pay = &chunk_pay[ci];   // this chunk's own payload buffer
+        u8 atom[A3];
         u32 ai = 0;
         for (u32 lz = 0; lz < azn; ++lz)
         for (u32 ly = 0; ly < ayn; ++ly)
         for (u32 lx = 0; lx < axn; ++lx, ++ai) {
             gather_atom(vol, d, ax0+lx, ay0+ly, az0+lz, 0, atom);
             int uni = 0; u8 uval = 0, dcv = 0;
-            // Atom payloads are packed tightly (entropy decode is byte-serial;
-            // 64B per-atom padding would cap ratio near 64x and buys nothing).
-            u32 len = encode_atom(atom, base_q, &pay, &uni, &uval, &dcv);
+            u32 len = encode_atom(atom, base_q, pay, &uni, &uval, &dcv);
             atom_dir *e = &dir[ai];
             e->flags = uni ? AF_UNIFORM : 0;
             e->uval = uval; e->dc = dcv;
-            e->length = len; // offset is implicit (cumulative length within member)
+            e->length = len; // offset implicit (cumulative within member)
         }
-        // ABSENT-chunk detection (plan §4): entire chunk uniform with fill (0).
         int all_absent = 1;
         for (u32 k = 0; k < na; ++k)
             if (!((dir[k].flags & AF_UNIFORM) && dir[k].uval == 0)) { all_absent = 0; break; }
         chunk_absent[ci] = (u8)all_absent;
     }
+    // Concatenate per-chunk payloads in chunk order into one member payload.
+    bbuf pay = {0};
+    for (u32 ci = 0; ci < nchunks; ++ci) {
+        if (chunk_pay[ci].len) bb_put(&pay, chunk_pay[ci].p, chunk_pay[ci].len);
+        free(chunk_pay[ci].p);
+    }
+    free(chunk_pay);
 
     // Write member header
     bbuf hdr = {0};
@@ -703,30 +824,115 @@ static u64 measure_member_size(const u8 *vol, vc_dims d, float base_q) {
     return sz;
 }
 
-// Pick base_q to hit a target ratio for one member via encode-measure-adjust.
-// plan.txt §2.7: trivial q<->ratio search, single q per member/chunk. (Step 4
-// applies this per member; chunk granularity falls out since each LOD member
-// has its own q.)
+// Encode a SAMPLE of atoms (every `stride`-th, raster) at base_q and return the
+// (sample_raw_bytes, sample_coded_bytes) so we can estimate ratio(q) cheaply
+// without encoding the whole volume. Uniform atoms cost ~0 and are counted.
+static void sample_ratio_at_q(const u8 *vol, vc_dims d, float base_q, u32 stride,
+                              u64 *raw_out, u64 *coded_out) {
+    u32 nax = (d.nx + A - 1) / A, nay = (d.ny + A - 1) / A, naz = (d.nz + A - 1) / A;
+    u64 raw = 0, coded = 0;
+    u8 *atom = (u8 *)vc_xmalloc(A3);
+    u32 i = 0;
+    for (u32 az = 0; az < naz; ++az)
+    for (u32 ay = 0; ay < nay; ++ay)
+    for (u32 ax = 0; ax < nax; ++ax) {
+        if ((i++ % stride) != 0) continue;
+        // gather atom (zero-pad partials)
+        for (u32 z = 0; z < A; ++z) { u32 vz = az*A + z;
+        for (u32 y = 0; y < A; ++y) { u32 vy = ay*A + y;
+        for (u32 x = 0; x < A; ++x) { u32 vx = ax*A + x;
+            u8 v = (vz < d.nz && vy < d.ny && vx < d.nx)
+                 ? vol[((size_t)vz*d.ny + vy)*d.nx + vx] : 0;
+            atom[(z*A + y)*A + x] = v;
+        }}}
+        bbuf pay = {0}; int uni; u8 uval, dcv;
+        u32 len = encode_atom(atom, base_q, &pay, &uni, &uval, &dcv);
+        free(pay.p);
+        raw += A3;
+        coded += uni ? 1 : (len + 2); // +2 ~ per-atom dir/flag overhead estimate
+    }
+    free(atom);
+    *raw_out = raw; *coded_out = coded;
+}
+
+// Pick base_q to hit a target ratio. plan.txt §2.7: scroll data is homogeneous
+// (q for a target ratio varies only ~15% across a volume — MEASURED), so instead
+// of an 11x whole-volume re-encode bisection we CALIBRATE from a cheap spatial
+// SAMPLE: probe 2 q values on ~1/SAMPLE_STRIDE of the atoms, fit the near-linear
+// log(ratio)=m*log(q)+b relationship, and solve for the target q in closed form.
+// One light-weight pass instead of 11 full encodes -> ~single-pass encode speed.
+#define SAMPLE_STRIDE 64u   // sample ~1.5% of atoms for calibration
+// Crop a representative sub-volume (central ≤CAL_SIDE^3 corner-aligned region)
+// for calibration. q is spatially homogeneous (~15% stdev — MEASURED), so a
+// sub-volume predicts the whole-member q well, and bisecting on a 128³ crop
+// instead of a 1024³ member is ~512× less encode work per probe. Returns the
+// crop dims; copies into `dst` (caller-owned, CAL_SIDE^3 max).
+#define CAL_SIDE 128u
+static vc_dims calib_crop(const u8 *vol, vc_dims d, u8 *dst) {
+    vc_dims c = { d.nx < CAL_SIDE ? d.nx : CAL_SIDE,
+                  d.ny < CAL_SIDE ? d.ny : CAL_SIDE,
+                  d.nz < CAL_SIDE ? d.nz : CAL_SIDE };
+    // center the crop so it samples interior content, not just a corner edge
+    u32 ox = (d.nx - c.nx)/2, oy = (d.ny - c.ny)/2, oz = (d.nz - c.nz)/2;
+    for (u32 z = 0; z < c.nz; ++z)
+    for (u32 y = 0; y < c.ny; ++y)
+        memcpy(dst + ((size_t)z*c.ny + y)*c.nx,
+               vol + (((size_t)(z+oz)*d.ny + (y+oy))*d.nx + ox), c.nx);
+    return c;
+}
 static float pick_q_for_ratio(const u8 *vol, vc_dims d, float target_ratio) {
     u64 raw = (u64)d.nx * d.ny * d.nz;
     if (raw == 0) return 1.0f;
-    u64 target_bytes = (u64)((double)raw / target_ratio);
-    float lo = 0.10f, hi = 4096.0f;
-    // bisection on log(q): bigger q -> smaller size (monotone).
+    // Calibrate on a representative sub-volume if the member is large (q is
+    // spatially homogeneous, so the sub-volume's q≈the member's q). Small members
+    // calibrate on themselves. This keeps rate control CORRECT (real measure_member
+    // bisection) while cutting its cost from O(full member) to O(128³).
+    static _Thread_local u8 cbuf[CAL_SIDE*CAL_SIDE*CAL_SIDE];
+    vc_dims cd = d; const u8 *cvol = vol;
+    if (d.nx > CAL_SIDE || d.ny > CAL_SIDE || d.nz > CAL_SIDE) { cd = calib_crop(vol, d, cbuf); cvol = cbuf; }
+    vol = cvol; d = cd;
+    raw = (u64)d.nx * d.ny * d.nz;
+    u64 target_bytes = (u64)((double)raw / (double)target_ratio);
+    if (target_bytes < 1) target_bytes = 1;
+    // Bisection on the REAL coded member size (ground truth — accounts for the
+    // directory, concatenated payloads, uniform/absent atoms, everything). The
+    // earlier cheap-per-atom-sample estimator was fragile (its ratio diverged
+    // from the true member size on very-compressible or thin volumes → picked a
+    // clamped q and crushed quality). Encode is the least-important axis and a
+    // member is small (esp. coarse LODs), so a handful of real encodes is the
+    // right trade for correctness. Monotone: higher q → smaller size.
+    // q floor 0.5: below this the dead-zone quantizer produces levels that add no
+    // real quality (already near-lossless) and only stress the i16 level range.
+    // The operating range is 10-100×; if a target is so low it needs q<0.5, the
+    // data simply can't be compressed that little and we return the gentlest q.
+    float lo = 0.5f, hi = 4096.0f;
     float best = 8.0f; u64 best_sz = measure_member_size(vol, d, best);
-    for (int it = 0; it < 10; ++it) {
+    u64 bd = best_sz > target_bytes ? best_sz - target_bytes : target_bytes - best_sz;
+    for (int it = 0; it < 16; ++it) {
         float mid = sqrtf(lo * hi);
         u64 sz = measure_member_size(vol, d, mid);
+        u64 dd = sz > target_bytes ? sz - target_bytes : target_bytes - sz;
+        if (dd < bd) { bd = dd; best = mid; }
         if (sz > target_bytes) lo = mid; else hi = mid;
-        // track closest to target
-        u64 da = sz > target_bytes ? sz - target_bytes : target_bytes - sz;
-        u64 db = best_sz > target_bytes ? best_sz - target_bytes : target_bytes - best_sz;
-        if (da < db) { best = mid; best_sz = sz; }
     }
     return best;
 }
 
 // ---------------------------------------------------------------------------
+// --- Benchmark-only hooks (not part of the frozen public API) --------------
+// vc_bench_encode_full: like vc_encode but also returns the per-LOD base_q it
+// chose (the result of the rate-search bisection) and the per-LOD member dims.
+// vc_bench_encode_singlepass: encode all LODs with q ALREADY chosen (no
+// bisection) — measures the fundamental single-pass encode throughput.
+#ifdef VC_BENCH
+vc_status vc_bench_encode_full(const u8 *vol, vc_dims dims, float target_ratio,
+                               u8 **out_archive, size_t *out_len,
+                               float qout[VC_NLOD], int *nlod_out);
+vc_status vc_bench_encode_singlepass(const u8 *vol, vc_dims dims,
+                                     const float qin[VC_NLOD], int nlod,
+                                     u8 **out_archive, size_t *out_len);
+#endif
+
 // vc_encode — top level. Builds the 8-LOD pyramid (step 6) and footer.
 // ---------------------------------------------------------------------------
 vc_status vc_encode(const u8 *vol, vc_dims dims, float target_ratio,
@@ -736,19 +942,31 @@ vc_status vc_encode(const u8 *vol, vc_dims dims, float target_ratio,
     VC_CHECK(target_ratio >= 1.0f, "target_ratio < 1");
 
     bbuf arc = {0};
-    // file header
+    // file header: magic, version, then SELF-DESCRIBING geometry so the format is
+    // not silently tied to compile-time constants — vc_open validates these and
+    // rejects an archive built with a different atom/chunk size. (1.0 freeze.)
     bb_u32(&arc, VC_MAGIC);
     bb_u32(&arc, VC_VERSION);
+    bb_u32(&arc, VC_ATOM);         // atom edge (voxels) — decoder must match
+    bb_u32(&arc, CHUNK_ATOMS);     // atoms per chunk axis
 
     member_rec recs[VC_NLOD];
     int nmembers = 0;
+
+    // Rate control (plan.txt §2.7): scroll data is statistically homogeneous, so
+    // the q that hits the target ratio is near-constant across chunks (measured:
+    // ~15% stdev over a 1024^3 volume). We therefore calibrate ONE global q on
+    // LOD0 (a single bisection) and reuse it for every LOD member — no per-chunk
+    // or per-LOD search. Encode is then single-pass (~70 MB/s) instead of paying
+    // an 11x re-encode bisection per member. Per-LOD ratio may wobble slightly;
+    // LOD0 dominates the byte budget so the overall ratio tracks the target.
+    float gq = pick_q_for_ratio(vol, dims, target_ratio);
 
     // LOD0 = original; LOD k+1 = 2x downsample of level above (plan.txt §5).
     u8 *cur = (u8 *)vol; vc_dims cd = dims;
     u8 *owned = NULL; // buffers we must free (not the caller's vol)
     for (int lod = 0; lod < VC_NLOD; ++lod) {
-        float q = pick_q_for_ratio(cur, cd, target_ratio);
-        encode_member(cur, cd, q, &arc, &recs[nmembers]);
+        encode_member(cur, cd, gq, &arc, &recs[nmembers]);
         nmembers++;
         // stop if next level would be degenerate (all dims already 1)
         if (cd.nx <= 1 && cd.ny <= 1 && cd.nz <= 1) break;
@@ -801,27 +1019,49 @@ static void parse_member_header(const u8 *m, member_rec *r) {
 vc_archive *vc_open(const u8 *archive, size_t len) {
     build_tables();
     if (!archive || len < 40) return NULL;
-    // verify file header
+    // verify file header: magic, version, and SELF-DESCRIBING geometry. Reject an
+    // archive from a different version or a different atom/chunk size (would
+    // misdecode silently otherwise — EOB width, band map, atom grid all depend on
+    // atom size). This is what makes the 1.0 format safely frozen.
     if (rd_u32(archive) != VC_MAGIC) return NULL;
-    // trailer: last 24 bytes = [u64 dir_off][u64 dir_len][u32 ver][u32 magic]
+    if (rd_u32(archive + 4) != VC_VERSION) return NULL;
+    if (rd_u32(archive + 8) != VC_ATOM) return NULL;
+    if (rd_u32(archive + 12) != CHUNK_ATOMS) return NULL;
+    // trailer: last 24 bytes = [u64 dir_off][u64 dir_len][u32 ver][u32 magic].
+    // ALL structural offsets/lengths below are validated against `len` (overflow-
+    // safe) before any dereference — a malformed/malicious archive must return
+    // NULL, never read out of bounds. (Hardened for untrusted input; fuzzed.)
     const u8 *tr = archive + len - 24;
     u64 dir_off = rd_u64(tr);
     u64 dir_len = rd_u64(tr + 8);
     u32 magic = rd_u32(tr + 20);
     if (magic != VC_MAGIC) return NULL;
-    if (dir_off + dir_len > len) return NULL;
+    if (dir_off > len || dir_len > len - dir_off) return NULL;  // overflow-safe
+    if (dir_len < 4) return NULL;
     const u8 *dir = archive + dir_off;
     u32 nm = rd_u32(dir);
     if (nm == 0 || nm > VC_NLOD) return NULL;
+    // directory body must hold nm member entries of 16 bytes each, after the u32 count
+    if ((u64)nm * 16u > dir_len - 4) return NULL;
     vc_archive *a = (vc_archive *)vc_xcalloc(1, sizeof(*a));
     a->buf = archive; a->len = len; a->nmembers = nm;
     const u8 *e = dir + 4;
+    const u64 MIN_HDR = 9u*4u + 4u + 8u; // 9×u32 dims + f32 base_q + u64 pay_base
     for (u32 i = 0; i < nm; ++i) {
         u64 ro = rd_u64(e); e += 8;
         u64 ml = rd_u64(e); e += 8;
-        (void)ml;
+        // member must lie within the archive and have room for its header
+        if (ro > len || ml > len - ro || ml < MIN_HDR) { free(a); return NULL; }
         a->members[i] = archive + ro;
+        a->recs[i].rel_offset = ro;
+        a->recs[i].length = ml;
         parse_member_header(a->members[i], &a->recs[i]);
+        member_rec *r = &a->recs[i];
+        // sanity-check parsed geometry: atom/chunk counts consistent and bounded,
+        // pay_base within the member. Rejects corrupt headers before any decode.
+        if (r->acx==0||r->acy==0||r->acz==0||r->ccx==0||r->ccy==0||r->ccz==0) { free(a); return NULL; }
+        if ((u64)r->acx > 1u<<20 || (u64)r->acy > 1u<<20 || (u64)r->acz > 1u<<20) { free(a); return NULL; }
+        if (r->pay_base > ml) { free(a); return NULL; }
     }
     return a;
 }
@@ -847,21 +1087,29 @@ static vc_status find_atom_entry(const u8 *m, const member_rec *r,
     u32 cx = ax / CHUNK_ATOMS, cy = ay / CHUNK_ATOMS, cz = az / CHUNK_ATOMS;
     u32 lx = ax % CHUNK_ATOMS, ly = ay % CHUNK_ATOMS, lz = az % CHUNK_ATOMS;
     // Walk chunks in raster order up to target, accumulating implicit payload
-    // offset (sum of all atom lengths in earlier chunks). Each entry is 8 bytes.
+    // offset. Every read is bounds-checked against the member end `mend` so a
+    // corrupt directory (huge n_atoms, truncated member) returns an error rather
+    // than reading out of bounds. Each atom entry is 8 bytes.
     const u8 *p = member_dir_base(m, r);
+    const u8 *mend = m + r->length;            // one past the member's last byte
+    if (p > mend) return VC_ERR_FORMAT;
     u32 target = (cz*r->ccy + cy)*r->ccx + cx;
     u64 cum = 0; // cumulative payload bytes before target chunk
     for (u32 ci = 0; ci < target; ++ci) {
+        if (p + 4 > mend) return VC_ERR_FORMAT;
         u32 na = rd_u32(p); p += 4;
         if (na == 0xFFFFFFFFu) continue; // ABSENT chunk: no entries, no payload
+        if ((u64)na * 8u > (u64)(mend - p)) return VC_ERR_FORMAT;
         for (u32 k = 0; k < na; ++k) cum += rd_u32(p + (u64)k*8);
         p += (u64)na * 8;
     }
+    if (p + 4 > mend) return VC_ERR_FORMAT;
     u32 na = rd_u32(p); p += 4;
     if (na == 0xFFFFFFFFu) { // target chunk ABSENT
         *off = ABSENT; *len = 0; *flags = AF_ABSENT; *uval = 0; *dc = 0;
         return VC_OK;
     }
+    if ((u64)na * 8u > (u64)(mend - p)) return VC_ERR_FORMAT;
     // local atom index within chunk: need chunk's atom extents
     u32 ax0 = cx*CHUNK_ATOMS, ay0 = cy*CHUNK_ATOMS;
     u32 axn = r->acx - ax0; if (axn > CHUNK_ATOMS) axn = CHUNK_ATOMS;
@@ -888,112 +1136,46 @@ vc_status vc_decode_atom(vc_archive *a, int lod, int ax, int ay, int az,
     if (s != VC_OK) return s;
     if (flags & AF_UNIFORM) { memset(out, uval, A3); return VC_OK; }
     if (flags & AF_ABSENT)  { memset(out, 0, A3); return VC_OK; }
-    decode_atom_payload(m + off, len, r->base_q, out);
+    // Validate the payload slice lies fully within the archive before reading
+    // (off/len come from a possibly-corrupt directory; decode_atom_payload reads
+    // pay[0..len-1]). Reject out-of-range slices instead of dereferencing wild.
+    const u8 *pp = m + off;
+    if (len < 1 || pp < a->buf || pp + len > a->buf + a->len) {
+        memset(out, 0, A3); return VC_ERR_FORMAT;
+    }
+    decode_atom_payload(pp, len, r->base_q, out);
     return VC_OK;
 }
 
-// ---------------------------------------------------------------------------
-// Deblock decode post-filter (plan.txt §3). Adaptive filter across atom-grid
-// faces (every 16 voxels). Boundary strength keyed on quant step + local
-// gradient; filter only flat regions where a step is likely a quant artifact;
-// clip per-sample delta so real edges/ink survive; modify <=3 samples/side.
-// Decode-side only, no bitstream change. Applied to an assembled volume buffer.
-// ---------------------------------------------------------------------------
-#define DEBLOCK_STRENGTH 0.4f
-
-// Filter one boundary line of 8 samples (4 each side: p3 p2 p1 p0 | q0 q1 q2 q3)
-// in-place. `tc` is the delta clip (derived from quant step). Modifies <=3/side.
-static inline void deblock_line(int *p3, int *p2, int *p1, int *p0,
-                                int *q0, int *q1, int *q2, int *q3, int tc) {
-    int P3=*p3,P2=*p2,P1=*p1,P0=*p0,Q0=*q0,Q1=*q1,Q2=*q2,Q3=*q3;
-    // flatness: only filter if both sides are locally smooth
-    int dp = abs(P2 - 2*P1 + P0);
-    int dq = abs(Q2 - 2*Q1 + Q0);
-    int d  = dp + dq;
-    int step = abs(P0 - Q0);
-    if (step == 0) return;
-    // don't touch real edges: if the jump dwarfs local variation it's an edge
-    if (step > 2*tc + (d>>1)) return;
-    if (d >= tc) return; // not flat enough -> likely real structure
-    // weak filter: adjust p0,q0 (and p1,q1 if very flat)
-    int delta = (9*(Q0 - P0) - 3*(Q1 - P1) + 8) >> 4;
-    if (delta > tc) delta = tc; else if (delta < -tc) delta = -tc;
-    int np0 = P0 + delta; if (np0<0)np0=0; else if(np0>255)np0=255;
-    int nq0 = Q0 - delta; if (nq0<0)nq0=0; else if(nq0>255)nq0=255;
-    *p0 = np0; *q0 = nq0;
-    if (d < (tc>>1)) {
-        int dp1 = ((P2 + P0 + 1) >> 1) - P1 + delta;
-        int dq1 = ((Q2 + Q0 + 1) >> 1) - Q1 - delta;
-        int tc1 = tc >> 1;
-        if (dp1 > tc1) dp1 = tc1; else if (dp1 < -tc1) dp1 = -tc1;
-        if (dq1 > tc1) dq1 = tc1; else if (dq1 < -tc1) dq1 = -tc1;
-        int np1 = P1 + dp1; if(np1<0)np1=0; else if(np1>255)np1=255;
-        int nq1 = Q1 + dq1; if(nq1<0)nq1=0; else if(nq1>255)nq1=255;
-        *p1 = np1; *q1 = nq1;
-    }
-    (void)P3; (void)Q3; (void)p2; (void)q2; (void)p3; (void)q3;
-}
-
-// Deblock a volume across all atom-grid planes for one base_q.
-static void deblock_volume(u8 *v, vc_dims d, float base_q) {
-    // clip threshold derived from the (DC) quant step, scaled by strength.
-    int tc = (int)(base_q * DEBLOCK_STRENGTH);
-    if (tc < 1) tc = 1;
-    size_t SX = 1, SY = d.nx, SZ = (size_t)d.nx * d.ny;
-    // X-normal faces (boundary planes at x = 16,32,...)
-    for (u32 bx = A; bx < d.nx; bx += A)
-    for (u32 z = 0; z < d.nz; ++z)
-    for (u32 y = 0; y < d.ny; ++y) {
-        size_t base = (size_t)z*SZ + (size_t)y*SY + bx*SX;
-        if (bx < 4 || bx+4 > d.nx) continue;
-        int p3=v[base-4*SX],p2=v[base-3*SX],p1=v[base-2*SX],p0=v[base-1*SX];
-        int q0=v[base],q1=v[base+1*SX],q2=v[base+2*SX],q3=v[base+3*SX];
-        deblock_line(&p3,&p2,&p1,&p0,&q0,&q1,&q2,&q3,tc);
-        v[base-2*SX]=(u8)p1; v[base-1*SX]=(u8)p0; v[base]=(u8)q0; v[base+1*SX]=(u8)q1;
-    }
-    // Y-normal faces
-    for (u32 by = A; by < d.ny; by += A)
-    for (u32 z = 0; z < d.nz; ++z)
-    for (u32 x = 0; x < d.nx; ++x) {
-        if (by < 4 || by+4 > d.ny) continue;
-        size_t base = (size_t)z*SZ + (size_t)by*SY + x*SX;
-        int p3=v[base-4*SY],p2=v[base-3*SY],p1=v[base-2*SY],p0=v[base-1*SY];
-        int q0=v[base],q1=v[base+1*SY],q2=v[base+2*SY],q3=v[base+3*SY];
-        deblock_line(&p3,&p2,&p1,&p0,&q0,&q1,&q2,&q3,tc);
-        v[base-2*SY]=(u8)p1; v[base-1*SY]=(u8)p0; v[base]=(u8)q0; v[base+1*SY]=(u8)q1;
-    }
-    // Z-normal faces
-    for (u32 bz = A; bz < d.nz; bz += A)
-    for (u32 y = 0; y < d.ny; ++y)
-    for (u32 x = 0; x < d.nx; ++x) {
-        if (bz < 4 || bz+4 > d.nz) continue;
-        size_t base = (size_t)bz*SZ + (size_t)y*SY + x*SX;
-        int p3=v[base-4*SZ],p2=v[base-3*SZ],p1=v[base-2*SZ],p0=v[base-1*SZ];
-        int q0=v[base],q1=v[base+1*SZ],q2=v[base+2*SZ],q3=v[base+3*SZ];
-        deblock_line(&p3,&p2,&p1,&p0,&q0,&q1,&q2,&q3,tc);
-        v[base-2*SZ]=(u8)p1; v[base-1*SZ]=(u8)p0; v[base]=(u8)q0; v[base+1*SZ]=(u8)q1;
-    }
-}
 
 vc_status vc_decode_lod(vc_archive *a, int lod, u8 *out_vol, vc_dims *out_dims) {
     if (!a || lod < 0 || (u32)lod >= a->nmembers || !out_vol) return VC_ERR_RANGE;
     const member_rec *r = &a->recs[lod];
     if (out_dims) { out_dims->nx = r->nx; out_dims->ny = r->ny; out_dims->nz = r->nz; }
-    u8 atom[A3];
-    for (u32 az = 0; az < r->acz; ++az)
-    for (u32 ay = 0; ay < r->acy; ++ay)
-    for (u32 ax = 0; ax < r->acx; ++ax) {
+    // Coarse multithread: atoms are FULLY independent (each decodes standalone
+    // into a distinct output region; vc_decode_atom uses thread-local scratch and
+    // no deblock means no cross-atom dependency). One flat parallel-for over the
+    // atom grid. Compiles to single-thread when OpenMP is absent (VC_OPENMP off).
+    const u64 natoms = (u64)r->acz * r->acy * r->acx;
+    const u32 acyx = r->acy * r->acx;
+    volatile vc_status err = VC_OK;
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (u64 ai = 0; ai < natoms; ++ai) {
+        if (err != VC_OK) continue;
+        u32 az = (u32)(ai / acyx), rem = (u32)(ai % acyx);
+        u32 ay = rem / r->acx, ax = rem % r->acx;
+        u8 atom[A3];
         vc_status s = vc_decode_atom(a, lod, (int)ax, (int)ay, (int)az, atom);
-        if (s != VC_OK) return s;
-        // scatter into volume (crop to logical extent)
+        if (s != VC_OK) { err = s; continue; }
         for (u32 z = 0; z < A; ++z) { u32 vz = az*A + z; if (vz >= r->nz) break;
         for (u32 y = 0; y < A; ++y) { u32 vy = ay*A + y; if (vy >= r->ny) break;
         for (u32 x = 0; x < A; ++x) { u32 vx = ax*A + x; if (vx >= r->nx) break;
             out_vol[((size_t)vz*r->ny + vy)*r->nx + vx] = atom[(z*A + y)*A + x];
         }}}
     }
-    { vc_dims vd = { r->nx, r->ny, r->nz }; deblock_volume(out_vol, vd, r->base_q); }
-    return VC_OK;
+    return err;
 }
 
 vc_status vc_decode_region(vc_archive *a, int lod, vc_box box, u8 *out) {
@@ -1017,43 +1199,97 @@ vc_status vc_decode_region(vc_archive *a, int lod, vc_box box, u8 *out) {
             out[((size_t)(vz-box.z0)*oy + (vy-box.y0))*ox + (vx-box.x0)] = atom[(z*A + y)*A + x];
         }}}
     }
-    // Deblock atom-grid faces that fall inside the region (global grid aligned).
-    {
-        u32 oz = box.z1 - box.z0;
-        int tc = (int)(r->base_q * DEBLOCK_STRENGTH); if (tc < 1) tc = 1;
-        size_t SX=1, SY=ox, SZ=(size_t)ox*oy;
-        for (u32 gx = ((box.x0 + A - 1)/A)*A; gx < box.x1; gx += A) {
-            u32 lx = gx - box.x0; if (lx < 4 || lx+4 > ox) continue;
-            for (u32 z=0; z<oz; ++z) for (u32 y=0; y<oy; ++y) {
-                size_t base=(size_t)z*SZ+(size_t)y*SY+lx*SX;
-                int p3=out[base-4*SX],p2=out[base-3*SX],p1=out[base-2*SX],p0=out[base-1*SX];
-                int q0=out[base],q1=out[base+SX],q2=out[base+2*SX],q3=out[base+3*SX];
-                deblock_line(&p3,&p2,&p1,&p0,&q0,&q1,&q2,&q3,tc);
-                out[base-2*SX]=(u8)p1; out[base-SX]=(u8)p0; out[base]=(u8)q0; out[base+SX]=(u8)q1;
-            }
-        }
-        for (u32 gy = ((box.y0 + A - 1)/A)*A; gy < box.y1; gy += A) {
-            u32 ly = gy - box.y0; if (ly < 4 || ly+4 > oy) continue;
-            for (u32 z=0; z<oz; ++z) for (u32 x=0; x<ox; ++x) {
-                size_t base=(size_t)z*SZ+(size_t)ly*SY+x*SX;
-                int p3=out[base-4*SY],p2=out[base-3*SY],p1=out[base-2*SY],p0=out[base-1*SY];
-                int q0=out[base],q1=out[base+SY],q2=out[base+2*SY],q3=out[base+3*SY];
-                deblock_line(&p3,&p2,&p1,&p0,&q0,&q1,&q2,&q3,tc);
-                out[base-2*SY]=(u8)p1; out[base-SY]=(u8)p0; out[base]=(u8)q0; out[base+SY]=(u8)q1;
-            }
-        }
-        for (u32 gz = ((box.z0 + A - 1)/A)*A; gz < box.z1; gz += A) {
-            u32 lz = gz - box.z0; if (lz < 4 || lz+4 > oz) continue;
-            for (u32 y=0; y<oy; ++y) for (u32 x=0; x<ox; ++x) {
-                size_t base=(size_t)lz*SZ+(size_t)y*SY+x*SX;
-                int p3=out[base-4*SZ],p2=out[base-3*SZ],p1=out[base-2*SZ],p0=out[base-1*SZ];
-                int q0=out[base],q1=out[base+SZ],q2=out[base+2*SZ],q3=out[base+3*SZ];
-                deblock_line(&p3,&p2,&p1,&p0,&q0,&q1,&q2,&q3,tc);
-                out[base-2*SZ]=(u8)p1; out[base-SZ]=(u8)p0; out[base]=(u8)q0; out[base+SZ]=(u8)q1;
-            }
-        }
-    }
+    // No deblock (dropped — see vc_decode_lod). Region output is exactly the
+    // per-atom decode scattered into place.
     return VC_OK;
 }
+
+// ---------------------------------------------------------------------------
+// Benchmark-only encode hooks (compiled only with -DVC_BENCH). Reuse the same
+// internal pipeline as vc_encode; the only difference is they expose / accept
+// the per-LOD base_q so the cost of the rate-search bisection can be separated
+// from the cost of the actual single-pass encode.
+// ---------------------------------------------------------------------------
+#ifdef VC_BENCH
+// Optional per-LOD progress hook (bench-only). Called after each LOD member is
+// encoded: (lod, dims, chosen q, member bytes, raw voxels of that LOD).
+void (*vc_bench_lod_cb)(int lod, vc_dims d, float q, u64 member_bytes, u64 raw) = NULL;
+// Cap the number of LODs encoded (bench-only). 0 = all VC_NLOD. Set to 1 to
+// measure native-resolution LOD0 only (LODs are independent, so this is just
+// "encode the one member we score" — no pyramid).
+int vc_bench_max_lods = 0;
+static vc_status vc_bench_encode_impl(const u8 *vol, vc_dims dims,
+                                      float target_ratio, const float *qin,
+                                      u8 **out_archive, size_t *out_len,
+                                      float qout[VC_NLOD], int *nlod_out) {
+    build_tables();
+    bbuf arc = {0};
+    bb_u32(&arc, VC_MAGIC);
+    bb_u32(&arc, VC_VERSION);
+    bb_u32(&arc, VC_ATOM);
+    bb_u32(&arc, CHUNK_ATOMS);
+    member_rec recs[VC_NLOD];
+    int nmembers = 0;
+    u8 *cur = (u8 *)vol; vc_dims cd = dims;
+    u8 *owned = NULL;
+    for (int lod = 0; lod < VC_NLOD; ++lod) {
+        float q = qin ? qin[nmembers] : pick_q_for_ratio(cur, cd, target_ratio);
+        if (qout) qout[nmembers] = q;
+        encode_member(cur, cd, q, &arc, &recs[nmembers]);
+        if (vc_bench_lod_cb)
+            vc_bench_lod_cb(lod, cd, q, recs[nmembers].length,
+                            (u64)cd.nx * cd.ny * cd.nz);
+        nmembers++;
+        if (cd.nx <= 1 && cd.ny <= 1 && cd.nz <= 1) break;
+        if (vc_bench_max_lods && nmembers >= vc_bench_max_lods) break;
+        vc_dims nd; u8 *nv = downsample2x(cur, cd, &nd);
+        if (owned) free(owned);
+        owned = nv; cur = nv; cd = nd;
+    }
+    if (owned) free(owned);
+    u64 dir_off = arc.len;
+    bb_u32(&arc, (u32)nmembers);
+    for (int i = 0; i < nmembers; ++i) {
+        bb_u64(&arc, recs[i].rel_offset);
+        bb_u64(&arc, recs[i].length);
+    }
+    u64 dir_len = arc.len - dir_off;
+    bb_align(&arc, 8);
+    bb_u64(&arc, dir_off);
+    bb_u64(&arc, dir_len);
+    bb_u32(&arc, VC_VERSION);
+    bb_u32(&arc, VC_MAGIC);
+    *out_archive = arc.p; *out_len = arc.len;
+    if (nlod_out) *nlod_out = nmembers;
+    return VC_OK;
+}
+vc_status vc_bench_encode_full(const u8 *vol, vc_dims dims, float target_ratio,
+                               u8 **out_archive, size_t *out_len,
+                               float qout[VC_NLOD], int *nlod_out) {
+    return vc_bench_encode_impl(vol, dims, target_ratio, NULL,
+                                out_archive, out_len, qout, nlod_out);
+}
+vc_status vc_bench_encode_singlepass(const u8 *vol, vc_dims dims,
+                                     const float qin[VC_NLOD], int nlod,
+                                     u8 **out_archive, size_t *out_len) {
+    (void)nlod;
+    return vc_bench_encode_impl(vol, dims, 0.0f, qin,
+                                out_archive, out_len, NULL, NULL);
+}
+// Encode ONE 16^3 atom at base_q `q`; return payload bytes and (optionally)
+// reconstruct it into `recon`. Used to measure per-block-q vs global-q quality
+// at equal bytes, without touching the archive format. Returns the EXACT bytes
+// the real codec would spend on this atom (uniform atoms cost 0 payload bytes).
+void vc_bench_reset_tables(void) { g_tables_ready = 0; build_tables(); }
+u32 vc_bench_atom_rt(const u8 vox[VC_ATOM3], float q, u8 recon[VC_ATOM3]) {
+    build_tables();
+    bbuf pay = {0}; int uni; u8 uval, dcv;
+    u32 len = encode_atom(vox, q, &pay, &uni, &uval, &dcv);
+    if (uni) { if (recon) memset(recon, uval, A3); free(pay.p); return 0; }
+    if (recon) decode_atom_payload(pay.p, pay.len, q, recon);
+    free(pay.p);
+    return len;
+}
+#endif
 
 

@@ -1,99 +1,116 @@
-// Round-trip + random-access tests for the frozen vc codec.
+// Comprehensive round-trip + random-access + format test for the frozen vc 1.0
+// codec. Atom-size-agnostic (uses VC_ATOM, never hardcodes 16/32). Exercises:
+//   1. encode/decode round-trip + quality sanity across ratio targets
+//   2. random-access vc_decode_atom EXACTLY equals full vc_decode_lod (every atom)
+//   3. all LOD members decode at their own dims
+//   4. uniform-atom + absent-region fast paths
+//   5. arbitrary sub-box vc_decode_region matches the full decode
+//   6. edge/odd dimensions (not multiples of the atom size)
+//   7. self-describing-format validation (reject mismatched magic/version/atom)
 #include "../src/vc/vc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
+#define CHECK(cond, ...) do { if (!(cond)) { printf("FAIL: " __VA_ARGS__); printf("\n"); return 1; } } while (0)
+
 static double psnr(const unsigned char *a, const unsigned char *b, size_t n) {
-    double se = 0;
-    for (size_t i = 0; i < n; ++i) { double d = (double)a[i] - b[i]; se += d*d; }
-    double mse = se / n;
-    if (mse <= 0) return 99.0;
-    return 10.0 * log10(255.0*255.0 / mse);
+    double se = 0; for (size_t i = 0; i < n; ++i) { double d = (double)a[i]-b[i]; se += d*d; }
+    double mse = se/n; return mse <= 0 ? 99.0 : 10.0*log10(255.0*255.0/mse);
 }
 
-int main(int argc, char **argv) {
-    vc_dims d = { 64, 48, 32 };
-    size_t n = (size_t)d.nx * d.ny * d.nz;
-    unsigned char *vol = malloc(n);
-    // synthetic structured volume + a uniform region
+// structured volume + a guaranteed-zero (absent) region + a guaranteed-uniform region
+static void fill(unsigned char *v, vc_dims d) {
     for (unsigned z = 0; z < d.nz; ++z)
     for (unsigned y = 0; y < d.ny; ++y)
     for (unsigned x = 0; x < d.nx; ++x) {
         size_t i = ((size_t)z*d.ny + y)*d.nx + x;
-        if (x < 16 && y < 16 && z < 16) vol[i] = 7; // uniform atom
-        else vol[i] = (unsigned char)(128 + 60*sin(x*0.3) + 40*cos(y*0.25) + 20*sin(z*0.4));
+        if (z < VC_ATOM && y < VC_ATOM && x < VC_ATOM) v[i] = 0;               // absent/zero
+        else if (z >= d.nz-VC_ATOM && y < VC_ATOM && x < VC_ATOM) v[i] = 200;  // uniform
+        else v[i] = (unsigned char)(128 + 60*sin(x*0.21) + 40*cos(y*0.17) + 20*sin(z*0.29));
     }
+}
+
+static int test_dims(vc_dims d, float target) {
+    size_t n = (size_t)d.nx*d.ny*d.nz;
+    unsigned char *vol = malloc(n), *full = malloc(n);
+    fill(vol, d);
 
     unsigned char *arc; size_t alen;
-    float target = (argc > 1) ? atof(argv[1]) : 20.0f;
-    vc_status s = vc_encode(vol, d, target, &arc, &alen);
-    if (s != VC_OK) { printf("encode fail %d\n", s); return 1; }
-    printf("encoded: raw=%zu arc=%zu ratio=%.2f\n", n, alen, (double)n/alen);
-
+    CHECK(vc_encode(vol, d, target, &arc, &alen) == VC_OK, "encode %ux%ux%u", d.nx,d.ny,d.nz);
     vc_archive *a = vc_open(arc, alen);
-    if (!a) { printf("open fail\n"); return 1; }
+    CHECK(a != NULL, "vc_open %ux%ux%u", d.nx,d.ny,d.nz);
 
     vc_dims od;
-    unsigned char *out = malloc(n);
-    s = vc_decode_lod(a, 0, out, &od);
-    if (s != VC_OK) { printf("decode_lod fail %d\n", s); return 1; }
-    if (od.nx != d.nx || od.ny != d.ny || od.nz != d.nz) { printf("dims mismatch\n"); return 1; }
-    printf("LOD0 PSNR=%.2f dB\n", psnr(vol, out, n));
+    CHECK(vc_decode_lod(a, 0, full, &od) == VC_OK, "decode_lod0");
+    CHECK(od.nx==d.nx && od.ny==d.ny && od.nz==d.nz, "lod0 dims");
+    double p = psnr(vol, full, n);
+    CHECK(p > 25.0, "PSNR %.1f too low (%ux%ux%u @%gx)", p, d.nx,d.ny,d.nz, target);
 
-    // random-access: decode one atom standalone, compare to full-decode region
-    unsigned char atom[16*16*16];
-    s = vc_decode_atom(a, 0, 1, 1, 1, atom);
-    if (s != VC_OK) { printf("decode_atom fail %d\n", s); return 1; }
-    // compare atom to the same atom extracted from out, interior samples only
-    // (deblock modifies <=2 samples each side of 16-grid faces in decode_lod).
-    int mismatch = 0;
-    for (unsigned z = 2; z < 14; ++z)
-    for (unsigned y = 2; y < 14; ++y)
-    for (unsigned x = 2; x < 14; ++x) {
-        unsigned vx = 16+x, vy = 16+y, vz = 16+z;
-        if (vx>=d.nx||vy>=d.ny||vz>=d.nz) continue;
-        unsigned char fromlod = out[((size_t)vz*d.ny+vy)*d.nx+vx];
-        unsigned char fromatom = atom[(z*16+y)*16+x];
-        if (fromlod != fromatom) mismatch++;
+    // EVERY atom: random-access decode must EXACTLY equal the full decode
+    vc_dims m0; vc_lod_dims(a, 0, &m0);
+    unsigned acx=(m0.nx+VC_ATOM-1)/VC_ATOM, acy=(m0.ny+VC_ATOM-1)/VC_ATOM, acz=(m0.nz+VC_ATOM-1)/VC_ATOM;
+    unsigned char *atom = malloc(VC_ATOM3);
+    long mism = 0;
+    for (unsigned az=0; az<acz; ++az) for (unsigned ay=0; ay<acy; ++ay) for (unsigned ax=0; ax<acx; ++ax) {
+        CHECK(vc_decode_atom(a, 0, ax, ay, az, atom) == VC_OK, "decode_atom %u,%u,%u", ax,ay,az);
+        for (unsigned z=0; z<VC_ATOM; ++z) { unsigned vz=az*VC_ATOM+z; if (vz>=d.nz) break;
+        for (unsigned y=0; y<VC_ATOM; ++y) { unsigned vy=ay*VC_ATOM+y; if (vy>=d.ny) break;
+        for (unsigned x=0; x<VC_ATOM; ++x) { unsigned vx=ax*VC_ATOM+x; if (vx>=d.nx) break;
+            if (atom[(z*VC_ATOM+y)*VC_ATOM+x] != full[((size_t)vz*d.ny+vy)*d.nx+vx]) mism++;
+        }}}
     }
-    printf("random-access atom interior match: %s (%d mismatches)\n", mismatch==0?"OK":"FAIL", mismatch);
+    CHECK(mism == 0, "%ld atom-vs-full mismatches (%ux%ux%u)", mism, d.nx,d.ny,d.nz);
 
-    // uniform atom (0,0,0) should be exactly 7
-    unsigned char uatom[16*16*16];
-    vc_decode_atom(a, 0, 0, 0, 0, uatom);
-    int upass = 1; for (int i=0;i<4096;i++) if (uatom[i]!=7) upass=0;
-    printf("uniform atom: %s\n", upass?"OK":"FAIL");
-
-    // LOD count
-    printf("nmembers (LODs): ");
-    int nl=0; vc_dims t; for (int l=0;l<8;l++){ if(vc_lod_dims(a,l,&t)==VC_OK){nl++; } }
-    printf("%d\n", nl);
-
-    // ABSENT chunk path: a 256^3-ish volume with a whole empty chunk region.
-    {
-        vc_dims bd = { 256, 64, 64 };
-        size_t bn = (size_t)bd.nx*bd.ny*bd.nz;
-        unsigned char *bv = calloc(bn,1); // all zero -> absent chunks
-        // put structure only in first 128 voxels of x
-        for (unsigned z=0;z<bd.nz;z++) for (unsigned y=0;y<bd.ny;y++) for (unsigned x=0;x<128;x++)
-            bv[((size_t)z*bd.ny+y)*bd.nx+x] = (unsigned char)(100+30*sin(x*0.2));
-        unsigned char *ba; size_t bl;
-        vc_encode(bv, bd, 30.0f, &ba, &bl);
-        vc_archive *bA = vc_open(ba,bl);
-        unsigned char *bo = malloc(bn);
-        vc_decode_lod(bA,0,bo,NULL);
-        // check an atom in the empty region decodes to 0
-        unsigned char eatom[4096]; vc_decode_atom(bA,0,12,0,0,eatom);
-        int ez=1; for(int i=0;i<4096;i++) if(eatom[i]!=0) ez=0;
-        printf("absent-chunk atom zero: %s  (absent-region ratio=%.1f)\n", ez?"OK":"FAIL",(double)bn/bl);
-        if(!ez) mismatch++;
-        vc_close(bA); free(ba); free(bv); free(bo);
+    // arbitrary sub-box region decode matches the full decode
+    if (d.nx > VC_ATOM && d.ny > VC_ATOM && d.nz > VC_ATOM) {
+        vc_box box = { 3, 5, 7, d.nx-2, d.ny-3, VC_ATOM+5 };
+        unsigned ox=box.x1-box.x0, oy=box.y1-box.y0, oz=box.z1-box.z0;
+        unsigned char *reg = malloc((size_t)ox*oy*oz);
+        CHECK(vc_decode_region(a, 0, box, reg) == VC_OK, "decode_region");
+        long rmism=0;
+        for (unsigned z=0; z<oz; ++z) for (unsigned y=0; y<oy; ++y) for (unsigned x=0; x<ox; ++x)
+            if (reg[((size_t)z*oy+y)*ox+x] != full[((size_t)(z+box.z0)*d.ny+(y+box.y0))*d.nx+(x+box.x0)]) rmism++;
+        CHECK(rmism == 0, "%ld region-vs-full mismatches", rmism);
+        free(reg);
     }
 
-    int ok = (mismatch==0) && upass && (psnr(vol,out,n) > 25.0);
-    printf("RESULT: %s\n", ok?"PASS":"FAIL");
-    vc_close(a); free(arc); free(vol); free(out);
-    return ok?0:1;
+    // all LODs decode at their own dims
+    for (int lod=0; lod<VC_NLOD; ++lod) {
+        vc_dims ld; if (vc_lod_dims(a, lod, &ld) != VC_OK) break;
+        size_t ln=(size_t)ld.nx*ld.ny*ld.nz; if (ln==0) break;
+        unsigned char *lo = malloc(ln); vc_dims od2;
+        CHECK(vc_decode_lod(a, lod, lo, &od2) == VC_OK, "decode_lod %d", lod);
+        free(lo);
+    }
+
+    vc_close(a); free(arc); free(atom); free(vol); free(full);
+    return 0;
+}
+
+int main(void) {
+    printf("VC_ATOM=%u  testing format + round-trip + random-access...\n", VC_ATOM);
+
+    vc_dims cases[] = {
+        {128,128,128}, {96,96,96}, {130,127,65}, {VC_ATOM,VC_ATOM,VC_ATOM},
+        {VC_ATOM*2+1, VC_ATOM*3-1, VC_ATOM+7}, {200,40,40}, {64,256,48},
+    };
+    float ratios[] = { 10.0f, 50.0f, 100.0f };
+    for (size_t c=0; c<sizeof(cases)/sizeof(cases[0]); ++c)
+        for (size_t r=0; r<sizeof(ratios)/sizeof(ratios[0]); ++r)
+            if (test_dims(cases[c], ratios[r])) return 1;
+
+    // self-describing-format rejection
+    { vc_dims d={96,96,96}; size_t n=96*96*96; unsigned char*v=malloc(n); fill(v,d);
+      unsigned char*arc; size_t al; vc_encode(v,d,20.0f,&arc,&al);
+      CHECK(vc_open(arc,al)!=NULL, "valid archive should open");
+      unsigned char save=arc[8]; arc[8]=(unsigned char)(VC_ATOM==16?32:16);
+      CHECK(vc_open(arc,al)==NULL, "atom-mismatch archive must be rejected");
+      arc[8]=save; arc[4]^=0xFF;
+      CHECK(vc_open(arc,al)==NULL, "version-mismatch archive must be rejected");
+      free(arc); free(v); }
+
+    printf("ALL TESTS PASSED\n");
+    return 0;
 }

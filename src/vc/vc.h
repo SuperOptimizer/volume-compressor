@@ -26,8 +26,8 @@ typedef struct {
     uint32_t x1, y1, z1; // exclusive upper corner
 } vc_box;
 
-#define VC_ATOM   16u            // atom edge (voxels)
-#define VC_ATOM3  (16u*16u*16u)  // 4096
+#define VC_ATOM   32u            // atom edge (voxels)
+#define VC_ATOM3  (32u*32u*32u)  // 32768
 #define VC_NLOD   8              // fixed LOD count
 
 typedef struct vc_archive vc_archive;
