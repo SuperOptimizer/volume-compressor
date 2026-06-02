@@ -62,3 +62,10 @@ dkms.conf
 /build_*/
 harness/refbuild/
 data
+
+# build artifacts
+/bench_1024
+/bench_real
+/bench_c4d_1024
+/score
+/crash-*

@@ -171,10 +171,8 @@ Rules:
 - Member = one LOD volume (0..7), each fully independent with its own chunk grid +
   index. The footer enumerates the 8 members; reader does a tail read -> footer ->
   directory -> member index -> range-GET the atoms it wants.
-- Alignment: do NOT 64-byte-align atom payloads — MEASURED to cap ratio near 64x at
-  high compression and help byte-serial entropy decode nothing. Pack payloads TIGHT
-  with implicit cumulative offsets (8 B/dir entry); this recovered +3..+11 dB at
-  50-100x and let 100x actually reach ~87x. (Footer/index may still align for mmap.)
+- Alignment: align atom payloads to 64 bytes (SIMD/cache), footer + chunk
+  directories to a friendly boundary (e.g. 4 KiB) for mmap. (Lock once, document.)
 - Footer metadata: a small versioned, tag/length-delimited block (skippable
   unknown fields) — NOT a fixed C-struct — so the format can evolve. One magic at
   each end + a trailing footer-length so the footer is found in one tail read.
