@@ -546,6 +546,7 @@ typedef struct {
     u32 acx, acy, acz;       // atom counts per axis (ceil(dim/16))
     u32 ccx, ccy, ccz;       // chunk counts per axis
     float base_q;            // step-1 single q for whole member (per-chunk later)
+    u64  pay_base;           // member-relative offset of payload region
     u64  rel_offset;         // member payload offset within archive
     u64  length;             // member length
 } member_rec;
@@ -639,15 +640,13 @@ static void encode_member(const u8 *vol, vc_dims d, float base_q, bbuf *arc,
         for (u32 lx = 0; lx < axn; ++lx, ++ai) {
             gather_atom(vol, d, ax0+lx, ay0+ly, az0+lz, 0, atom);
             int uni = 0; u8 uval = 0, dcv = 0;
-            // align each atom payload to 64B within pay
-            bb_align(&pay, 64);
-            u64 off = pay.len;
+            // Atom payloads are packed tightly (entropy decode is byte-serial;
+            // 64B per-atom padding would cap ratio near 64x and buys nothing).
             u32 len = encode_atom(atom, base_q, &pay, &uni, &uval, &dcv);
             atom_dir *e = &dir[ai];
             e->flags = uni ? AF_UNIFORM : 0;
             e->uval = uval; e->dc = dcv;
-            e->length = len;
-            e->offset = uni ? 0 : off; // pay-relative; patched to member-relative below
+            e->length = len; // offset is implicit (cumulative length within member)
         }
         // ABSENT-chunk detection (plan §4): entire chunk uniform with fill (0).
         int all_absent = 1;
@@ -662,14 +661,17 @@ static void encode_member(const u8 *vol, vc_dims d, float base_q, bbuf *arc,
     bb_u32(&hdr, acx); bb_u32(&hdr, acy); bb_u32(&hdr, acz);
     bb_u32(&hdr, ccx); bb_u32(&hdr, ccy); bb_u32(&hdr, ccz);
     bb_put(&hdr, &base_q, 4);
+    u64 pay_base_slot = hdr.len; // patched after we know header size
+    bb_u64(&hdr, 0);             // [u64 pay_base] member-relative payload start
     // chunk directories. Sentinel n_atoms = 0xFFFFFFFF marks an ABSENT chunk
     // (entirely fill/zero) with NO atom entries and zero payload (plan §4).
+    // Each atom entry is 8 bytes: [u32 len][u8 flags][u8 uval][u8 dc][u8 pad].
+    // Atom byte offsets are IMPLICIT (cumulative payload length within member).
     for (u32 ci = 0; ci < nchunks; ++ci) {
         if (chunk_absent[ci]) { bb_u32(&hdr, 0xFFFFFFFFu); continue; }
         bb_u32(&hdr, chunk_natoms[ci]);
         for (u32 ai = 0; ai < chunk_natoms[ci]; ++ai) {
             atom_dir *e = &dirs[ci][ai];
-            bb_u64(&hdr, e->offset); // pay-relative; fix to member-relative below
             bb_u32(&hdr, e->length);
             bb_u8(&hdr, e->flags);
             bb_u8(&hdr, e->uval);
@@ -677,27 +679,9 @@ static void encode_member(const u8 *vol, vc_dims d, float base_q, bbuf *arc,
             bb_u8(&hdr, 0);
         }
     }
-    // payloads start right after header, 64B aligned within member
+    // Chunk directories / payload region aligned to 64B for mmap-friendliness.
     bb_align(&hdr, 64);
-    u64 pay_base = hdr.len; // member-relative offset of payload region
-
-    // Patch atom offsets in hdr to member-relative = pay_base + pay_relative.
-    // Re-walk hdr to find each u64 offset slot. Easier: rebuild offsets array.
-    // We stored pay-relative offsets; add pay_base. Walk dir entries in same order.
-    {
-        size_t pos = 0;
-        pos += 9*4 + 4; // 9 u32 + f32 base_q
-        for (u32 ci = 0; ci < nchunks; ++ci) {
-            pos += 4; // n_atoms u32 (or sentinel)
-            if (chunk_absent[ci]) continue;
-            for (u32 ai = 0; ai < chunk_natoms[ci]; ++ai) {
-                atom_dir *e = &dirs[ci][ai];
-                u64 newoff = (e->flags & AF_UNIFORM) ? 0 : (pay_base + e->offset);
-                memcpy(hdr.p + pos, &newoff, 8);
-                pos += 8 + 4 + 4; // u64 + u32 + 4 bytes flags/uval/dc/pad
-            }
-        }
-    }
+    { u64 pb = hdr.len; memcpy(hdr.p + pay_base_slot, &pb, 8); }
 
     // Append hdr then payloads to archive
     bb_put(arc, hdr.p, hdr.len);
@@ -727,10 +711,10 @@ static float pick_q_for_ratio(const u8 *vol, vc_dims d, float target_ratio) {
     u64 raw = (u64)d.nx * d.ny * d.nz;
     if (raw == 0) return 1.0f;
     u64 target_bytes = (u64)((double)raw / target_ratio);
-    float lo = 0.25f, hi = 256.0f;
+    float lo = 0.10f, hi = 4096.0f;
     // bisection on log(q): bigger q -> smaller size (monotone).
     float best = 8.0f; u64 best_sz = measure_member_size(vol, d, best);
-    for (int it = 0; it < 12; ++it) {
+    for (int it = 0; it < 16; ++it) {
         float mid = sqrtf(lo * hi);
         u64 sz = measure_member_size(vol, d, mid);
         if (sz > target_bytes) lo = mid; else hi = mid;
@@ -811,6 +795,7 @@ static void parse_member_header(const u8 *m, member_rec *r) {
     r->acx = rd_u32(m+12); r->acy = rd_u32(m+16); r->acz = rd_u32(m+20);
     r->ccx = rd_u32(m+24); r->ccy = rd_u32(m+28); r->ccz = rd_u32(m+32);
     memcpy(&r->base_q, m+36, 4);
+    r->pay_base = rd_u64(m+40);
 }
 
 vc_archive *vc_open(const u8 *archive, size_t len) {
@@ -852,7 +837,7 @@ vc_status vc_lod_dims(const vc_archive *a, int lod, vc_dims *out) {
 // the 16-byte dir record within the member, plus parsed fields.
 static const u8 *member_dir_base(const u8 *m, const member_rec *r) {
     (void)r;
-    return m + 9*4 + 4; // after 9 u32 + f32
+    return m + 9*4 + 4 + 8; // after 9 u32 + f32 base_q + u64 pay_base
 }
 // Size of one chunk's dir block: 4 (n_atoms) + n_atoms*16.
 static vc_status find_atom_entry(const u8 *m, const member_rec *r,
@@ -861,13 +846,16 @@ static vc_status find_atom_entry(const u8 *m, const member_rec *r,
     if (ax >= r->acx || ay >= r->acy || az >= r->acz) return VC_ERR_RANGE;
     u32 cx = ax / CHUNK_ATOMS, cy = ay / CHUNK_ATOMS, cz = az / CHUNK_ATOMS;
     u32 lx = ax % CHUNK_ATOMS, ly = ay % CHUNK_ATOMS, lz = az % CHUNK_ATOMS;
-    // walk chunks in raster order up to (cz,cy,cx) summing dir block sizes
+    // Walk chunks in raster order up to target, accumulating implicit payload
+    // offset (sum of all atom lengths in earlier chunks). Each entry is 8 bytes.
     const u8 *p = member_dir_base(m, r);
     u32 target = (cz*r->ccy + cy)*r->ccx + cx;
+    u64 cum = 0; // cumulative payload bytes before target chunk
     for (u32 ci = 0; ci < target; ++ci) {
         u32 na = rd_u32(p); p += 4;
-        if (na == 0xFFFFFFFFu) continue; // ABSENT chunk: no entries
-        p += (u64)na * 16;
+        if (na == 0xFFFFFFFFu) continue; // ABSENT chunk: no entries, no payload
+        for (u32 k = 0; k < na; ++k) cum += rd_u32(p + (u64)k*8);
+        p += (u64)na * 8;
     }
     u32 na = rd_u32(p); p += 4;
     if (na == 0xFFFFFFFFu) { // target chunk ABSENT
@@ -880,10 +868,12 @@ static vc_status find_atom_entry(const u8 *m, const member_rec *r,
     u32 ayn = r->acy - ay0; if (ayn > CHUNK_ATOMS) ayn = CHUNK_ATOMS;
     u32 ai = (lz*ayn + ly)*axn + lx;
     if (ai >= na) return VC_ERR_RANGE;
-    const u8 *e = p + (u64)ai * 16;
-    *off = rd_u64(e);
-    *len = rd_u32(e + 8);
-    *flags = e[12]; *uval = e[13]; *dc = e[14];
+    // accumulate lengths of atoms before ai within this chunk
+    for (u32 k = 0; k < ai; ++k) cum += rd_u32(p + (u64)k*8);
+    const u8 *e = p + (u64)ai * 8;
+    *len = rd_u32(e);
+    *flags = e[4]; *uval = e[5]; *dc = e[6];
+    *off = (*flags & (AF_UNIFORM|AF_ABSENT)) ? ABSENT : (r->pay_base + cum);
     return VC_OK;
 }
 
