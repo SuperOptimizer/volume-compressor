@@ -92,6 +92,41 @@ static void variable_q_perchunk(const u8 *vol,u32 d,u32 h,u32 w,
     free(rec); free(cbuf);
 }
 
+// FAST-ENCODE tier bake-off: probe vs Laplacian vs closed-form vs feedback, all
+// per-16^3, measured on the SAME footing — allocation wall-time (the win) AND an
+// honest q-field PSNR+ratio through the real codec (eval_qfield_realcodec).
+static void run_fast_tier(const u8 *vol,u32 d,u32 h,u32 w){
+    const double targets[]={16.0,32.0,64.0,128.0}; // q-knobs map ~ ratio targets
+    const char *mnames[]={"probe","laplacian","closed-form","feedback"};
+    const vc_rc_model models[]={VC_RC_MODEL_PROBE,VC_RC_MODEL_LAPLACIAN,
+                                VC_RC_MODEL_CLOSEDFORM,VC_RC_MODEL_FEEDBACK};
+    printf("\n=== FAST-ENCODE TIER (per-16^3): probe vs laplacian vs closed-form vs feedback ===\n");
+    printf("pred_ratio = allocator's predicted ratio (shared-table model, faithful).\n");
+    printf("qfPSNR = honest whole-volume PSNR of the chosen q-field through the codec's\n");
+    printf("         exact DCT+deadzone (vc_rc_qfield_truemse) — pure allocation quality.\n");
+    printf("target | model       | alloc_ms | pred_ratio | ratio_err | qfPSNR_dB | dB_vs_probe | speedup\n");
+    printf("-------+-------------+----------+------------+-----------+-----------+-------------+--------\n");
+    for(int ti=0;ti<4;++ti){
+        double probe_ms=0, probe_psnr=0;
+        for(int mi=0;mi<4;++mi){
+            vc_rc_config cfg={ .gran=VC_RC_PER_BLOCK,.dist=VC_RC_DIST_PARSEVAL,
+                .model=models[mi],.target_ratio=targets[ti],.step_window=0.0 };
+            u32 nu=vc_rc_count_units(d,h,w,VC_RC_PER_BLOCK);
+            vc_rc_unit *u=malloc((size_t)nu*sizeof(vc_rc_unit)); vc_rc_result res;
+            double t0=now_sec(); vc_rc_allocate(vol,d,h,w,&cfg,u,&res); double t1=now_sec();
+            double ams=(t1-t0)*1e3;
+            double m=vc_rc_qfield_truemse(vol,d,h,w,u);
+            double qp=psnr_of(m);
+            double rerr=100.0*(res.achieved_ratio-targets[ti])/targets[ti];
+            if(mi==0){ probe_ms=ams; probe_psnr=qp; }
+            printf("%5.0fx | %-11s | %8.1f | %9.2fx | %+7.1f%%  | %8.2f  | %+10.2f  | %6.2fx\n",
+                   targets[ti],mnames[mi],ams,res.achieved_ratio,rerr,qp,
+                   qp-probe_psnr, probe_ms/(ams+1e-9));
+            free(u);
+        }
+    }
+}
+
 static void run(const char *label, const u8 *vol, u32 d, u32 h, u32 w){
     size_t raw=(size_t)d*h*w;
     printf("\n#### %s  (%ux%ux%u, %.1f MB, chunk=%u)\n", label,d,h,w,raw/1e6,vc_chunk_side());
@@ -185,6 +220,8 @@ static void run(const char *label, const u8 *vol, u32 d, u32 h, u32 w){
                tgt, vr, vp, fr, fp, vp-fp);
         free(u);
     }
+
+    run_fast_tier(vol,d,h,w);
 }
 
 int main(int argc, char **argv){

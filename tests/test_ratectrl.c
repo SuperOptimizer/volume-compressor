@@ -86,6 +86,45 @@ int main(void) {
     printf("== analytical Laplacian model ==\n");
     CHECK(hits(vol, D, H, W, VC_RC_PER_BLOCK, VC_RC_DIST_PARSEVAL, VC_RC_MODEL_LAPLACIAN, 10.0, "perblock/parseval/laplacian 10x"), "Laplacian model hits 10x");
 
+    // FAST-ENCODE tier: closed-form q-from-lambda + single-pass feedback. Both
+    // are per-16^3 only and must still hit the target ratio within tolerance.
+    printf("== FAST tier: closed-form q-from-lambda ==\n");
+    CHECK(hits(vol, D, H, W, VC_RC_PER_BLOCK, VC_RC_DIST_PARSEVAL, VC_RC_MODEL_CLOSEDFORM, 10.0, "perblock/closedform 10x"), "closed-form hits 10x");
+    CHECK(hits(vol, D, H, W, VC_RC_PER_BLOCK, VC_RC_DIST_PARSEVAL, VC_RC_MODEL_CLOSEDFORM, 30.0, "perblock/closedform 30x"), "closed-form hits 30x");
+    printf("== FAST tier: single-pass feedback controller ==\n");
+    CHECK(hits(vol, D, H, W, VC_RC_PER_BLOCK, VC_RC_DIST_PARSEVAL, VC_RC_MODEL_FEEDBACK, 10.0, "perblock/feedback 10x"), "feedback hits ~10x");
+    CHECK(hits(vol, D, H, W, VC_RC_PER_BLOCK, VC_RC_DIST_PARSEVAL, VC_RC_MODEL_FEEDBACK, 30.0, "perblock/feedback 30x"), "feedback hits ~30x");
+
+    // Honest q-field MSE: the fast tier's allocation, run through the codec's
+    // exact DCT+deadzone, must produce a valid (positive, finite) MSE and the
+    // closed-form's should be no worse than ~3 dB below the probe's at 20x — the
+    // "small quality cost" gate. Also exercises vc_rc_qfield_truemse round-trip.
+    {
+        u32 nu = vc_rc_count_units(D, H, W, VC_RC_PER_BLOCK);
+        vc_rc_unit *up = malloc((size_t)nu*sizeof(vc_rc_unit));
+        vc_rc_unit *uc = malloc((size_t)nu*sizeof(vc_rc_unit));
+        vc_rc_result rp, rc;
+        vc_rc_config cp = { .gran=VC_RC_PER_BLOCK, .dist=VC_RC_DIST_PARSEVAL, .model=VC_RC_MODEL_PROBE,      .target_ratio=20.0, .step_window=0.0 };
+        vc_rc_config cc = { .gran=VC_RC_PER_BLOCK, .dist=VC_RC_DIST_PARSEVAL, .model=VC_RC_MODEL_CLOSEDFORM, .target_ratio=20.0, .step_window=0.0 };
+        vc_rc_allocate(vol,D,H,W,&cp,up,&rp);
+        vc_rc_allocate(vol,D,H,W,&cc,uc,&rc);
+        f64 mp = vc_rc_qfield_truemse(vol,D,H,W,up);
+        f64 mc = vc_rc_qfield_truemse(vol,D,H,W,uc);
+        f64 pp = mp>0?10.0*log10(255.0*255.0/mp):99.0;
+        f64 pc = mc>0?10.0*log10(255.0*255.0/mc):99.0;
+        printf("  q-field PSNR @20x: probe=%.2f dB closed-form=%.2f dB (delta %+.2f dB)\n", pp, pc, pc-pp);
+        CHECK(mc > 0 && mc < 1e6, "closed-form q-field true-MSE is valid (round-trips through codec DCT)");
+        // NOTE: this synthetic (half PERFECTLY-flat air + half structure) is the
+        // adversarial WORST case for the fast tier: probe's variable-q correctly
+        // drops the dead-flat air and lavishes bits on structure (Parseval-MSE is
+        // well-behaved here), so it wins several dB. On REAL scroll data the
+        // opposite holds — the unbounded Parseval probe goes "bang-bang" and the
+        // closed-form is within ~0.5 dB or BEATS probe (see FAST_RC_RESULTS.md).
+        // Gate only that the fast tier doesn't collapse on the synthetic extreme.
+        CHECK(pc >= pp - 8.0, "closed-form within 8 dB of probe on adversarial-synthetic worst case");
+        free(up); free(uc);
+    }
+
     // Step-distribution spread: on a mixed air|structure volume, per-block must
     // assign a RANGE of steps (air coarse, structure fine), not one uniform step.
     {

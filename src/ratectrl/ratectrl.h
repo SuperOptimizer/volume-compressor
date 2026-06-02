@@ -55,6 +55,14 @@ typedef enum {
 typedef enum {
     VC_RC_MODEL_PROBE     = 0,  // multi-q probe through the real entropy coder
     VC_RC_MODEL_LAPLACIAN = 1,  // analytical Laplacian R-D from coef variance
+    // --- FAST-ENCODE tier (no per-step grid, no hull, no per-point probing) ---
+    VC_RC_MODEL_CLOSEDFORM = 2, // closed-form q-from-lambda per atom: one fwd DCT
+                                // per block, derive step = base*f(variance) from a
+                                // single global lambda via step ~= 2.94*sqrt(lambda),
+                                // bisect lambda on the closed-form rate sum only.
+    VC_RC_MODEL_FEEDBACK   = 3, // single-pass raster feedback controller: one fwd
+                                // DCT per block, adjust step on the fly toward a
+                                // running bytes-per-block budget (proportional).
 } vc_rc_model;
 
 typedef struct {
@@ -103,5 +111,14 @@ int vc_rc_allocate(const u8 *vol, u32 dz, u32 dy, u32 dx,
 
 // Number of allocation units for a volume at the given granularity.
 u32 vc_rc_count_units(u32 dz, u32 dy, u32 dx, vc_rc_gran gran);
+
+// Honest whole-volume MSE of a PER-BLOCK q-field: for each 16^3 block, run the
+// codec's exact transform + dead-zone quant/dequant + inverse at that block's
+// `units[ui].step` and accumulate spatial error. This isolates the ALLOCATION
+// quality (which step each block got) from per-block-archive entropy overhead, so
+// it is the fair quality metric to compare rate-control models at a matched
+// predicted ratio. Block walk matches vc_rc_count_units(PER_BLOCK). Returns MSE.
+f64 vc_rc_qfield_truemse(const u8 *vol, u32 dz, u32 dy, u32 dx,
+                         const vc_rc_unit *units);
 
 #endif // VC_RATECTRL_H
