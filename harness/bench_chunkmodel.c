@@ -158,6 +158,7 @@ int main(int argc,char**argv){
           {"E2 Hil N64  base rans",      CG(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,64, VC_BOUND_FIXED,0,VC_TABLE_BASE,0,0)},
           {"E2 Hil N256 base rans",      CG(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,256,VC_BOUND_FIXED,0,VC_TABLE_BASE,0,0)},
           // ===== I1: drift-adaptive boundaries (cap=group_n) =====
+          {"I1 Hil drift.03 rans",       CG(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,512,VC_BOUND_DRIFT,0.03f,VC_TABLE_FULL,0,0)},
           {"I1 Hil drift.10 rans",       CG(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,512,VC_BOUND_DRIFT,0.10f,VC_TABLE_FULL,0,0)},
           {"I1 Hil drift.15 rans",       CG(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,512,VC_BOUND_DRIFT,0.15f,VC_TABLE_FULL,0,0)},
           {"I1 Hil drift.20 rans",       CG(VC_TRAV_HILBERT,VC_ENT_RANS_SHARED,512,VC_BOUND_DRIFT,0.20f,VC_TABLE_FULL,0,0)},
