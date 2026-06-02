@@ -888,6 +888,89 @@ vc_status vc_decode_atom(vc_archive *a, int lod, int ax, int ay, int az,
     return VC_OK;
 }
 
+// ---------------------------------------------------------------------------
+// Deblock decode post-filter (plan.txt §3). Adaptive filter across atom-grid
+// faces (every 16 voxels). Boundary strength keyed on quant step + local
+// gradient; filter only flat regions where a step is likely a quant artifact;
+// clip per-sample delta so real edges/ink survive; modify <=3 samples/side.
+// Decode-side only, no bitstream change. Applied to an assembled volume buffer.
+// ---------------------------------------------------------------------------
+#define DEBLOCK_STRENGTH 0.4f
+
+// Filter one boundary line of 8 samples (4 each side: p3 p2 p1 p0 | q0 q1 q2 q3)
+// in-place. `tc` is the delta clip (derived from quant step). Modifies <=3/side.
+static inline void deblock_line(int *p3, int *p2, int *p1, int *p0,
+                                int *q0, int *q1, int *q2, int *q3, int tc) {
+    int P3=*p3,P2=*p2,P1=*p1,P0=*p0,Q0=*q0,Q1=*q1,Q2=*q2,Q3=*q3;
+    // flatness: only filter if both sides are locally smooth
+    int dp = abs(P2 - 2*P1 + P0);
+    int dq = abs(Q2 - 2*Q1 + Q0);
+    int d  = dp + dq;
+    int step = abs(P0 - Q0);
+    if (step == 0) return;
+    // don't touch real edges: if the jump dwarfs local variation it's an edge
+    if (step > 2*tc + (d>>1)) return;
+    if (d >= tc) return; // not flat enough -> likely real structure
+    // weak filter: adjust p0,q0 (and p1,q1 if very flat)
+    int delta = (9*(Q0 - P0) - 3*(Q1 - P1) + 8) >> 4;
+    if (delta > tc) delta = tc; else if (delta < -tc) delta = -tc;
+    int np0 = P0 + delta; if (np0<0)np0=0; else if(np0>255)np0=255;
+    int nq0 = Q0 - delta; if (nq0<0)nq0=0; else if(nq0>255)nq0=255;
+    *p0 = np0; *q0 = nq0;
+    if (d < (tc>>1)) {
+        int dp1 = ((P2 + P0 + 1) >> 1) - P1 + delta;
+        int dq1 = ((Q2 + Q0 + 1) >> 1) - Q1 - delta;
+        int tc1 = tc >> 1;
+        if (dp1 > tc1) dp1 = tc1; else if (dp1 < -tc1) dp1 = -tc1;
+        if (dq1 > tc1) dq1 = tc1; else if (dq1 < -tc1) dq1 = -tc1;
+        int np1 = P1 + dp1; if(np1<0)np1=0; else if(np1>255)np1=255;
+        int nq1 = Q1 + dq1; if(nq1<0)nq1=0; else if(nq1>255)nq1=255;
+        *p1 = np1; *q1 = nq1;
+    }
+    (void)P3; (void)Q3; (void)p2; (void)q2; (void)p3; (void)q3;
+}
+
+// Deblock a volume across all atom-grid planes for one base_q.
+static void deblock_volume(u8 *v, vc_dims d, float base_q) {
+    // clip threshold derived from the (DC) quant step, scaled by strength.
+    int tc = (int)(base_q * DEBLOCK_STRENGTH);
+    if (tc < 1) tc = 1;
+    size_t SX = 1, SY = d.nx, SZ = (size_t)d.nx * d.ny;
+    // X-normal faces (boundary planes at x = 16,32,...)
+    for (u32 bx = A; bx < d.nx; bx += A)
+    for (u32 z = 0; z < d.nz; ++z)
+    for (u32 y = 0; y < d.ny; ++y) {
+        size_t base = (size_t)z*SZ + (size_t)y*SY + bx*SX;
+        if (bx < 4 || bx+4 > d.nx) continue;
+        int p3=v[base-4*SX],p2=v[base-3*SX],p1=v[base-2*SX],p0=v[base-1*SX];
+        int q0=v[base],q1=v[base+1*SX],q2=v[base+2*SX],q3=v[base+3*SX];
+        deblock_line(&p3,&p2,&p1,&p0,&q0,&q1,&q2,&q3,tc);
+        v[base-2*SX]=(u8)p1; v[base-1*SX]=(u8)p0; v[base]=(u8)q0; v[base+1*SX]=(u8)q1;
+    }
+    // Y-normal faces
+    for (u32 by = A; by < d.ny; by += A)
+    for (u32 z = 0; z < d.nz; ++z)
+    for (u32 x = 0; x < d.nx; ++x) {
+        if (by < 4 || by+4 > d.ny) continue;
+        size_t base = (size_t)z*SZ + (size_t)by*SY + x*SX;
+        int p3=v[base-4*SY],p2=v[base-3*SY],p1=v[base-2*SY],p0=v[base-1*SY];
+        int q0=v[base],q1=v[base+1*SY],q2=v[base+2*SY],q3=v[base+3*SY];
+        deblock_line(&p3,&p2,&p1,&p0,&q0,&q1,&q2,&q3,tc);
+        v[base-2*SY]=(u8)p1; v[base-1*SY]=(u8)p0; v[base]=(u8)q0; v[base+1*SY]=(u8)q1;
+    }
+    // Z-normal faces
+    for (u32 bz = A; bz < d.nz; bz += A)
+    for (u32 y = 0; y < d.ny; ++y)
+    for (u32 x = 0; x < d.nx; ++x) {
+        if (bz < 4 || bz+4 > d.nz) continue;
+        size_t base = (size_t)bz*SZ + (size_t)y*SY + x*SX;
+        int p3=v[base-4*SZ],p2=v[base-3*SZ],p1=v[base-2*SZ],p0=v[base-1*SZ];
+        int q0=v[base],q1=v[base+1*SZ],q2=v[base+2*SZ],q3=v[base+3*SZ];
+        deblock_line(&p3,&p2,&p1,&p0,&q0,&q1,&q2,&q3,tc);
+        v[base-2*SZ]=(u8)p1; v[base-1*SZ]=(u8)p0; v[base]=(u8)q0; v[base+1*SZ]=(u8)q1;
+    }
+}
+
 vc_status vc_decode_lod(vc_archive *a, int lod, u8 *out_vol, vc_dims *out_dims) {
     if (!a || lod < 0 || (u32)lod >= a->nmembers || !out_vol) return VC_ERR_RANGE;
     const member_rec *r = &a->recs[lod];
@@ -905,6 +988,7 @@ vc_status vc_decode_lod(vc_archive *a, int lod, u8 *out_vol, vc_dims *out_dims) 
             out_vol[((size_t)vz*r->ny + vy)*r->nx + vx] = atom[(z*A + y)*A + x];
         }}}
     }
+    { vc_dims vd = { r->nx, r->ny, r->nz }; deblock_volume(out_vol, vd, r->base_q); }
     return VC_OK;
 }
 
@@ -928,6 +1012,42 @@ vc_status vc_decode_region(vc_archive *a, int lod, vc_box box, u8 *out) {
         for (u32 x = 0; x < A; ++x) { u32 vx = ax*A + x; if (vx < box.x0 || vx >= box.x1) continue;
             out[((size_t)(vz-box.z0)*oy + (vy-box.y0))*ox + (vx-box.x0)] = atom[(z*A + y)*A + x];
         }}}
+    }
+    // Deblock atom-grid faces that fall inside the region (global grid aligned).
+    {
+        u32 oz = box.z1 - box.z0;
+        int tc = (int)(r->base_q * DEBLOCK_STRENGTH); if (tc < 1) tc = 1;
+        size_t SX=1, SY=ox, SZ=(size_t)ox*oy;
+        for (u32 gx = ((box.x0 + A - 1)/A)*A; gx < box.x1; gx += A) {
+            u32 lx = gx - box.x0; if (lx < 4 || lx+4 > ox) continue;
+            for (u32 z=0; z<oz; ++z) for (u32 y=0; y<oy; ++y) {
+                size_t base=(size_t)z*SZ+(size_t)y*SY+lx*SX;
+                int p3=out[base-4*SX],p2=out[base-3*SX],p1=out[base-2*SX],p0=out[base-1*SX];
+                int q0=out[base],q1=out[base+SX],q2=out[base+2*SX],q3=out[base+3*SX];
+                deblock_line(&p3,&p2,&p1,&p0,&q0,&q1,&q2,&q3,tc);
+                out[base-2*SX]=(u8)p1; out[base-SX]=(u8)p0; out[base]=(u8)q0; out[base+SX]=(u8)q1;
+            }
+        }
+        for (u32 gy = ((box.y0 + A - 1)/A)*A; gy < box.y1; gy += A) {
+            u32 ly = gy - box.y0; if (ly < 4 || ly+4 > oy) continue;
+            for (u32 z=0; z<oz; ++z) for (u32 x=0; x<ox; ++x) {
+                size_t base=(size_t)z*SZ+(size_t)ly*SY+x*SX;
+                int p3=out[base-4*SY],p2=out[base-3*SY],p1=out[base-2*SY],p0=out[base-1*SY];
+                int q0=out[base],q1=out[base+SY],q2=out[base+2*SY],q3=out[base+3*SY];
+                deblock_line(&p3,&p2,&p1,&p0,&q0,&q1,&q2,&q3,tc);
+                out[base-2*SY]=(u8)p1; out[base-SY]=(u8)p0; out[base]=(u8)q0; out[base+SY]=(u8)q1;
+            }
+        }
+        for (u32 gz = ((box.z0 + A - 1)/A)*A; gz < box.z1; gz += A) {
+            u32 lz = gz - box.z0; if (lz < 4 || lz+4 > oz) continue;
+            for (u32 y=0; y<oy; ++y) for (u32 x=0; x<ox; ++x) {
+                size_t base=(size_t)lz*SZ+(size_t)y*SY+x*SX;
+                int p3=out[base-4*SZ],p2=out[base-3*SZ],p1=out[base-2*SZ],p0=out[base-1*SZ];
+                int q0=out[base],q1=out[base+SZ],q2=out[base+2*SZ],q3=out[base+3*SZ];
+                deblock_line(&p3,&p2,&p1,&p0,&q0,&q1,&q2,&q3,tc);
+                out[base-2*SZ]=(u8)p1; out[base-SZ]=(u8)p0; out[base]=(u8)q0; out[base+SZ]=(u8)q1;
+            }
+        }
     }
     return VC_OK;
 }

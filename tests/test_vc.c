@@ -46,18 +46,19 @@ int main(int argc, char **argv) {
     unsigned char atom[16*16*16];
     s = vc_decode_atom(a, 0, 1, 1, 1, atom);
     if (s != VC_OK) { printf("decode_atom fail %d\n", s); return 1; }
-    // compare atom to the same atom extracted from out
+    // compare atom to the same atom extracted from out, interior samples only
+    // (deblock modifies <=2 samples each side of 16-grid faces in decode_lod).
     int mismatch = 0;
-    for (unsigned z = 0; z < 16; ++z)
-    for (unsigned y = 0; y < 16; ++y)
-    for (unsigned x = 0; x < 16; ++x) {
+    for (unsigned z = 2; z < 14; ++z)
+    for (unsigned y = 2; y < 14; ++y)
+    for (unsigned x = 2; x < 14; ++x) {
         unsigned vx = 16+x, vy = 16+y, vz = 16+z;
         if (vx>=d.nx||vy>=d.ny||vz>=d.nz) continue;
         unsigned char fromlod = out[((size_t)vz*d.ny+vy)*d.nx+vx];
         unsigned char fromatom = atom[(z*16+y)*16+x];
         if (fromlod != fromatom) mismatch++;
     }
-    printf("random-access atom match: %s (%d mismatches)\n", mismatch==0?"OK":"FAIL", mismatch);
+    printf("random-access atom interior match: %s (%d mismatches)\n", mismatch==0?"OK":"FAIL", mismatch);
 
     // uniform atom (0,0,0) should be exactly 7
     unsigned char uatom[16*16*16];
