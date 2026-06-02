@@ -116,6 +116,15 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/harness/bench_ratectrl.c)
   target_link_libraries(bench_ratectrl PRIVATE vc)
 endif()
 
+# --- Round-3 edge/gradient importance-weight allocation experiment ----------
+# Self-contained bench: standalone codec-matched 16^3 DCT + qmatrix16 (included)
+# + RLGR rate + metrics, all provided by libvc. Per-block step (q-field) lever
+# => touched=1 preserved.
+if(EXISTS ${CMAKE_SOURCE_DIR}/harness/bench_edgeweight.c)
+  add_executable(bench_edgeweight harness/bench_edgeweight.c)
+  target_link_libraries(bench_edgeweight PRIVATE vc m)
+endif()
+
 # --- Phase-1 chunk-model (block-grid) bake-off (src/chunkmodel/) ------------
 # Self-contained engine: blockgrid.c #includes dct_int16.c (renamed) and links
 # rlgr.c + metrics.c. Does NOT touch codec.c. Runtime-parameterized so one binary
