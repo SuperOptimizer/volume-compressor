@@ -248,12 +248,17 @@ static int build_hull(rd_pt *p, int n) {
     }
     int m = 0;
     for (int i = 0; i < n; ++i) if (m == 0 || p[i].d < p[m-1].d - 1e-9) p[m++] = p[i];
+    // Lower convex hull (minimize D for given R). Points are R-ascending; D is
+    // decreasing, so segment slopes dD/dR are negative and, for a convex frontier,
+    // INCREASE (become less steep) with R. Drop the middle vertex p[h-1] whenever
+    // it lies ABOVE the chord p[h-2]->p[i], i.e. when the earlier slope is not
+    // less than the later slope (s1 >= s2) — that vertex is interior/dominated.
     int h = 0;
     for (int i = 0; i < m; ++i) {
         while (h >= 2) {
             f64 s1 = (p[h-1].d - p[h-2].d) / (p[h-1].r - p[h-2].r + 1e-12);
             f64 s2 = (p[i].d   - p[h-1].d) / (p[i].r   - p[h-1].r + 1e-12);
-            if (s2 >= s1) --h; else break;
+            if (s1 >= s2) --h; else break;
         }
         p[h++] = p[i];
     }
