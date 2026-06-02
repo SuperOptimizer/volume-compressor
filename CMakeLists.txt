@@ -133,6 +133,23 @@ add_executable(bench_chunkmodel harness/bench_chunkmodel.c ${VC_CM_SRC})
 target_include_directories(bench_chunkmodel PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(bench_chunkmodel PRIVATE m)
 
+# --- HF / perceptual distortion-path bake-off (src/quant/ work; self-contained) -
+# Includes the won DCT-16 transform + the 16^3 quant matrix directly, links the
+# won RLGR + metrics. Does NOT touch codec.c / ratectrl / chunkmodel. Guarded so
+# an absent source never breaks configure for others.
+if(EXISTS ${CMAKE_SOURCE_DIR}/harness/bench_hfdist.c)
+  add_executable(bench_hfdist harness/bench_hfdist.c
+                 src/entropy/rlgr.c src/metrics/metrics.c)
+  target_include_directories(bench_hfdist PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_link_libraries(bench_hfdist PRIVATE m)
+endif()
+
+if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_qmatrix16.c)
+  add_executable(vc_test_qmatrix16 tests/test_qmatrix16.c src/entropy/rlgr.c)
+  target_include_directories(vc_test_qmatrix16 PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_link_libraries(vc_test_qmatrix16 PRIVATE m)
+endif()
+
 enable_testing()
 add_test(NAME roundtrip COMMAND vc_test)
 add_test(NAME ratectrl COMMAND vc_test_ratectrl)
@@ -140,3 +157,6 @@ add_test(NAME entropy COMMAND vc_test_entropy)
 add_test(NAME transforms COMMAND vc_test_transforms)
 add_test(NAME healing COMMAND vc_test_healing)
 add_test(NAME chunkmodel COMMAND vc_test_chunkmodel)
+if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_qmatrix16.c)
+  add_test(NAME qmatrix16 COMMAND vc_test_qmatrix16)
+endif()
