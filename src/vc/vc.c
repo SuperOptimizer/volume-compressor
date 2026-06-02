@@ -397,12 +397,26 @@ static u32 dec_magnitude(rc_dec *d, atom_ctx *ac) {
     return v + x + 1;
 }
 
+// EOB = scan position of last significant coef + 1 (0 means empty atom).
+// Coded as a 12-bit fixed-length value in bypass (A3=4096 fits in 12 bits).
+// plan.txt §2.5: decode stops at EOB; trailing zeros cost nothing.
+static void enc_eob(rc_enc *e, u32 eob) {
+    for (int i = 11; i >= 0; --i) enc_bypass(e, (eob >> i) & 1);
+}
+static u32 dec_eob(rc_dec *d) {
+    u32 v = 0;
+    for (int i = 0; i < 12; ++i) v = (v << 1) | (u32)dec_bypass(d);
+    return v;
+}
+
 // Encode one atom's quantized coefficients (raster order q[A3]) into encoder.
-// last_scan = scan position of last significant coef (EOB), or -1 if all zero.
-// Step 1 ignores EOB (codes all); kept param for step 2.
 static void enc_atom_coefs(rc_enc *e, const i16 *q) {
     atom_ctx ac; atom_ctx_init(&ac);
-    for (u32 p = 0; p < A3; ++p) {
+    // find EOB: last scan position with nonzero coef
+    u32 eob = 0;
+    for (u32 p = A3; p-- > 0;) { if (q[g_scan[p]] != 0) { eob = p + 1; break; } }
+    enc_eob(e, eob);
+    for (u32 p = 0; p < eob; ++p) {
         u32 idx = g_scan[p];
         int b = band_of(idx);
         i16 v = q[idx];
@@ -416,7 +430,8 @@ static void enc_atom_coefs(rc_enc *e, const i16 *q) {
 static void dec_atom_coefs(rc_dec *d, i16 *q) {
     atom_ctx ac; atom_ctx_init(&ac);
     memset(q, 0, A3 * sizeof(i16));
-    for (u32 p = 0; p < A3; ++p) {
+    u32 eob = dec_eob(d);
+    for (u32 p = 0; p < eob; ++p) {
         u32 idx = g_scan[p];
         int b = band_of(idx);
         if (!dec_bit(d, &ac.sig[b])) continue;
