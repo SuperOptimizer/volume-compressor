@@ -99,9 +99,17 @@ target_compile_definitions(vc_shared PUBLIC VC_TESTHOOKS)
 
 # --- tools -----------------------------------------------------------------
 
+# Vendored libs3 (S3 client) + libcurl are REQUIRED: the exporter reads source
+# zarr from S3 and writes the archive to S3. Built into the exporter directly.
+find_package(CURL REQUIRED)
+
 if(EXISTS ${CMAKE_SOURCE_DIR}/tools/vc_export_stream.c)
-  add_executable(vc_export_stream tools/vc_export_stream.c tools/third_party/cJSON.c)
-  target_link_libraries(vc_export_stream PRIVATE vc)
+  add_executable(vc_export_stream
+    tools/vc_export_stream.c
+    tools/third_party/cJSON.c
+    tools/third_party/libs3/libs3.c)
+  target_include_directories(vc_export_stream PRIVATE tools/third_party/libs3)
+  target_link_libraries(vc_export_stream PRIVATE vc CURL::libcurl Threads::Threads)
 endif()
 
 # --- tests / benches -------------------------------------------------------

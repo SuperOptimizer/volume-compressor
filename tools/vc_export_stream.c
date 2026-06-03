@@ -18,6 +18,7 @@
 #define _GNU_SOURCE
 #include "../src/vc/vc.h"
 #include "third_party/cJSON.h"
+#include "third_party/libs3/libs3.h"
 #include "downscale.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +35,54 @@
 typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64;
 #define A 32u
 
+// ------------------------------------------------------------------ source I/O
+// The source zarr lives either on a local filesystem or in S3 (s3://bucket/key).
+// One abstraction: a path is an S3 URL iff it starts with "s3://". A single
+// shared, thread-safe s3_client is created once if any S3 path is used (the
+// vendored libs3 makes concurrent transfers safe: NOSIGNAL + curl-init mutex).
+static s3_client *g_s3 = NULL;             // NULL until first S3 path seen
+static int src_is_s3(const char *p){ return strncmp(p,"s3://",5)==0; }
+static void src_init_s3(void){
+    if(g_s3) return;
+    s3_config cfg; memset(&cfg,0,sizeof cfg);   // anonymous (public Vesuvius bucket)
+    cfg.max_retries=5;
+    g_s3=s3_client_new(&cfg);
+    if(!g_s3){ fprintf(stderr,"s3_client_new failed\n"); exit(1); }
+}
+// GET an object fully into a malloc'd buffer (caller frees). *len set. Returns
+// NULL on 404 / error. For S3, this is a single GET; for local, a file read.
+static u8 *src_get(const char *path, size_t *len){
+    if(src_is_s3(path)){
+        s3_response r; memset(&r,0,sizeof r);
+        s3_status st=s3_get(g_s3, path, &r);
+        u8 *out=NULL;
+        if(st==S3_OK && r.status==200 && r.body){ out=malloc(r.body_len); if(out){ memcpy(out,r.body,r.body_len); if(len)*len=r.body_len; } }
+        s3_response_free(&r);
+        return out;
+    }
+    int fd=open(path,O_RDONLY);
+    if(fd<0) return NULL;
+    struct stat stt;
+    if(fstat(fd,&stt)){close(fd);return NULL;}
+    if(stt.st_size<0||!S_ISREG(stt.st_mode)){close(fd);return NULL;}
+    size_t n=(size_t)stt.st_size; u8 *b=malloc(n); if(!b){close(fd);return NULL;}
+    ssize_t g=read(fd,b,n); close(fd);
+    if(g!=(ssize_t)n){free(b);return NULL;}
+    if(len)*len=n;
+    return b;
+}
+// Does an object exist? (occupancy probe.) HEAD for S3, access() for local.
+static int src_exists(const char *path){
+    if(src_is_s3(path)){
+        s3_response r; memset(&r,0,sizeof r);
+        s3_status st=s3_head(g_s3, path, &r);
+        int ok=(st==S3_OK && r.status>=200 && r.status<300);
+        s3_response_free(&r);
+        return ok;
+    }
+    return access(path,F_OK)==0;
+}
+
 // Copy exactly A(=32) bytes. Intrinsic-free (like vc.c): __builtin_memcpy with a
 // compile-time-constant size lowers to inline vector moves under -march — one ymm
 // move on AVX2, two q-reg moves on NEON, etc. — with NO libc call/dispatch. This
@@ -49,18 +98,18 @@ static atomic_long g_io_open=0, g_io_miss=0, g_io_bytes=0;
 // ------------------------------------------------------------------ zarr read
 typedef struct { char dir[1024]; u32 sz,sy,sx, cz,cy,cx; } zlevel;
 
-static char *read_file(const char *p, size_t *len){
-    int fd=open(p,O_RDONLY); if(fd<0)return NULL; struct stat st; if(fstat(fd,&st)){close(fd);return NULL;}
-    if(st.st_size<0 || !S_ISREG(st.st_mode)){close(fd);return NULL;}
-    size_t n=(size_t)st.st_size;
-    char *b=malloc(n+1); if(!b){close(fd);return NULL;}
-    ssize_t g=read(fd,b,n); close(fd);
-    if(g!=(ssize_t)n){free(b);return NULL;} b[n]=0; if(len)*len=n; return b;
+// Read a whole text resource (local file OR s3:// object) into a NUL-terminated
+// malloc'd buffer for cJSON. Routes through src_get (handles both).
+static char *read_text(const char *p){
+    size_t n=0; u8 *raw=src_get(p,&n); if(!raw) return NULL;
+    char *b=realloc(raw,n+1); if(!b){ free(raw); return NULL; }
+    b[n]=0; return b;
 }
-static int parse_zarray0(const char *zarr, zlevel *lv){
-    char p[1100]; snprintf(lv->dir,sizeof lv->dir,"%s/0",zarr);
+// Parse the .zarray for one pyramid level L of the zarr (dir = "<zarr>/<L>").
+static int parse_zarray_lvl(const char *zarr, int L, zlevel *lv){
+    char p[1100]; snprintf(lv->dir,sizeof lv->dir,"%s/%d",zarr,L);
     snprintf(p,sizeof p,"%s/.zarray",lv->dir);
-    char *t=read_file(p,0); if(!t)return -1; cJSON *j=cJSON_Parse(t); free(t); if(!j)return -1;
+    char *t=read_text(p); if(!t)return -1; cJSON *j=cJSON_Parse(t); free(t); if(!j)return -1;
     cJSON *sh=cJSON_GetObjectItem(j,"shape"), *ch=cJSON_GetObjectItem(j,"chunks");
     cJSON *dt=cJSON_GetObjectItem(j,"dtype"), *co=cJSON_GetObjectItem(j,"compressor");
     cJSON *sep=cJSON_GetObjectItem(j,"dimension_separator");
@@ -72,6 +121,7 @@ static int parse_zarray0(const char *zarr, zlevel *lv){
     if(ok&&sep&&sep->valuestring&&strcmp(sep->valuestring,"/")){fprintf(stderr,"dim sep not '/'\n");ok=0;}
     cJSON_Delete(j); return ok?0:-1;
 }
+static int parse_zarray0(const char *zarr, zlevel *lv){ return parse_zarray_lvl(zarr,0,lv); }
 
 // ------------------------------------------------------------------ helpers
 static int npyr(u32 sz,u32 sy,u32 sx){ int n=1; u32 z=sz,y=sy,x=sx; for(int l=1;l<VC_NLOD;++l){z=(z+1)/2;y=(y+1)/2;x=(x+1)/2;n=l+1;if(z<=1&&y<=1&&x<=1)break;} return n; }
@@ -82,15 +132,85 @@ static int npyr(u32 sz,u32 sy,u32 sx){ int n=1; u32 z=sz,y=sy,x=sx; for(int l=1;
 // too. We build this with a cheap stat() scan (no reads), then workers use it to
 // SKIP fully-empty tiles entirely (no chunk reads, no downscale, no zero-marks).
 typedef struct { u8 *present; u32 ncz,ncy,ncx; } chunkmap;
-static int cm_build(chunkmap *cm, const zlevel *z0){
+
+int g_scan_threads = 1;   // worker count for fetching the coarse occupancy level
+
+// Build the present-chunk bitmap from a COARSE pyramid level instead of probing
+// every 0/ chunk. The zarr is box-downscaled (zero-preserving), so a coarse-level
+// voxel is zero IFF all its 0/ parents are zero. We pick the coarsest level Lc
+// whose 2^Lc factor divides the 0/ chunk size (so a 0/ chunk maps to a whole
+// integer block of Lc voxels), download that tiny level in full, and mark a 0/
+// chunk present iff its footprint at Lc has any nonzero voxel. For this volume Lc
+// is 5/ -> one 128x71x71 chunk (<1MB, a single GET) replaces ~10k HEADs. Scales:
+// the coarse level is 2^(3*Lc) smaller than 0/. Falls back to per-chunk probing
+// only if no usable coarse level exists.
+#define CM_OCC_LEVEL 4   // preferred occupancy level: 4/ (16x). Coarser (5/, 32x)
+                         // averages faint edge data to zero; 4/ keeps more of the
+                         // feathered surface. A 0/ chunk maps to (chunk/16)^3 voxels.
+static int cm_fill_from_coarse(chunkmap *cm, const char *zarr, const zlevel *z0){
+    // Prefer CM_OCC_LEVEL; if it's absent or its factor doesn't tile a 0/ chunk
+    // cleanly, fall back to the next-coarsest usable level (then finer).
+    int bestL=-1; zlevel cl; u32 f=1;
+    for(int pass=0; pass<2 && bestL<0; ++pass){
+        // pass 0: try exactly CM_OCC_LEVEL. pass 1: scan coarsest..finest.
+        int lo = pass==0?CM_OCC_LEVEL:1, hi = pass==0?CM_OCC_LEVEL:VC_NLOD-1;
+        for(int L=hi; L>=lo; --L){
+            u32 ff=1u<<L;
+            if(z0->cz % ff || z0->cy % ff || z0->cx % ff) continue;  // must tile a 0/ chunk cleanly
+            zlevel t; if(parse_zarray_lvl(zarr,L,&t)!=0) continue;    // level must exist
+            cl=t; f=ff; bestL=L; break;
+        }
+    }
+    if(bestL<0) return -1;
+    // voxels-per-0/chunk at level Lc on each axis
+    u32 vcz=z0->cz/f, vcy=z0->cy/f, vcx=z0->cx/f;
+    // download the whole coarse level into a dense buffer [clz][cly][clx]
+    size_t voxn=(size_t)cl.sz*cl.sy*cl.sx; u8 *buf=calloc(voxn,1); if(!buf){return -1;}
+    u32 nclz=(cl.sz+cl.cz-1)/cl.cz, ncly=(cl.sy+cl.cy-1)/cl.cy, nclx=(cl.sx+cl.cx-1)/cl.cx;
+    size_t cb=(size_t)cl.cz*cl.cy*cl.cx; u8 *chk=malloc(cb);
+    for(u32 qz=0;qz<nclz;++qz)for(u32 qy=0;qy<ncly;++qy)for(u32 qx=0;qx<nclx;++qx){
+        char p[1200]; snprintf(p,sizeof p,"%s/%u/%u/%u",cl.dir,qz,qy,qx);
+        size_t gn=0; u8 *got=src_get(p,&gn);
+        if(!got) continue;                                   // absent chunk -> stays zero
+        if(gn>cb) gn=cb;
+        memcpy(chk,got,gn);
+        if(gn<cb) memset(chk+gn,0,cb-gn);
+        free(got);
+        // scatter this coarse chunk into buf (clamp to true coarse dims)
+        u32 gz0=qz*cl.cz, gy0=qy*cl.cy, gx0=qx*cl.cx;
+        for(u32 z=0; z<cl.cz && gz0+z<cl.sz; ++z)
+          for(u32 y=0; y<cl.cy && gy0+y<cl.sy; ++y){
+            u32 w=cl.cx; if(gx0+w>cl.sx) w=cl.sx-gx0;
+            memcpy(buf+((size_t)(gz0+z)*cl.sy+(gy0+y))*cl.sx+gx0,
+                   chk+((size_t)z*cl.cy+y)*cl.cx, w);
+          }
+    }
+    free(chk);
+    // mark each 0/ chunk present iff its [vcz x vcy x vcx] footprint at Lc is nonzero
+    for(u32 cz=0;cz<cm->ncz;++cz)for(u32 cy=0;cy<cm->ncy;++cy)for(u32 cx=0;cx<cm->ncx;++cx){
+        u32 z0v=cz*vcz, y0v=cy*vcy, x0v=cx*vcx; int nz=0;
+        for(u32 z=z0v; z<z0v+vcz && z<cl.sz && !nz; ++z)
+          for(u32 y=y0v; y<y0v+vcy && y<cl.sy && !nz; ++y)
+            for(u32 x=x0v; x<x0v+vcx && x<cl.sx; ++x)
+              if(buf[((size_t)z*cl.sy+y)*cl.sx+x]){ nz=1; break; }
+        if(nz) cm->present[((size_t)cz*cm->ncy+cy)*cm->ncx+cx]=1;
+    }
+    free(buf);
+    printf("occupancy from coarse level %d/ (%ux%ux%u, factor %u)\n", bestL, cl.sz,cl.sy,cl.sx, f);
+    return 0;
+}
+
+static int cm_build(chunkmap *cm, const char *zarr, const zlevel *z0){
     cm->ncz=(z0->sz+z0->cz-1)/z0->cz; cm->ncy=(z0->sy+z0->cy-1)/z0->cy; cm->ncx=(z0->sx+z0->cx-1)/z0->cx;
     size_t n=(size_t)cm->ncz*cm->ncy*cm->ncx;
     cm->present=calloc(n,1); if(!cm->present) return -1;
-    // probe each chunk file with access() (fast, no read). Parallelizable but the
-    // scan is tiny (~10k stats here) so keep it simple/serial.
+    // Preferred: derive occupancy from a coarse pyramid level (one tiny download).
+    if(cm_fill_from_coarse(cm, zarr, z0)==0) return 0;
+    // Fallback: probe each 0/ chunk directly (access() local / HEAD on S3).
+    fprintf(stderr,"no usable coarse level; falling back to per-chunk existence probe\n");
     for(u32 cz=0;cz<cm->ncz;++cz)for(u32 cy=0;cy<cm->ncy;++cy)for(u32 cx=0;cx<cm->ncx;++cx){
         char p[1200]; snprintf(p,sizeof p,"%s/%u/%u/%u",z0->dir,cz,cy,cx);
-        if(access(p,F_OK)==0) cm->present[((size_t)cz*cm->ncy+cy)*cm->ncx+cx]=1;
+        if(src_exists(p)) cm->present[((size_t)cz*cm->ncy+cy)*cm->ncx+cx]=1;
     }
     return 0;
 }
@@ -340,10 +460,19 @@ static void *tile_worker(void *arg){
                     atomic_fetch_add(&g_io_miss,1); continue;
                 }
                 char pth[1200]; snprintf(pth,sizeof pth,"%s/%u/%u/%u",z0->dir,ccz,ccy,ccx);
-                int fd=open(pth,O_RDONLY); atomic_fetch_add(&g_io_open,1);
-                if(fd<0){ atomic_fetch_add(&g_io_miss,1); continue; }
-                if(read(fd,chk,cb)!=(ssize_t)cb) memset(chk,0,cb);
-                atomic_fetch_add(&g_io_bytes,cb); close(fd);
+                atomic_fetch_add(&g_io_open,1);
+                if(src_is_s3(pth)){
+                    size_t gn=0; u8 *got=src_get(pth,&gn);          // S3 GET
+                    if(!got){ atomic_fetch_add(&g_io_miss,1); continue; }
+                    if(gn==cb) memcpy(chk,got,cb); else { memset(chk,0,cb); if(gn) memcpy(chk,got,gn<cb?gn:cb); }
+                    free(got);
+                }else{
+                    int fd=open(pth,O_RDONLY);
+                    if(fd<0){ atomic_fetch_add(&g_io_miss,1); continue; }
+                    if(read(fd,chk,cb)!=(ssize_t)cb) memset(chk,0,cb);
+                    close(fd);
+                }
+                atomic_fetch_add(&g_io_bytes,cb);
                 u32 gx0=ccx*cx, gy0=ccy*cy;
                 u32 ox0=gx0>vx0?gx0:vx0, ox1=(gx0+cx)<vx1?(gx0+cx):vx1;
                 u32 oy0=gy0>vy0?gy0:vy0, oy1=(gy0+cy)<vy1?(gy0+cy):vy1;
@@ -453,6 +582,11 @@ int main(int argc, char **argv){
     }
     if(nthreads<=0){long n=sysconf(_SC_NPROCESSORS_ONLN);nthreads=n>2?(int)n-1:1;}
 
+    // If the source is an s3:// URL, spin up the shared thread-safe S3 client and
+    // thread the occupancy sweep (HEAD per chunk would be RTT-bound otherwise).
+    if(src_is_s3(zarr)){ src_init_s3(); g_scan_threads=nthreads;
+        printf("source is S3; %d-way occupancy sweep\n",nthreads); }
+
     zlevel z0;
     if(parse_zarray0(zarr,&z0)){fprintf(stderr,"cannot read level 0 .zarray\n");return 1;}
     // PAD the output volume up to a multiple of the region size (1024) in every
@@ -516,9 +650,10 @@ int main(int argc, char **argv){
            BAND,SB,SB,ntx,nty,nbz,nbands,fine);
     printf("  per-band RAM ~%.0f MB; coarse tail LOD%d..%d built after\n", band_mem/1e6, fine+1, nlod-1);
 
-    // A-priori occupancy scan: which source chunks exist (cheap stat sweep).
+    // A-priori occupancy: derived from a coarse pyramid level (one tiny download),
+    // not per-chunk probing. The zarr is box-downscaled so coarse-zero => 0/-zero.
     chunkmap cm; double tcm=now_s();
-    if(cm_build(&cm,&z0)!=0){ fprintf(stderr,"chunkmap alloc failed\n"); return 1; }
+    if(cm_build(&cm,zarr,&z0)!=0){ fprintf(stderr,"chunkmap alloc failed\n"); return 1; }
     long cm_present=0,cm_total=(long)cm.ncz*cm.ncy*cm.ncx;
     for(long i=0;i<cm_total;++i) cm_present+=cm.present[i];
     printf("occupancy scan: %ld/%ld source chunks present (%.0f%%) in %.2fs\n",
