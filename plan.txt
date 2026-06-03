@@ -5,6 +5,12 @@ A frozen, single-pipeline, lossy compression codec for dense u8 3D X-ray
 volumetric data (Herculaneum / Vesuvius scroll micro-CT). Pure C23, CPU-only,
 compiler-autovectorized, single .h + .c style, drop-in.
 
+>>> HISTORICAL (v1.0). This is the original frozen-codec plan. The PER-ATOM
+>>> CODEC PIPELINE (§2) remains accurate (except ATOM = 32³, not 16³). The
+>>> ARCHIVE FORMAT and STRUCTURAL HIERARCHY here are SUPERSEDED — the current
+>>> on-disk format is specified in docs/SPEC.md (sparse, appendable, two-level
+>>> index, no chunks). When in doubt, docs/SPEC.md wins.
+
 This document is SELF-CONTAINED: it specifies the entire codec to be built from
 scratch. It is the distillation of ~26 experiments + literature + an audit; the
 experiment history is NOT needed to implement this. The companion file

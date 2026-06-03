@@ -58,6 +58,9 @@ dkms.conf
 /build/
 /data/
 
+# large local test volumes (zarr source + raw extracts) — not committed
+/testdata/
+
 # bake-off build dirs + reference builds
 /build_*/
 harness/refbuild/

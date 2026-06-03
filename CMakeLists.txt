@@ -83,14 +83,44 @@ if(VC_VEC_REPORT)
 endif()
 
 # --- the codec: one unit ---------------------------------------------------
+find_package(Threads REQUIRED)
 add_library(vc STATIC src/vc/vc.c)
 target_include_directories(vc PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(vc PUBLIC m)
+target_link_libraries(vc PUBLIC m Threads::Threads)
+# Test hooks (downsampling helper used to form LOD pyramids in tests).
+target_compile_definitions(vc PUBLIC VC_TESTHOOKS)
+
+# Shared library for language bindings (e.g. the Python/ctypes exporter).
+add_library(vc_shared SHARED src/vc/vc.c)
+set_target_properties(vc_shared PROPERTIES OUTPUT_NAME vc)
+target_include_directories(vc_shared PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(vc_shared PUBLIC m Threads::Threads)
+target_compile_definitions(vc_shared PUBLIC VC_TESTHOOKS)
+
+# --- tools -----------------------------------------------------------------
+
+if(EXISTS ${CMAKE_SOURCE_DIR}/tools/vc_export_stream.c)
+  add_executable(vc_export_stream tools/vc_export_stream.c tools/third_party/cJSON.c)
+  target_link_libraries(vc_export_stream PRIVATE vc)
+endif()
 
 # --- tests / benches -------------------------------------------------------
+enable_testing()
 if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_vc.c)
   add_executable(vc_test tests/test_vc.c)
   target_link_libraries(vc_test PRIVATE vc)
-  enable_testing()
   add_test(NAME roundtrip COMMAND vc_test)
+endif()
+
+if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_sparse.c)
+  add_executable(vc_test_sparse tests/test_sparse.c)
+  target_link_libraries(vc_test_sparse PRIVATE vc)
+  add_test(NAME sparse COMMAND vc_test_sparse)
+endif()
+
+if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_realdata.c)
+  add_executable(vc_test_realdata tests/test_realdata.c)
+  target_link_libraries(vc_test_realdata PRIVATE vc)
+  # real-data test needs the decoded raw volume; gated by VC_TESTDATA env var
+  add_test(NAME realdata COMMAND vc_test_realdata)
 endif()

@@ -1,6 +1,9 @@
-// volume-compressor — frozen single-pipeline codec implementation.
-// Build order per plan.txt §7. Step 1: minimal core (DCT-16 + dead-zone quant +
-// context coder + chunk/archive, fixed q, single LOD). Round-trips lossy.
+// volume-compressor — lossy 3D u8 codec with a sparse, appendable archive.
+// Core: DCT-32 + dead-zone quant + context coder; archive maps (lod,az,ay,ax)
+// to a self-contained atom payload via a two-level sparse index. See docs/SPEC.md.
+#if defined(__linux__)
+#define _GNU_SOURCE   // enables mremap on Linux (faster in-place file remap)
+#endif
 #include "vc.h"
 
 #include <stdlib.h>
@@ -46,8 +49,6 @@ static void *vc_xcalloc(size_t n, size_t sz) {
 // ---------------------------------------------------------------------------
 #define A      VC_ATOM             // atom edge (derives from the public header)
 #define A3     VC_ATOM3            // A*A*A
-#define CHUNK_ATOMS 4u             // atoms per axis per chunk
-#define CHUNK_SIDE  (CHUNK_ATOMS*A) // 128 voxels (4 * 32)
 
 #define Q14    14u                 // DCT fixed-point shift
 
@@ -557,24 +558,19 @@ static void dec_atom_coefs(rc_dec *d, i16 *q) {
 }
 
 // ===========================================================================
-// Archive format (plan.txt §4). Step 1: single LOD member, raster atoms.
+// Archive format constants (docs/SPEC.md). Sparse two-level index: a region
+// hash table (L1) → dense R³ atom-slot blocks (L2), mapping (lod,az,ay,ax) to a
+// self-contained atom payload. See the writer/reader sections below.
 // ===========================================================================
-#define VC_MAGIC   0x00314356u // "VC1\0"
-#define VC_VERSION 1u
-#define ABSENT     0xFFFFFFFFFFFFFFFFull
+#define VC_MAGIC      0x00314356u // "VC1\0"
+#define VC_VERSION    1u
+#define VC_LAYOUT_SPARSE2 1u      // file-header layout word: two-level sparse
+#define ABSENT        0xFFFFFFFFFFFFFFFFull
 
-// Per-atom directory entry stored in chunk header.
-typedef struct {
-    u64 offset;   // byte offset of atom payload within archive (ABSENT sentinel)
-    u32 length;   // payload length in bytes
-    u8  flags;    // bit0 uniform, bit1 absent
-    u8  uval;     // uniform value
-    u8  dc;       // stored DC mean (rounded)
-} atom_dir;
-#define AF_UNIFORM 1u
-#define AF_ABSENT  2u
-
-// In step 1 q is fixed and global. Stored in member header.
+// Atom-slot flags (level-2 dense block). A zero flags byte == AF_ABSENT.
+#define AF_ABSENT  0u   // unwritten / never fetched (coverage ABSENT)
+#define AF_PRESENT 1u   // real payload at offset/length
+#define AF_ZERO    2u   // known-zero atom, no payload (coverage KNOWN_ZERO)
 
 // ---- growable byte buffer ----
 typedef struct { u8 *p; size_t len, cap; } bbuf;
@@ -590,50 +586,36 @@ static void bb_put(bbuf *b, const void *src, size_t n) {
     bb_reserve(b, n); memcpy(b->p + b->len, src, n); b->len += n;
 }
 static void bb_u8(bbuf *b, u8 v)  { bb_reserve(b, 1); b->p[b->len++] = v; }
-static void bb_u32(bbuf *b, u32 v){ bb_put(b, &v, 4); }
-static void bb_u64(bbuf *b, u64 v){ bb_put(b, &v, 8); }
-static void bb_align(bbuf *b, size_t a) {
-    while (b->len % a) bb_u8(b, 0);
-}
 
-// ---- little reader helpers over a borrowed buffer ----
-static u32 rd_u32(const u8 *p) { u32 v; memcpy(&v, p, 4); return v; }
-static u64 rd_u64(const u8 *p) { u64 v; memcpy(&v, p, 8); return v; }
-
-// Per-atom payload: [dc u8][rc bytes...]. Uniform atoms carry no payload.
-// Encode one atom from a 16^3 voxel block. Returns 0 if uniform (sets *uval),
-// else appends rc-coded coefs to out and returns payload length (incl dc byte).
+// Encode one atom. An all-zero atom carries no payload (writer flags it
+// AF_ZERO): sets *is_zero=1, returns 0. Otherwise appends the payload
+// [dc u8][rc bytes...] to `out` and returns its length.
 static u32 encode_atom(const u8 *vox, float base_q, bbuf *out,
-                       int *is_uniform, u8 *uval, u8 *dcv) {
-    // uniform fast-path
-    u8 first = vox[0];
-    int uni = 1;
-    for (u32 i = 1; i < A3; ++i) if (vox[i] != first) { uni = 0; break; }
-    if (uni) { *is_uniform = 1; *uval = first; *dcv = first; return 0; }
-    *is_uniform = 0;
-
-    // DC mean
+                       int *is_zero, u8 *dcv) {
+    // Single pass: sum the voxels. For unsigned bytes, sum==0 iff the atom is all
+    // zero — so the zero-check and the DC mean fold into one scan (was two passes).
     u32 sum = 0;
     for (u32 i = 0; i < A3; ++i) sum += vox[i];
+    if (sum == 0) { *is_zero = 1; *dcv = 0; return 0; }
+    *is_zero = 0;
     i32 dc = (i32)((sum + A3/2) / A3);
     *dcv = (u8)dc;
 
-    i32 *coef = (i32 *)vc_xmalloc(A3 * sizeof(i32));
+    // Per-atom scratch is thread-local and reused across atoms — was malloc/free
+    // per atom (2 each), which dominated encode_atom's non-DCT time at scale. The
+    // decode path already does this; mirror it here. Reentrant (one set per thread).
+    static _Thread_local i32 coef[A3] __attribute__((aligned(64)));
+    static _Thread_local i16 q[A3]    __attribute__((aligned(64)));
+    static _Thread_local u8 scratch[A3 * 4 + 64] __attribute__((aligned(64)));
     atom_dct_fwd(vox, dc, coef);
-    i16 q[A3];
     quantize(coef, base_q, q);
-    free(coef);
 
     size_t start = out->len;
     bb_u8(out, (u8)dc);
-    // rc encode coefs into a scratch buffer then append
-    size_t cap = A3 * 4 + 64;
-    u8 *scratch = (u8 *)vc_xmalloc(cap);
-    rc_enc e; enc_init(&e, scratch, cap);
+    rc_enc e; enc_init(&e, scratch, sizeof scratch);
     enc_atom_coefs(&e, q);
     enc_flush(&e);
     bb_put(out, scratch, e.len);
-    free(scratch);
     return (u32)(out->len - start);
 }
 
@@ -648,648 +630,785 @@ static void decode_atom_payload(const u8 *pay, u32 len, float base_q, u8 *vox) {
     atom_dct_inv(coef, dc, vox);
 }
 
-// ---------------------------------------------------------------------------
-// Member encode. A member = one LOD volume. Layout written to bbuf `out`:
-//   member header (returned via member_rec), chunks each:
-//     [chunk header: per-atom dir] [atom payloads, 64B-aligned]
-// The member is self-contained; offsets in the atom dir are relative to the
-// member start. We collect chunk metadata, then write index + payloads.
-// ---------------------------------------------------------------------------
-typedef struct {
-    u32 nx, ny, nz;          // logical dims
-    u32 acx, acy, acz;       // atom counts per axis (ceil(dim/16))
-    u32 ccx, ccy, ccz;       // chunk counts per axis
-    float base_q;            // step-1 single q for whole member (per-chunk later)
-    u64  pay_base;           // member-relative offset of payload region
-    u64  rel_offset;         // member payload offset within archive
-    u64  length;             // member length
-} member_rec;
+// ===========================================================================
+// Sparse appendable archive (docs/SPEC.md).
+//
+// Two-level index over a single mmap'd file, mutated in place; atom payloads
+// and L2 blocks append at EOF and are never moved. One index, no footer.
+//
+//   [file header + index header]  (FILE_HDR bytes, 64B aligned)
+//   [L1 hash table]               (l1_cap × L1_ENTRY)        ← mutated in place
+//   [L2 blocks + atom payloads]   (append at EOF via cursor) ← never rewritten
+//
+// L1 entry: [u64 region_key][u64 block_ref]
+//   block_ref == 0            empty bucket (header occupies offset 0)
+//   block_ref == VC_ZERO_REGION  known all-zero region (no L2 block)
+//   else                      file offset of the dense R³ L2 block
+// L2 slot (ATOM_SLOT bytes): [u64 offset][u32 length][u8 flags][u8 dc][u16 pad]
+//   `offset` is the release-published commit word (acquire-loaded by readers).
+// ===========================================================================
 
-// Downsample a volume 2x per axis (box filter). Returns malloc'd buffer + dims.
-static u8 *downsample2x(const u8 *vol, vc_dims in, vc_dims *out) {
-    u32 ox = (in.nx + 1) / 2, oy = (in.ny + 1) / 2, oz = (in.nz + 1) / 2;
-    if (ox < 1) ox = 1;
-    if (oy < 1) oy = 1;
-    if (oz < 1) oz = 1;
-    u8 *o = (u8 *)vc_xmalloc((size_t)ox * oy * oz);
-    for (u32 z = 0; z < oz; ++z)
-    for (u32 y = 0; y < oy; ++y)
-    for (u32 x = 0; x < ox; ++x) {
-        u32 x0 = x*2, y0 = y*2, z0 = z*2;
-        u32 acc = 0, n = 0;
-        for (u32 dz = 0; dz < 2; ++dz) { u32 zz = z0+dz; if (zz>=in.nz) continue;
-        for (u32 dy = 0; dy < 2; ++dy) { u32 yy = y0+dy; if (yy>=in.ny) continue;
-        for (u32 dx = 0; dx < 2; ++dx) { u32 xx = x0+dx; if (xx>=in.nx) continue;
-            acc += vol[((size_t)zz*in.ny + yy)*in.nx + xx]; n++;
-        }}}
-        o[((size_t)z*oy + y)*ox + x] = (u8)((acc + n/2) / (n ? n : 1));
-    }
-    out->nx = ox; out->ny = oy; out->nz = oz;
-    return o;
+#include <pthread.h>
+#include <stdatomic.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+
+#define R_ATOMS    32u                 // index-region edge in atoms (1024 voxels)
+#define R3         (R_ATOMS*R_ATOMS*R_ATOMS)
+#define ATOM_SLOT  16u                 // bytes per L2 slot
+#define L1_ENTRY   16u                 // bytes per L1 bucket
+#define L2_BLOCK_BYTES ((u64)R3 * ATOM_SLOT)
+#define VC_ZERO_REGION 1ull            // block_ref sentinel: whole region known-0
+#define VC_CLAIMED_REGION 2ull         // block_ref sentinel: claimed, block being
+                                       // allocated by the CAS winner (transient)
+#define L1_INIT_CAP   1024u            // initial L1 buckets (grows by rehash)
+#define L1_MAX_LOAD_N 7u               // grow when count*10 >= cap*7  (70%)
+#define L1_MAX_LOAD_D 10u
+
+uint32_t vc_region_atoms(void) { return R_ATOMS; }
+
+// ---- file header (little-endian, packed by field offset) -------------------
+//  0  u32 magic
+//  4  u32 version
+//  8  u32 atom            (== VC_ATOM)
+// 12  u32 layout          (== VC_LAYOUT_SPARSE2)
+// 16  u32 region_atoms    (== R_ATOMS)
+// 20  u32 nlod
+// 24  u32 nx,ny,nz        (lod0 dims)
+// 36  f32 target_ratio
+// 40  u64 l1_cap
+// 48  u64 l1_count
+// 56  u64 l1_off          (file offset of L1 table)
+// 64  u64 cursor          (append EOF cursor; bytes used)
+// 72  f32 base_q[8]       (per-lod, 0 == not yet learned)
+// 104 ... pad to 128
+#define FH_MAGIC 0
+#define FH_VER   4
+#define FH_ATOM  8
+#define FH_LAYOUT 12
+#define FH_RGN   16
+#define FH_NLOD  20
+#define FH_NX    24
+#define FH_NY    28
+#define FH_NZ    32
+#define FH_TRATIO 36
+#define FH_L1CAP 40
+#define FH_L1CNT 48
+#define FH_L1OFF 56
+#define FH_CURSOR 64
+#define FH_BASEQ 72
+#define FILE_HDR 128u
+
+// split-mix64 finalizer — good integer hash for the packed region key.
+static inline u64 mix64(u64 x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+static inline u64 region_key(int lod, u32 rz, u32 ry, u32 rx) {
+    return ((u64)(lod & 7) << 45) | ((u64)(rz & 0x7FFF) << 30)
+         | ((u64)(ry & 0x7FFF) << 15) | (u64)(rx & 0x7FFF);
 }
 
-// Gather a 16^3 atom from a volume at atom coords, padding edges with fill.
-static void gather_atom(const u8 *vol, vc_dims d, u32 ax, u32 ay, u32 az,
-                        u8 fill, u8 *atom) {
-    for (u32 z = 0; z < A; ++z)
-    for (u32 y = 0; y < A; ++y)
-    for (u32 x = 0; x < A; ++x) {
-        u32 vx = ax*A + x, vy = ay*A + y, vz = az*A + z;
-        u8 v = fill;
-        if (vx < d.nx && vy < d.ny && vz < d.nz)
-            v = vol[((size_t)vz*d.ny + vy)*d.nx + vx];
-        atom[(z*A + y)*A + x] = v;
+// derive lod dims from lod0 via strict 2x pyramid.
+static vc_dims lod_dims_of(vc_dims d0, int lod) {
+    vc_dims d = d0;
+    for (int i = 0; i < lod; ++i) {
+        d.nx = (d.nx + 1) / 2; d.ny = (d.ny + 1) / 2; d.nz = (d.nz + 1) / 2;
+    }
+    return d;
+}
+static int dims_valid(vc_dims d) {
+    return d.nx && d.ny && d.nz &&
+           d.nx <= VC_MAX_DIM && d.ny <= VC_MAX_DIM && d.nz <= VC_MAX_DIM;
+}
+
+// ===========================================================================
+// Writer
+// ===========================================================================
+// On Linux we reserve a large VIRTUAL address range once (cheap; MAP_NORESERVE
+// so unwritten pages cost nothing) and grow the FILE under it with ftruncate —
+// the mmap base NEVER moves, so reads need no lock and the cursor just advances.
+// macOS lacks reliable map-past-EOF growth, so it falls back to remap-on-grow.
+#define VC_RESERVE  (10ull << 40)   // 10 TiB virtual reservation (Linux)
+#define VC_GROW_STEP (1ull << 30)   // grow the file 1 GiB at a time
+
+struct vc_writer {
+    int     fd;
+    u8     *map;            // mmap base (stable for the writer's life on Linux)
+    u64     map_len;        // mapped length (== reservation on Linux)
+    u64     file_len;       // file length actually backed by ftruncate
+    int     fixed_map;      // 1 = base never moves (Linux huge map); 0 = remap mode
+    pthread_mutex_t grow_mu;// serializes ftruncate/remap growth
+    pthread_rwlock_t lock;  // guards L1 structural mutations (region create/rehash)
+    atomic_uint_least64_t cursor; // append EOF cursor (mirrors header FH_CURSOR)
+    vc_dims dims0;
+    int     nlod;
+    float   target_ratio;
+    // Per-LOD base_q, set explicitly by the caller via vc_set_base_q (no
+    // auto-calibration). Atomic so the append hot path reads it lock-free and
+    // encodes outside the structural lock. 0.0 == not set (appending errors).
+    _Atomic float base_q[VC_NLOD];
+};
+
+static u32 rd_u32m(const u8 *p){ u32 v; memcpy(&v,p,4); return v; }
+static u64 rd_u64m(const u8 *p){ u64 v; memcpy(&v,p,8); return v; }
+static void wr_u32m(u8 *p, u32 v){ memcpy(p,&v,4); }
+static void wr_u64m(u8 *p, u64 v){ memcpy(p,&v,8); }
+static float rd_f32m(const u8 *p){ float v; memcpy(&v,p,4); return v; }
+static void wr_f32m(u8 *p, float v){ memcpy(p,&v,4); }
+
+// Ensure the file backs at least `need` bytes (so accesses to offset<need via
+// the mapping don't SIGBUS). Thread-safe via grow_mu; does NOT require the
+// rwlock. On the fixed huge map (Linux) the base never moves — just ftruncate.
+// In remap mode (macOS) it remaps, which moves the base, so remap-mode callers
+// must hold the rwlock exclusively around any raw-pointer use (see writer_alloc).
+static int writer_ensure(vc_writer *w, u64 need) {
+    if (need <= w->file_len) return 0;
+    pthread_mutex_lock(&w->grow_mu);
+    if (need <= w->file_len) { pthread_mutex_unlock(&w->grow_mu); return 0; }
+    // grow the file in big steps to amortize the metadata ops
+    u64 nl = w->file_len ? w->file_len : FILE_HDR;
+    while (nl < need) nl += VC_GROW_STEP;
+    if (w->fixed_map) {
+        if (nl > w->map_len) nl = w->map_len;   // bounded by the reservation
+        if (need > w->map_len) { pthread_mutex_unlock(&w->grow_mu); return -1; } // exceeded 10TB
+        if (ftruncate(w->fd, (off_t)nl) != 0) { pthread_mutex_unlock(&w->grow_mu); return -1; }
+        w->file_len = nl;                        // base pointer unchanged
+    } else {
+        if (ftruncate(w->fd, (off_t)nl) != 0) { pthread_mutex_unlock(&w->grow_mu); return -1; }
+        munmap(w->map, w->map_len);
+        void *nm = mmap(NULL, nl, PROT_READ|PROT_WRITE, MAP_SHARED, w->fd, 0);
+        if (nm == MAP_FAILED) { pthread_mutex_unlock(&w->grow_mu); return -1; }
+        w->map = (u8 *)nm; w->map_len = nl; w->file_len = nl;
+    }
+    pthread_mutex_unlock(&w->grow_mu);
+    return 0;
+}
+
+// Reserve `n` bytes at the append cursor (atomic) and ensure the file backs it.
+// Returns the file offset of the reserved range.
+static u64 writer_alloc(vc_writer *w, u64 n, int have_excl) {
+    (void)have_excl;
+    u64 off = atomic_fetch_add(&w->cursor, n);
+    if (off + n > w->file_len) writer_ensure(w, off + n);
+    return off;
+}
+
+// L1 probe over the table at file offset l1_off with capacity cap. Returns the
+// bucket index for `key` (existing or first empty). cap is a power of two.
+static u64 l1_probe(const u8 *map, u64 l1_off, u64 cap, u64 key) {
+    u64 mask = cap - 1;
+    u64 i = mix64(key) & mask;
+    for (;;) {
+        const u8 *e = map + l1_off + i*L1_ENTRY;
+        u64 bref = rd_u64m(e + 8);
+        if (bref == 0) return i;                 // empty bucket
+        if (rd_u64m(e) == key) return i;         // found
+        i = (i + 1) & mask;
     }
 }
 
-// Encode a full member (one volume) into `out`, given base_q. Fills *rec.
-// Serialized member layout (all offsets relative to member start):
-//   [u32 nx][u32 ny][u32 nz][u32 acx][u32 acy][u32 acz]
-//   [u32 ccx][u32 ccy][u32 ccz][f32 base_q]
-//   per chunk (raster ccz,ccy,ccx):
-//     [u32 n_atoms]
-//     per atom (raster within chunk): [u64 off][u32 len][u8 flags][u8 uval][u8 dc][u8 pad]
-//   [payload region, 64B-aligned atoms]
-static void encode_member(const u8 *vol, vc_dims d, float base_q, bbuf *arc,
-                          member_rec *rec) {
-    u32 acx = (d.nx + A - 1) / A, acy = (d.ny + A - 1) / A, acz = (d.nz + A - 1) / A;
-    if (acx == 0) acx = 1;
-    if (acy == 0) acy = 1;
-    if (acz == 0) acz = 1;
-    u32 ccx = (acx + CHUNK_ATOMS - 1) / CHUNK_ATOMS;
-    u32 ccy = (acy + CHUNK_ATOMS - 1) / CHUNK_ATOMS;
-    u32 ccz = (acz + CHUNK_ATOMS - 1) / CHUNK_ATOMS;
+// Rehash L1 into a new, larger table appended at EOF. Caller holds excl lock.
+static int l1_grow(vc_writer *w) {
+    u64 old_off = rd_u64m(w->map + FH_L1OFF);
+    u64 old_cap = rd_u64m(w->map + FH_L1CAP);
+    u64 new_cap = old_cap * 2;
+    u64 new_off = writer_alloc(w, new_cap * L1_ENTRY, 1);
+    if (writer_ensure(w, new_off + new_cap*L1_ENTRY) != 0) return -1;
+    memset(w->map + new_off, 0, new_cap * L1_ENTRY);
+    // reinsert occupied buckets
+    for (u64 i = 0; i < old_cap; ++i) {
+        const u8 *e = w->map + old_off + i*L1_ENTRY;
+        u64 bref = rd_u64m(e + 8);
+        if (bref == 0) continue;
+        u64 key = rd_u64m(e);
+        u64 j = l1_probe(w->map, new_off, new_cap, key);
+        u8 *ne = w->map + new_off + j*L1_ENTRY;
+        wr_u64m(ne, key); wr_u64m(ne + 8, bref);
+    }
+    wr_u64m(w->map + FH_L1OFF, new_off);
+    wr_u64m(w->map + FH_L1CAP, new_cap);
+    // old table becomes dead space (no compaction; cache is rebuildable).
+    return 0;
+}
 
-    u64 member_start = arc->len;
-    rec->nx = d.nx; rec->ny = d.ny; rec->nz = d.nz;
-    rec->acx = acx; rec->acy = acy; rec->acz = acz;
-    rec->ccx = ccx; rec->ccy = ccy; rec->ccz = ccz;
-    rec->base_q = base_q;
+// Atomic accessors over an 8-byte field in the (naturally-aligned) mmap.
+static inline _Atomic u64 *atomptr(u8 *p) { return (_Atomic u64 *)p; }
 
-    // Build payloads + directory. Chunks are INDEPENDENT, so encode each chunk
-    // into its OWN payload buffer in parallel (coarse multithread), then
-    // concatenate in chunk order. Atom offsets are implicit-cumulative within the
-    // member, which the in-order concat preserves. Single-thread without OpenMP.
-    u32 nchunks = ccx * ccy * ccz;
-    atom_dir **dirs = (atom_dir **)vc_xcalloc(nchunks, sizeof(atom_dir *));
-    u32 *chunk_natoms = (u32 *)vc_xcalloc(nchunks, sizeof(u32));
-    u8  *chunk_absent = (u8 *)vc_xcalloc(nchunks, sizeof(u8));
-    bbuf *chunk_pay = (bbuf *)vc_xcalloc(nchunks, sizeof(bbuf)); // per-chunk payload
-
-    #ifdef _OPENMP
-    #pragma omp parallel for schedule(dynamic) collapse(1)
-    #endif
-    for (u32 ci = 0; ci < nchunks; ++ci) {
-        u32 cx = ci % ccx, cy = (ci / ccx) % ccy, cz = ci / (ccx*ccy);
-        u32 ax0 = cx*CHUNK_ATOMS, ay0 = cy*CHUNK_ATOMS, az0 = cz*CHUNK_ATOMS;
-        u32 axn = acx - ax0; if (axn > CHUNK_ATOMS) axn = CHUNK_ATOMS;
-        u32 ayn = acy - ay0; if (ayn > CHUNK_ATOMS) ayn = CHUNK_ATOMS;
-        u32 azn = acz - az0; if (azn > CHUNK_ATOMS) azn = CHUNK_ATOMS;
-        u32 na = axn * ayn * azn;
-        chunk_natoms[ci] = na;
-        atom_dir *dir = (atom_dir *)vc_xcalloc(na, sizeof(atom_dir));
-        dirs[ci] = dir;
-        bbuf *pay = &chunk_pay[ci];   // this chunk's own payload buffer
-        u8 atom[A3];
-        u32 ai = 0;
-        for (u32 lz = 0; lz < azn; ++lz)
-        for (u32 ly = 0; ly < ayn; ++ly)
-        for (u32 lx = 0; lx < axn; ++lx, ++ai) {
-            gather_atom(vol, d, ax0+lx, ay0+ly, az0+lz, 0, atom);
-            int uni = 0; u8 uval = 0, dcv = 0;
-            u32 len = encode_atom(atom, base_q, pay, &uni, &uval, &dcv);
-            atom_dir *e = &dir[ai];
-            e->flags = uni ? AF_UNIFORM : 0;
-            e->uval = uval; e->dc = dcv;
-            e->length = len; // offset implicit (cumulative within member)
+// LOCK-FREE find-or-create of a region's L2 block. Returns the block file offset,
+// VC_ZERO_REGION if known-zero, or 0 (only when create=0 and absent). The L1
+// table is preallocated large enough to never rehash, so there is NO lock: reads
+// are atomic acquire-loads; a new region is claimed by CAS-publishing its block
+// offset into an empty bucket (losers free their block and use the winner's).
+//
+// Bucket layout per entry: [u64 key][u64 block_ref]. We use block_ref as the
+// single commit word: a reader that sees block_ref!=0 is guaranteed (via the CAS
+// release) to also see the matching key. We therefore write `key` BEFORE the CAS
+// that publishes block_ref.
+static u64 region_block_lockfree(vc_writer *w, u64 key, int create) {
+    u64 cap = rd_u64m(w->map + FH_L1CAP);
+    u64 off = rd_u64m(w->map + FH_L1OFF);
+    u64 mask = cap - 1;
+    u64 i = mix64(key) & mask;
+    for (;;) {
+        u8 *e = w->map + off + i*L1_ENTRY;
+        u64 bref = atomic_load_explicit(atomptr(e+8), memory_order_acquire);
+        if (bref == VC_CLAIMED_REGION) {
+            // Another thread won this bucket and is allocating the block right now.
+            // It will be our key (key is written before the claim). Spin until the
+            // real offset is published, then return it.
+            if (rd_u64m(e) == key) {
+                do { bref = atomic_load_explicit(atomptr(e+8), memory_order_acquire); }
+                while (bref == VC_CLAIMED_REGION);
+                return bref;
+            }
+            i = (i + 1) & mask; continue;           // claimed by a DIFFERENT key
         }
-        int all_absent = 1;
-        for (u32 k = 0; k < na; ++k)
-            if (!((dir[k].flags & AF_UNIFORM) && dir[k].uval == 0)) { all_absent = 0; break; }
-        chunk_absent[ci] = (u8)all_absent;
-    }
-    // Concatenate per-chunk payloads in chunk order into one member payload.
-    bbuf pay = {0};
-    for (u32 ci = 0; ci < nchunks; ++ci) {
-        if (chunk_pay[ci].len) bb_put(&pay, chunk_pay[ci].p, chunk_pay[ci].len);
-        free(chunk_pay[ci].p);
-    }
-    free(chunk_pay);
-
-    // Write member header
-    bbuf hdr = {0};
-    bb_u32(&hdr, d.nx); bb_u32(&hdr, d.ny); bb_u32(&hdr, d.nz);
-    bb_u32(&hdr, acx); bb_u32(&hdr, acy); bb_u32(&hdr, acz);
-    bb_u32(&hdr, ccx); bb_u32(&hdr, ccy); bb_u32(&hdr, ccz);
-    bb_put(&hdr, &base_q, 4);
-    u64 pay_base_slot = hdr.len; // patched after we know header size
-    bb_u64(&hdr, 0);             // [u64 pay_base] member-relative payload start
-    // chunk directories. Sentinel n_atoms = 0xFFFFFFFF marks an ABSENT chunk
-    // (entirely fill/zero) with NO atom entries and zero payload (plan §4).
-    // Each atom entry is 8 bytes: [u32 len][u8 flags][u8 uval][u8 dc][u8 pad].
-    // Atom byte offsets are IMPLICIT (cumulative payload length within member).
-    for (u32 ci = 0; ci < nchunks; ++ci) {
-        if (chunk_absent[ci]) { bb_u32(&hdr, 0xFFFFFFFFu); continue; }
-        bb_u32(&hdr, chunk_natoms[ci]);
-        for (u32 ai = 0; ai < chunk_natoms[ci]; ++ai) {
-            atom_dir *e = &dirs[ci][ai];
-            bb_u32(&hdr, e->length);
-            bb_u8(&hdr, e->flags);
-            bb_u8(&hdr, e->uval);
-            bb_u8(&hdr, e->dc);
-            bb_u8(&hdr, 0);
+        if (bref != 0) {
+            // occupied: matches us?
+            if (rd_u64m(e) == key) return bref;     // hit (block or ZERO_REGION)
+            i = (i + 1) & mask; continue;           // collision -> next bucket
         }
+        // empty bucket
+        if (!create) return 0;
+        // Two-phase claim — allocate ONLY after winning, so a lost race wastes NO
+        // disk block (the previous design pre-allocated a candidate block before the
+        // CAS and orphaned it on a loss, bloating the file nondeterministically).
+        // Phase 1: write key, then CAS-publish the transient CLAIMED sentinel.
+        wr_u64m(e, key);                            // key visible before publish
+        u64 expect = 0;
+        if (!atomic_compare_exchange_strong_explicit(atomptr(e+8), &expect,
+                VC_CLAIMED_REGION, memory_order_release, memory_order_acquire)) {
+            // Lost: someone else published here first. If our key, resolve it
+            // (spinning out any CLAIMED sentinel); else probe onward.
+            if (rd_u64m(e) == key) {
+                while (expect == VC_CLAIMED_REGION)
+                    expect = atomic_load_explicit(atomptr(e+8), memory_order_acquire);
+                return expect;
+            }
+            i = (i + 1) & mask; continue;
+        }
+        // Phase 2: we own the bucket. Allocate the block (advances EOF exactly once
+        // for this region, for the lifetime of the archive), zero it, publish.
+        u64 nb = writer_alloc(w, L2_BLOCK_BYTES, 0);
+        if (nb == 0 || writer_ensure(w, nb + L2_BLOCK_BYTES) != 0) return 0;
+        memset(w->map + nb, 0, L2_BLOCK_BYTES);
+        // writer_ensure may have remapped (non-fixed_map mode) -> recompute e from
+        // the current base before publishing through it.
+        e = w->map + off + i*L1_ENTRY;
+        atomic_store_explicit(atomptr(e+8), nb, memory_order_release);
+        atomic_fetch_add_explicit((_Atomic u64*)(w->map+FH_L1CNT), 1, memory_order_relaxed);
+        return nb;
     }
-    // Chunk directories / payload region aligned to 64B for mmap-friendliness.
-    bb_align(&hdr, 64);
-    { u64 pb = hdr.len; memcpy(hdr.p + pay_base_slot, &pb, 8); }
-
-    // Append hdr then payloads to archive
-    bb_put(arc, hdr.p, hdr.len);
-    bb_put(arc, pay.p, pay.len);
-
-    rec->rel_offset = member_start;
-    rec->length = arc->len - member_start;
-
-    for (u32 ci = 0; ci < nchunks; ++ci) free(dirs[ci]);
-    free(dirs); free(chunk_natoms); free(chunk_absent);
-    free(hdr.p); free(pay.p);
 }
 
-// Measure compressed size of a volume at a given base_q (for rate control).
-static u64 measure_member_size(const u8 *vol, vc_dims d, float base_q) {
-    bbuf tmp = {0}; member_rec rec;
-    encode_member(vol, d, base_q, &tmp, &rec);
-    u64 sz = tmp.len; free(tmp.p);
-    return sz;
-}
-
-// Encode a SAMPLE of atoms (every `stride`-th, raster) at base_q and return the
-// (sample_raw_bytes, sample_coded_bytes) so we can estimate ratio(q) cheaply
-// without encoding the whole volume. Uniform atoms cost ~0 and are counted.
-static void sample_ratio_at_q(const u8 *vol, vc_dims d, float base_q, u32 stride,
-                              u64 *raw_out, u64 *coded_out) {
-    u32 nax = (d.nx + A - 1) / A, nay = (d.ny + A - 1) / A, naz = (d.nz + A - 1) / A;
-    u64 raw = 0, coded = 0;
-    u8 *atom = (u8 *)vc_xmalloc(A3);
-    u32 i = 0;
-    for (u32 az = 0; az < naz; ++az)
-    for (u32 ay = 0; ay < nay; ++ay)
-    for (u32 ax = 0; ax < nax; ++ax) {
-        if ((i++ % stride) != 0) continue;
-        // gather atom (zero-pad partials)
-        for (u32 z = 0; z < A; ++z) { u32 vz = az*A + z;
-        for (u32 y = 0; y < A; ++y) { u32 vy = ay*A + y;
-        for (u32 x = 0; x < A; ++x) { u32 vx = ax*A + x;
-            u8 v = (vz < d.nz && vy < d.ny && vx < d.nx)
-                 ? vol[((size_t)vz*d.ny + vy)*d.nx + vx] : 0;
-            atom[(z*A + y)*A + x] = v;
-        }}}
-        bbuf pay = {0}; int uni; u8 uval, dcv;
-        u32 len = encode_atom(atom, base_q, &pay, &uni, &uval, &dcv);
-        free(pay.p);
-        raw += A3;
-        coded += uni ? 1 : (len + 2); // +2 ~ per-atom dir/flag overhead estimate
+// Legacy locked find-or-create (superseded by region_block_lockfree; retained
+// for reference and potential single-threaded setup paths).
+__attribute__((unused))
+static u64 region_block(vc_writer *w, u64 key, int create, int *created) {
+    if (created) *created = 0;
+    u64 cap = rd_u64m(w->map + FH_L1CAP);
+    u64 off = rd_u64m(w->map + FH_L1OFF);
+    u64 i = l1_probe(w->map, off, cap, key);
+    u64 bref = rd_u64m(w->map + off + i*L1_ENTRY + 8);
+    if (bref != 0) return bref;          // existing (block or ZERO_REGION)
+    if (!create) return 0;
+    // grow if this insert would exceed load factor (may remap + move w->map).
+    u64 cnt = rd_u64m(w->map + FH_L1CNT);
+    if ((cnt + 1) * L1_MAX_LOAD_D >= cap * L1_MAX_LOAD_N) {
+        if (l1_grow(w) != 0) return 0;
     }
-    free(atom);
-    *raw_out = raw; *coded_out = coded;
+    // Allocate the L2 block (this MAY remap and move w->map), THEN recompute the
+    // bucket from the current map/offset/cap before writing — never hold a raw
+    // pointer across an allocation.
+    u64 blk = writer_alloc(w, L2_BLOCK_BYTES, 1);
+    if (writer_ensure(w, blk + L2_BLOCK_BYTES) != 0) return 0;
+    memset(w->map + blk, 0, L2_BLOCK_BYTES);   // all slots AF_ABSENT
+    cap = rd_u64m(w->map + FH_L1CAP);
+    off = rd_u64m(w->map + FH_L1OFF);
+    i = l1_probe(w->map, off, cap, key);
+    u8 *e = w->map + off + i*L1_ENTRY;
+    wr_u64m(e, key); wr_u64m(e + 8, blk);
+    wr_u64m(w->map + FH_L1CNT, cnt + 1);
+    if (created) *created = 1;
+    return blk;
 }
 
-// Pick base_q to hit a target ratio. plan.txt §2.7: scroll data is homogeneous
-// (q for a target ratio varies only ~15% across a volume — MEASURED), so instead
-// of an 11x whole-volume re-encode bisection we CALIBRATE from a cheap spatial
-// SAMPLE: probe 2 q values on ~1/SAMPLE_STRIDE of the atoms, fit the near-linear
-// log(ratio)=m*log(q)+b relationship, and solve for the target q in closed form.
-// One light-weight pass instead of 11 full encodes -> ~single-pass encode speed.
-#define SAMPLE_STRIDE 64u   // sample ~1.5% of atoms for calibration
-// Crop a representative sub-volume (central ≤CAL_SIDE^3 corner-aligned region)
-// for calibration. q is spatially homogeneous (~15% stdev — MEASURED), so a
-// sub-volume predicts the whole-member q well, and bisecting on a 128³ crop
-// instead of a 1024³ member is ~512× less encode work per probe. Returns the
-// crop dims; copies into `dst` (caller-owned, CAL_SIDE^3 max).
-#define CAL_SIDE 128u
-static vc_dims calib_crop(const u8 *vol, vc_dims d, u8 *dst) {
-    vc_dims c = { d.nx < CAL_SIDE ? d.nx : CAL_SIDE,
-                  d.ny < CAL_SIDE ? d.ny : CAL_SIDE,
-                  d.nz < CAL_SIDE ? d.nz : CAL_SIDE };
-    // center the crop so it samples interior content, not just a corner edge
-    u32 ox = (d.nx - c.nx)/2, oy = (d.ny - c.ny)/2, oz = (d.nz - c.nz)/2;
-    for (u32 z = 0; z < c.nz; ++z)
-    for (u32 y = 0; y < c.ny; ++y)
-        memcpy(dst + ((size_t)z*c.ny + y)*c.nx,
-               vol + (((size_t)(z+oz)*d.ny + (y+oy))*d.nx + ox), c.nx);
-    return c;
-}
-static float pick_q_for_ratio(const u8 *vol, vc_dims d, float target_ratio) {
-    u64 raw = (u64)d.nx * d.ny * d.nz;
-    if (raw == 0) return 1.0f;
-    // Calibrate on a representative sub-volume if the member is large (q is
-    // spatially homogeneous, so the sub-volume's q≈the member's q). Small members
-    // calibrate on themselves. This keeps rate control CORRECT (real measure_member
-    // bisection) while cutting its cost from O(full member) to O(128³).
-    static _Thread_local u8 cbuf[CAL_SIDE*CAL_SIDE*CAL_SIDE];
-    vc_dims cd = d; const u8 *cvol = vol;
-    if (d.nx > CAL_SIDE || d.ny > CAL_SIDE || d.nz > CAL_SIDE) { cd = calib_crop(vol, d, cbuf); cvol = cbuf; }
-    vol = cvol; d = cd;
-    raw = (u64)d.nx * d.ny * d.nz;
-    u64 target_bytes = (u64)((double)raw / (double)target_ratio);
-    if (target_bytes < 1) target_bytes = 1;
-    // Bisection on the REAL coded member size (ground truth — accounts for the
-    // directory, concatenated payloads, uniform/absent atoms, everything). The
-    // earlier cheap-per-atom-sample estimator was fragile (its ratio diverged
-    // from the true member size on very-compressible or thin volumes → picked a
-    // clamped q and crushed quality). Encode is the least-important axis and a
-    // member is small (esp. coarse LODs), so a handful of real encodes is the
-    // right trade for correctness. Monotone: higher q → smaller size.
-    // q floor 0.5: below this the dead-zone quantizer produces levels that add no
-    // real quality (already near-lossless) and only stress the i16 level range.
-    // The operating range is 10-100×; if a target is so low it needs q<0.5, the
-    // data simply can't be compressed that little and we return the gentlest q.
-    float lo = 0.5f, hi = 4096.0f;
-    float best = 8.0f; u64 best_sz = measure_member_size(vol, d, best);
-    u64 bd = best_sz > target_bytes ? best_sz - target_bytes : target_bytes - best_sz;
-    for (int it = 0; it < 16; ++it) {
-        float mid = sqrtf(lo * hi);
-        u64 sz = measure_member_size(vol, d, mid);
-        u64 dd = sz > target_bytes ? sz - target_bytes : target_bytes - sz;
-        if (dd < bd) { bd = dd; best = mid; }
-        if (sz > target_bytes) lo = mid; else hi = mid;
-    }
-    return best;
+static inline u64 slot_index(u32 az, u32 ay, u32 ax) {
+    u32 lz = az & (R_ATOMS-1), ly = ay & (R_ATOMS-1), lx = ax & (R_ATOMS-1);
+    return ((u64)lz * R_ATOMS + ly) * R_ATOMS + lx;
 }
 
-// ---------------------------------------------------------------------------
-// --- Benchmark-only hooks (not part of the frozen public API) --------------
-// vc_bench_encode_full: like vc_encode but also returns the per-LOD base_q it
-// chose (the result of the rate-search bisection) and the per-LOD member dims.
-// vc_bench_encode_singlepass: encode all LODs with q ALREADY chosen (no
-// bisection) — measures the fundamental single-pass encode throughput.
-#ifdef VC_BENCH
-vc_status vc_bench_encode_full(const u8 *vol, vc_dims dims, float target_ratio,
-                               u8 **out_archive, size_t *out_len,
-                               float qout[VC_NLOD], int *nlod_out);
-vc_status vc_bench_encode_singlepass(const u8 *vol, vc_dims dims,
-                                     const float qin[VC_NLOD], int nlod,
-                                     u8 **out_archive, size_t *out_len);
-#endif
 
-// vc_encode — top level. Builds the 8-LOD pyramid (step 6) and footer.
-// ---------------------------------------------------------------------------
-vc_status vc_encode(const u8 *vol, vc_dims dims, float target_ratio,
-                    u8 **out_archive, size_t *out_len) {
+vc_writer *vc_create(const char *path, vc_dims lod0_dims, float target_ratio) {
     build_tables();
-    VC_CHECK(vol && out_archive && out_len, "vc_encode null arg");
-    VC_CHECK(target_ratio >= 1.0f, "target_ratio < 1");
+    if (!dims_valid(lod0_dims) || target_ratio < 1.0f) return NULL;
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return NULL;
 
-    bbuf arc = {0};
-    // file header: magic, version, then SELF-DESCRIBING geometry so the format is
-    // not silently tied to compile-time constants — vc_open validates these and
-    // rejects an archive built with a different atom/chunk size. (1.0 freeze.)
-    bb_u32(&arc, VC_MAGIC);
-    bb_u32(&arc, VC_VERSION);
-    bb_u32(&arc, VC_ATOM);         // atom edge (voxels) — decoder must match
-    bb_u32(&arc, CHUNK_ATOMS);     // atoms per chunk axis
-
-    member_rec recs[VC_NLOD];
-    int nmembers = 0;
-
-    // Rate control (plan.txt §2.7): scroll data is statistically homogeneous, so
-    // the q that hits the target ratio is near-constant across chunks (measured:
-    // ~15% stdev over a 1024^3 volume). We therefore calibrate ONE global q on
-    // LOD0 (a single bisection) and reuse it for every LOD member — no per-chunk
-    // or per-LOD search. Encode is then single-pass (~70 MB/s) instead of paying
-    // an 11x re-encode bisection per member. Per-LOD ratio may wobble slightly;
-    // LOD0 dominates the byte budget so the overall ratio tracks the target.
-    float gq = pick_q_for_ratio(vol, dims, target_ratio);
-
-    // LOD0 = original; LOD k+1 = 2x downsample of level above (plan.txt §5).
-    u8 *cur = (u8 *)vol; vc_dims cd = dims;
-    u8 *owned = NULL; // buffers we must free (not the caller's vol)
-    for (int lod = 0; lod < VC_NLOD; ++lod) {
-        encode_member(cur, cd, gq, &arc, &recs[nmembers]);
-        nmembers++;
-        // stop if next level would be degenerate (all dims already 1)
-        if (cd.nx <= 1 && cd.ny <= 1 && cd.nz <= 1) break;
-        vc_dims nd; u8 *nv = downsample2x(cur, cd, &nd);
-        if (owned) free(owned);
-        owned = nv; cur = nv; cd = nd;
+    int nlod = 1;
+    for (int l = 1; l < VC_NLOD; ++l) {
+        vc_dims d = lod_dims_of(lod0_dims, l);
+        nlod = l + 1;
+        if (d.nx <= 1 && d.ny <= 1 && d.nz <= 1) break;
     }
-    if (owned) free(owned);
 
-    // footer: member directory
-    u64 dir_off = arc.len;
-    bb_u32(&arc, (u32)nmembers);
-    for (int i = 0; i < nmembers; ++i) {
-        bb_u64(&arc, recs[i].rel_offset);
-        bb_u64(&arc, recs[i].length);
+    // Preallocate the L1 hash table large enough that it NEVER rehashes — this is
+    // what makes region lookup/creation lock-free (a moving table would need a
+    // lock). Max regions = sum over LODs of the region grid; size to ~2x that,
+    // rounded up to a power of two (load factor < 0.5).
+    u64 max_regions = 0;
+    for (int l = 0; l < nlod; ++l) {
+        vc_dims d = lod_dims_of(lod0_dims, l);
+        u64 rx = ((d.nx + A - 1)/A + R_ATOMS - 1)/R_ATOMS;
+        u64 ry = ((d.ny + A - 1)/A + R_ATOMS - 1)/R_ATOMS;
+        u64 rz = ((d.nz + A - 1)/A + R_ATOMS - 1)/R_ATOMS;
+        max_regions += rx*ry*rz;
     }
-    u64 dir_len = arc.len - dir_off;
-    bb_align(&arc, 8);
-    // trailer
-    bb_u64(&arc, dir_off);
-    bb_u64(&arc, dir_len);
-    bb_u32(&arc, VC_VERSION);
-    bb_u32(&arc, VC_MAGIC);
+    u64 l1_cap = L1_INIT_CAP;
+    while (l1_cap < max_regions * 2) l1_cap <<= 1;   // power-of-two, <50% load
 
-    *out_archive = arc.p;
-    *out_len = arc.len;
+    u64 l1_off = FILE_HDR;
+    u64 init_len = l1_off + l1_cap * L1_ENTRY;
+    if (ftruncate(fd, (off_t)init_len) != 0) { close(fd); return NULL; }
+
+    // Prefer a fixed huge virtual reservation (base never moves -> lock-free
+    // reads, no remap). MAP_NORESERVE keeps unwritten pages free. Fall back to a
+    // plain right-sized map (remap-on-grow) if the big reservation fails (macOS
+    // or constrained address space).
+    int fixed = 0; u64 map_len = init_len;
+    u8 *map = MAP_FAILED;
+#if defined(__linux__)
+    map = (u8 *)mmap(NULL, VC_RESERVE, PROT_READ|PROT_WRITE,
+                     MAP_SHARED | MAP_NORESERVE, fd, 0);
+    if (map != MAP_FAILED) { fixed = 1; map_len = VC_RESERVE; }
+#endif
+    if (map == MAP_FAILED) {
+        map = (u8 *)mmap(NULL, init_len, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+        if (map == MAP_FAILED) { close(fd); return NULL; }
+        fixed = 0; map_len = init_len;
+    }
+    memset(map, 0, init_len);
+
+    wr_u32m(map+FH_MAGIC, VC_MAGIC);
+    wr_u32m(map+FH_VER, VC_VERSION);
+    wr_u32m(map+FH_ATOM, VC_ATOM);
+    wr_u32m(map+FH_LAYOUT, VC_LAYOUT_SPARSE2);
+    wr_u32m(map+FH_RGN, R_ATOMS);
+    wr_u32m(map+FH_NLOD, (u32)nlod);
+    wr_u32m(map+FH_NX, lod0_dims.nx);
+    wr_u32m(map+FH_NY, lod0_dims.ny);
+    wr_u32m(map+FH_NZ, lod0_dims.nz);
+    wr_f32m(map+FH_TRATIO, target_ratio);
+    wr_u64m(map+FH_L1CAP, l1_cap);
+    wr_u64m(map+FH_L1CNT, 0);
+    wr_u64m(map+FH_L1OFF, l1_off);
+    wr_u64m(map+FH_CURSOR, init_len);
+
+    vc_writer *w = (vc_writer *)vc_xcalloc(1, sizeof(*w));
+    w->fd = fd; w->map = map; w->map_len = map_len; w->file_len = init_len;
+    w->fixed_map = fixed;
+    pthread_rwlock_init(&w->lock, NULL);
+    pthread_mutex_init(&w->grow_mu, NULL);
+    atomic_store(&w->cursor, init_len);
+    w->dims0 = lod0_dims; w->nlod = nlod; w->target_ratio = target_ratio;
+    return w;
+}
+
+vc_status vc_set_base_q(vc_writer *w, int lod, float q) {
+    if (!w || lod < 0 || lod >= w->nlod) return VC_ERR_RANGE;
+    if (q < 0.05f) q = 0.05f;
+    if (q > 4096.0f) q = 4096.0f;
+    pthread_rwlock_wrlock(&w->lock);
+    wr_f32m(w->map + FH_BASEQ + lod*4, q);
+    atomic_store_explicit(&w->base_q[lod], q, memory_order_release);
+    pthread_rwlock_unlock(&w->lock);
     return VC_OK;
 }
 
+
+static vc_status append_one(vc_writer *w, int lod, u32 az, u32 ay, u32 ax,
+                            const u8 vox[VC_ATOM3]) {
+    u32 rz = az / R_ATOMS, ry = ay / R_ATOMS, rx = ax / R_ATOMS;
+    u64 key = region_key(lod, rz, ry, rx);
+
+    // Detect all-zero (lock-free, pure). An all-zero atom stores as AF_ZERO.
+    int is_zero = 1;
+    for (u32 i = 0; i < A3; ++i) if (vox[i]) { is_zero = 0; break; }
+
+    // ENCODE OUTSIDE THE LOCK so appends run in parallel (the encode is the
+    // expensive part and is a pure function of vox + base_q). base_q[lod] is
+    // frozen from the first non-zero atom of the lod: if not yet frozen, take the
+    // exclusive lock briefly to do the warmup probe + freeze, then release and
+    // encode lock-free. Once frozen, all threads read it lock-free.
+    bbuf pay = {0}; u8 dcv = 0; u32 len = 0;
+    if (!is_zero) {
+        // q must have been set explicitly via vc_set_base_q before appending.
+        float q = atomic_load_explicit(&w->base_q[lod], memory_order_acquire);
+        if (q <= 0.0f) return VC_ERR_RANGE;   // no q set for this LOD
+        int z2 = 0;
+        len = encode_atom(vox, q, &pay, &z2, &dcv);
+    }
+
+    // Ensure the region's L2 block exists. region_block mutates the L1 hash
+    // table, so it runs under the exclusive lock (rare: only on first touch of a
+    // region / rehash). It internally reserves+zeros the block via writer_alloc
+    // (which grows the file under grow_mu, no remap on the fixed map).
+    // LOCK-FREE region lookup/creation (the L1 table never rehashes — it is
+    // preallocated from the volume dims). No lock on the common path.
+    u64 blk = region_block_lockfree(w, key, 1);
+    if (blk == VC_ZERO_REGION) {
+        // Rare: region was declared all-zero, now an atom arrives -> promote to a
+        // real block. This mutates an existing bucket, so take the lock.
+        pthread_rwlock_wrlock(&w->lock);
+        u64 cap = rd_u64m(w->map + FH_L1CAP), off = rd_u64m(w->map + FH_L1OFF);
+        u64 i = l1_probe(w->map, off, cap, key);
+        u8 *e = w->map + off + i*L1_ENTRY;
+        u64 cur = rd_u64m(e+8);
+        if (cur == VC_ZERO_REGION) {
+            u64 nb = writer_alloc(w, L2_BLOCK_BYTES, 1);
+            if (nb == 0 || writer_ensure(w, nb + L2_BLOCK_BYTES) != 0) { pthread_rwlock_unlock(&w->lock); free(pay.p); return VC_ERR_OOM; }
+            memset(w->map + nb, 0, L2_BLOCK_BYTES);
+            wr_u64m(e + 8, nb);
+            blk = nb;
+        } else blk = cur;   // another thread promoted it first
+        pthread_rwlock_unlock(&w->lock);
+    }
+    if (blk == 0) { free(pay.p); return VC_ERR_OOM; }
+
+    u64 slot_off = blk + slot_index(az,ay,ax)*ATOM_SLOT;
+
+    if (is_zero) {
+        // known-zero atom: no payload. publish flags as the commit point.
+        u8 *slot = w->map + slot_off;
+        wr_u64m(slot, ABSENT); wr_u32m(slot+8, 0); slot[13] = 0;
+        atomic_thread_fence(memory_order_release);
+        slot[12] = AF_ZERO;
+        free(pay.p);
+        return VC_OK;
+    }
+
+    // Reserve a unique EOF range (atomic cursor) and copy the payload there with
+    // NO lock — on the fixed map the base is stable and the range is exclusively
+    // ours. Then publish into our slot (a distinct slot per atom, so concurrent
+    // appends to the same block don't conflict). `offset` is the release-
+    // published commit word; readers acquire-load it.
+    u64 poff = writer_alloc(w, len, 0);
+    if (poff == 0 || writer_ensure(w, poff + len) != 0) { free(pay.p); return VC_ERR_OOM; }
+    if (!w->fixed_map) pthread_rwlock_rdlock(&w->lock);   // remap mode: pin base
+    memcpy(w->map + poff, pay.p, len);
+    u8 *slot = w->map + slot_off;
+    wr_u32m(slot+8, len); slot[12] = AF_PRESENT; slot[13] = dcv;
+    atomic_thread_fence(memory_order_release);
+    wr_u64m(slot, poff);   // RELEASE-published commit word
+    if (!w->fixed_map) pthread_rwlock_unlock(&w->lock);
+    free(pay.p);
+    return VC_OK;
+}
+
+vc_status vc_append_atom(vc_writer *w, int lod, u32 az, u32 ay, u32 ax,
+                         const u8 vox[VC_ATOM3]) {
+    if (!w || lod < 0 || lod >= w->nlod) return VC_ERR_RANGE;
+    vc_dims d = lod_dims_of(w->dims0, lod);
+    u32 acx=(d.nx+A-1)/A, acy=(d.ny+A-1)/A, acz=(d.nz+A-1)/A;
+    if (ax >= acx || ay >= acy || az >= acz) return VC_ERR_RANGE;
+    return append_one(w, lod, az, ay, ax, vox);
+}
+
+vc_status vc_append_box(vc_writer *w, int lod, vc_box b, const u8 *voxels) {
+    if (!w || lod < 0 || lod >= w->nlod || !voxels) return VC_ERR_RANGE;
+    if (b.x0 % A || b.y0 % A || b.z0 % A) return VC_ERR_RANGE;
+    if ((b.x1-b.x0) % A || (b.y1-b.y0) % A || (b.z1-b.z0) % A) return VC_ERR_RANGE;
+    if (b.x1<=b.x0 || b.y1<=b.y0 || b.z1<=b.z0) return VC_ERR_RANGE;
+    u32 bx = b.x1-b.x0, by = b.y1-b.y0;
+    u8 atom[A3];
+    for (u32 vz = b.z0; vz < b.z1; vz += A)
+    for (u32 vy = b.y0; vy < b.y1; vy += A)
+    for (u32 vx = b.x0; vx < b.x1; vx += A) {
+        // gather one 32^3 atom out of the box buffer
+        for (u32 z=0; z<A; ++z) for (u32 y=0; y<A; ++y) for (u32 x=0; x<A; ++x) {
+            u64 si = ((u64)(vz - b.z0 + z)*by + (vy - b.y0 + y))*bx + (vx - b.x0 + x);
+            atom[(z*A+y)*A+x] = voxels[si];
+        }
+        vc_status s = append_one(w, lod, vz/A, vy/A, vx/A, atom);
+        if (s != VC_OK) return s;
+    }
+    return VC_OK;
+}
+
+vc_status vc_mark_zero_atom(vc_writer *w, int lod, u32 az, u32 ay, u32 ax) {
+    if (!w || lod < 0 || lod >= w->nlod) return VC_ERR_RANGE;
+    u64 key = region_key(lod, az/R_ATOMS, ay/R_ATOMS, ax/R_ATOMS);
+    // Lock-free find-or-create, then write the explicit AF_ZERO slot. Creating
+    // the block guarantees this atom is recorded as KNOWN_ZERO (never left ABSENT)
+    // regardless of the order present/zero atoms arrive in the region.
+    u64 blk = region_block_lockfree(w, key, 1 /*create*/);
+    if (blk == 0) return VC_ERR_OOM;
+    if (blk == VC_ZERO_REGION) return VC_OK;   // whole region already known-zero
+    u8 *slot = w->map + blk + slot_index(az,ay,ax)*ATOM_SLOT;
+    wr_u64m(slot, ABSENT); wr_u32m(slot+8, 0); slot[13]=0;
+    atomic_thread_fence(memory_order_release);
+    slot[12] = AF_ZERO;
+    return VC_OK;
+}
+
+vc_status vc_mark_zero_region(vc_writer *w, int lod, u32 rz, u32 ry, u32 rx) {
+    if (!w || lod < 0 || lod >= w->nlod) return VC_ERR_RANGE;
+    u64 key = region_key(lod, rz, ry, rx);
+    // Lock-free: CAS the ZERO_REGION sentinel into an empty bucket (preallocated
+    // L1, never rehashes). If the region already has a block, leave it (write-
+    // once — a populated region is not downgraded).
+    u64 cap = rd_u64m(w->map + FH_L1CAP), off = rd_u64m(w->map + FH_L1OFF);
+    u64 mask = cap - 1, i = mix64(key) & mask;
+    for (;;) {
+        u8 *e = w->map + off + i*L1_ENTRY;
+        u64 bref = atomic_load_explicit(atomptr(e+8), memory_order_acquire);
+        if (bref != 0) { if (rd_u64m(e) == key) return VC_OK; i = (i+1)&mask; continue; }
+        wr_u64m(e, key);
+        u64 expect = 0;
+        if (atomic_compare_exchange_strong_explicit(atomptr(e+8), &expect, VC_ZERO_REGION,
+                memory_order_release, memory_order_acquire)) {
+            atomic_fetch_add_explicit((_Atomic u64*)(w->map+FH_L1CNT), 1, memory_order_relaxed);
+            return VC_OK;
+        }
+        if (rd_u64m(e) == key) return VC_OK;   // someone else claimed it for us
+        i = (i+1)&mask;
+    }
+}
+
+void vc_writer_close(vc_writer *w) {
+    if (!w) return;
+    // trim the file to the exact used length, persist final cursor.
+    u64 used = atomic_load(&w->cursor);
+    wr_u64m(w->map + FH_CURSOR, used);
+    // sync only the backed prefix (map_len may be a 10TB reservation).
+    msync(w->map, w->file_len, MS_SYNC);
+    munmap(w->map, w->map_len);
+    if (used && used < w->file_len) { if (ftruncate(w->fd, (off_t)used) != 0) {/*ignore*/} }
+    close(w->fd);
+    pthread_rwlock_destroy(&w->lock);
+    pthread_mutex_destroy(&w->grow_mu);
+    free(w);
+}
+
 // ===========================================================================
-// Decode side
+// Reader
 // ===========================================================================
 struct vc_archive {
     const u8 *buf; size_t len;
-    u32 nmembers;
-    const u8 *members[VC_NLOD]; // pointer to each member start
-    member_rec recs[VC_NLOD];
+    vc_dims dims0; int nlod;
+    u64 l1_off, l1_cap;
+    float base_q[VC_NLOD];
 };
-
-// Parse a member header into rec (dims/grid/base_q); returns ptr past header
-// data is read lazily; we only cache the rec fields.
-static void parse_member_header(const u8 *m, member_rec *r) {
-    r->nx = rd_u32(m+0);  r->ny = rd_u32(m+4);  r->nz = rd_u32(m+8);
-    r->acx = rd_u32(m+12); r->acy = rd_u32(m+16); r->acz = rd_u32(m+20);
-    r->ccx = rd_u32(m+24); r->ccy = rd_u32(m+28); r->ccz = rd_u32(m+32);
-    memcpy(&r->base_q, m+36, 4);
-    r->pay_base = rd_u64(m+40);
-}
 
 vc_archive *vc_open(const u8 *archive, size_t len) {
     build_tables();
-    if (!archive || len < 40) return NULL;
-    // verify file header: magic, version, and SELF-DESCRIBING geometry. Reject an
-    // archive from a different version or a different atom/chunk size (would
-    // misdecode silently otherwise — EOB width, band map, atom grid all depend on
-    // atom size). This is what makes the 1.0 format safely frozen.
-    if (rd_u32(archive) != VC_MAGIC) return NULL;
-    if (rd_u32(archive + 4) != VC_VERSION) return NULL;
-    if (rd_u32(archive + 8) != VC_ATOM) return NULL;
-    if (rd_u32(archive + 12) != CHUNK_ATOMS) return NULL;
-    // trailer: last 24 bytes = [u64 dir_off][u64 dir_len][u32 ver][u32 magic].
-    // ALL structural offsets/lengths below are validated against `len` (overflow-
-    // safe) before any dereference — a malformed/malicious archive must return
-    // NULL, never read out of bounds. (Hardened for untrusted input; fuzzed.)
-    const u8 *tr = archive + len - 24;
-    u64 dir_off = rd_u64(tr);
-    u64 dir_len = rd_u64(tr + 8);
-    u32 magic = rd_u32(tr + 20);
-    if (magic != VC_MAGIC) return NULL;
-    if (dir_off > len || dir_len > len - dir_off) return NULL;  // overflow-safe
-    if (dir_len < 4) return NULL;
-    const u8 *dir = archive + dir_off;
-    u32 nm = rd_u32(dir);
-    if (nm == 0 || nm > VC_NLOD) return NULL;
-    // directory body must hold nm member entries of 16 bytes each, after the u32 count
-    if ((u64)nm * 16u > dir_len - 4) return NULL;
+    if (!archive || len < FILE_HDR) return NULL;
+    if (rd_u32m(archive+FH_MAGIC) != VC_MAGIC) return NULL;
+    if (rd_u32m(archive+FH_VER) != VC_VERSION) return NULL;
+    if (rd_u32m(archive+FH_ATOM) != VC_ATOM) return NULL;
+    if (rd_u32m(archive+FH_LAYOUT) != VC_LAYOUT_SPARSE2) return NULL;
+    if (rd_u32m(archive+FH_RGN) != R_ATOMS) return NULL;
+    u32 nlod = rd_u32m(archive+FH_NLOD);
+    if (nlod == 0 || nlod > VC_NLOD) return NULL;
+    u64 l1_off = rd_u64m(archive+FH_L1OFF);
+    u64 l1_cap = rd_u64m(archive+FH_L1CAP);
+    if (l1_cap == 0 || (l1_cap & (l1_cap-1))) return NULL;   // power of two
+    if (l1_off > len || l1_cap > (len - l1_off) / L1_ENTRY) return NULL;
     vc_archive *a = (vc_archive *)vc_xcalloc(1, sizeof(*a));
-    a->buf = archive; a->len = len; a->nmembers = nm;
-    const u8 *e = dir + 4;
-    const u64 MIN_HDR = 9u*4u + 4u + 8u; // 9×u32 dims + f32 base_q + u64 pay_base
-    for (u32 i = 0; i < nm; ++i) {
-        u64 ro = rd_u64(e); e += 8;
-        u64 ml = rd_u64(e); e += 8;
-        // member must lie within the archive and have room for its header
-        if (ro > len || ml > len - ro || ml < MIN_HDR) { free(a); return NULL; }
-        a->members[i] = archive + ro;
-        a->recs[i].rel_offset = ro;
-        a->recs[i].length = ml;
-        parse_member_header(a->members[i], &a->recs[i]);
-        member_rec *r = &a->recs[i];
-        // sanity-check parsed geometry: atom/chunk counts consistent and bounded,
-        // pay_base within the member. Rejects corrupt headers before any decode.
-        if (r->acx==0||r->acy==0||r->acz==0||r->ccx==0||r->ccy==0||r->ccz==0) { free(a); return NULL; }
-        if ((u64)r->acx > 1u<<20 || (u64)r->acy > 1u<<20 || (u64)r->acz > 1u<<20) { free(a); return NULL; }
-        if (r->pay_base > ml) { free(a); return NULL; }
-    }
+    a->buf = archive; a->len = len; a->nlod = (int)nlod;
+    a->dims0.nx = rd_u32m(archive+FH_NX);
+    a->dims0.ny = rd_u32m(archive+FH_NY);
+    a->dims0.nz = rd_u32m(archive+FH_NZ);
+    a->l1_off = l1_off; a->l1_cap = l1_cap;
+    for (int l=0;l<VC_NLOD;++l) a->base_q[l] = rd_f32m(archive+FH_BASEQ+l*4);
     return a;
 }
 void vc_close(vc_archive *a) { free(a); }
 
 vc_status vc_lod_dims(const vc_archive *a, int lod, vc_dims *out) {
-    if (!a || lod < 0 || (u32)lod >= a->nmembers || !out) return VC_ERR_RANGE;
-    out->nx = a->recs[lod].nx; out->ny = a->recs[lod].ny; out->nz = a->recs[lod].nz;
+    if (!a || lod < 0 || lod >= a->nlod || !out) return VC_ERR_RANGE;
+    *out = lod_dims_of(a->dims0, lod);
     return VC_OK;
 }
 
-// Locate the directory entry for an atom (member-relative). Returns offset of
-// the 16-byte dir record within the member, plus parsed fields.
-static const u8 *member_dir_base(const u8 *m, const member_rec *r) {
-    (void)r;
-    return m + 9*4 + 4 + 8; // after 9 u32 + f32 base_q + u64 pay_base
+// Look up the L2 block ref for a region (read-only). 0 = absent, else block_ref
+// (possibly VC_ZERO_REGION).
+static u64 reader_block(const vc_archive *a, u64 key) {
+    u64 mask = a->l1_cap - 1;
+    u64 i = mix64(key) & mask;
+    for (;;) {
+        const u8 *e = a->buf + a->l1_off + i*L1_ENTRY;
+        u64 bref = rd_u64m(e + 8);
+        if (bref == 0) return 0;
+        if (rd_u64m(e) == key) return bref;
+        i = (i + 1) & mask;
+    }
 }
-// Size of one chunk's dir block: 4 (n_atoms) + n_atoms*16.
-static vc_status find_atom_entry(const u8 *m, const member_rec *r,
-                                 u32 ax, u32 ay, u32 az,
-                                 u64 *off, u32 *len, u8 *flags, u8 *uval, u8 *dc) {
-    if (ax >= r->acx || ay >= r->acy || az >= r->acz) return VC_ERR_RANGE;
-    u32 cx = ax / CHUNK_ATOMS, cy = ay / CHUNK_ATOMS, cz = az / CHUNK_ATOMS;
-    u32 lx = ax % CHUNK_ATOMS, ly = ay % CHUNK_ATOMS, lz = az % CHUNK_ATOMS;
-    // Walk chunks in raster order up to target, accumulating implicit payload
-    // offset. Every read is bounds-checked against the member end `mend` so a
-    // corrupt directory (huge n_atoms, truncated member) returns an error rather
-    // than reading out of bounds. Each atom entry is 8 bytes.
-    const u8 *p = member_dir_base(m, r);
-    const u8 *mend = m + r->length;            // one past the member's last byte
-    if (p > mend) return VC_ERR_FORMAT;
-    u32 target = (cz*r->ccy + cy)*r->ccx + cx;
-    u64 cum = 0; // cumulative payload bytes before target chunk
-    for (u32 ci = 0; ci < target; ++ci) {
-        if (p + 4 > mend) return VC_ERR_FORMAT;
-        u32 na = rd_u32(p); p += 4;
-        if (na == 0xFFFFFFFFu) continue; // ABSENT chunk: no entries, no payload
-        if ((u64)na * 8u > (u64)(mend - p)) return VC_ERR_FORMAT;
-        for (u32 k = 0; k < na; ++k) cum += rd_u32(p + (u64)k*8);
-        p += (u64)na * 8;
-    }
-    if (p + 4 > mend) return VC_ERR_FORMAT;
-    u32 na = rd_u32(p); p += 4;
-    if (na == 0xFFFFFFFFu) { // target chunk ABSENT
-        *off = ABSENT; *len = 0; *flags = AF_ABSENT; *uval = 0; *dc = 0;
-        return VC_OK;
-    }
-    if ((u64)na * 8u > (u64)(mend - p)) return VC_ERR_FORMAT;
-    // local atom index within chunk: need chunk's atom extents
-    u32 ax0 = cx*CHUNK_ATOMS, ay0 = cy*CHUNK_ATOMS;
-    u32 axn = r->acx - ax0; if (axn > CHUNK_ATOMS) axn = CHUNK_ATOMS;
-    u32 ayn = r->acy - ay0; if (ayn > CHUNK_ATOMS) ayn = CHUNK_ATOMS;
-    u32 ai = (lz*ayn + ly)*axn + lx;
-    if (ai >= na) return VC_ERR_RANGE;
-    // accumulate lengths of atoms before ai within this chunk
-    for (u32 k = 0; k < ai; ++k) cum += rd_u32(p + (u64)k*8);
-    const u8 *e = p + (u64)ai * 8;
-    *len = rd_u32(e);
-    *flags = e[4]; *uval = e[5]; *dc = e[6];
-    *off = (*flags & (AF_UNIFORM|AF_ABSENT)) ? ABSENT : (r->pay_base + cum);
-    return VC_OK;
+
+// Resolve an atom's slot: returns flags, and (offset,len,dc) for PRESENT.
+static u8 resolve_atom(const vc_archive *a, int lod, u32 az, u32 ay, u32 ax,
+                       u64 *off, u32 *len, u8 *dc) {
+    u64 key = region_key(lod, az/R_ATOMS, ay/R_ATOMS, ax/R_ATOMS);
+    u64 blk = reader_block(a, key);
+    if (blk == 0) return AF_ABSENT;
+    if (blk == VC_ZERO_REGION) return AF_ZERO;
+    if (blk + L2_BLOCK_BYTES > a->len) return AF_ABSENT; // corrupt guard
+    const u8 *slot = a->buf + blk + slot_index(az,ay,ax)*ATOM_SLOT;
+    // ACQUIRE-load the commit word (offset) before trusting the other fields.
+    u64 o = rd_u64m(slot);
+    atomic_thread_fence(memory_order_acquire);
+    u8 flags = slot[12];
+    if (flags == AF_PRESENT) { *off = o; *len = rd_u32m(slot+8); *dc = slot[13]; }
+    return flags;
 }
 
 vc_status vc_decode_atom(vc_archive *a, int lod, int ax, int ay, int az,
                          u8 out[VC_ATOM3]) {
-    if (!a || lod < 0 || (u32)lod >= a->nmembers || !out) return VC_ERR_RANGE;
-    const member_rec *r = &a->recs[lod];
-    const u8 *m = a->members[lod];
-    u64 off; u32 len; u8 flags, uval, dc;
-    vc_status s = find_atom_entry(m, r, (u32)ax, (u32)ay, (u32)az,
-                                  &off, &len, &flags, &uval, &dc);
-    if (s != VC_OK) return s;
-    if (flags & AF_UNIFORM) { memset(out, uval, A3); return VC_OK; }
-    if (flags & AF_ABSENT)  { memset(out, 0, A3); return VC_OK; }
-    // Validate the payload slice lies fully within the archive before reading
-    // (off/len come from a possibly-corrupt directory; decode_atom_payload reads
-    // pay[0..len-1]). Reject out-of-range slices instead of dereferencing wild.
-    const u8 *pp = m + off;
-    if (len < 1 || pp < a->buf || pp + len > a->buf + a->len) {
-        memset(out, 0, A3); return VC_ERR_FORMAT;
+    if (!a || lod < 0 || lod >= a->nlod || !out) return VC_ERR_RANGE;
+    vc_dims d = lod_dims_of(a->dims0, lod);
+    u32 acx=(d.nx+A-1)/A, acy=(d.ny+A-1)/A, acz=(d.nz+A-1)/A;
+    if ((u32)ax>=acx || (u32)ay>=acy || (u32)az>=acz) return VC_ERR_RANGE;
+    u64 off=0; u32 len=0; u8 dc=0;
+    u8 flags = resolve_atom(a, lod, az, ay, ax, &off, &len, &dc);
+    if (flags == AF_PRESENT) {
+        if (off == ABSENT || len < 1 || off + len > a->len) { memset(out,0,A3); return VC_ERR_FORMAT; }
+        decode_atom_payload(a->buf + off, len, a->base_q[lod], out);
+        return VC_OK;
     }
-    decode_atom_payload(pp, len, r->base_q, out);
+    memset(out, 0, A3);   // ABSENT or ZERO -> zeros
     return VC_OK;
 }
 
+vc_cover vc_atom_coverage(const vc_archive *a, int lod, u32 az, u32 ay, u32 ax) {
+    if (!a || lod < 0 || lod >= a->nlod) return VC_ABSENT;
+    u64 off; u32 len; u8 dc;
+    u8 flags = resolve_atom(a, lod, az, ay, ax, &off, &len, &dc);
+    if (flags == AF_PRESENT) return VC_PRESENT;
+    if (flags == AF_ZERO)    return VC_KNOWN_ZERO;
+    return VC_ABSENT;
+}
 
-vc_status vc_decode_lod(vc_archive *a, int lod, u8 *out_vol, vc_dims *out_dims) {
-    if (!a || lod < 0 || (u32)lod >= a->nmembers || !out_vol) return VC_ERR_RANGE;
-    const member_rec *r = &a->recs[lod];
-    if (out_dims) { out_dims->nx = r->nx; out_dims->ny = r->ny; out_dims->nz = r->nz; }
-    // Coarse multithread: atoms are FULLY independent (each decodes standalone
-    // into a distinct output region; vc_decode_atom uses thread-local scratch and
-    // no deblock means no cross-atom dependency). One flat parallel-for over the
-    // atom grid. Compiles to single-thread when OpenMP is absent (VC_OPENMP off).
-    const u64 natoms = (u64)r->acz * r->acy * r->acx;
-    const u32 acyx = r->acy * r->acx;
-    volatile vc_status err = VC_OK;
-    #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
-    #endif
-    for (u64 ai = 0; ai < natoms; ++ai) {
-        if (err != VC_OK) continue;
-        u32 az = (u32)(ai / acyx), rem = (u32)(ai % acyx);
-        u32 ay = rem / r->acx, ax = rem % r->acx;
-        u8 atom[A3];
-        vc_status s = vc_decode_atom(a, lod, (int)ax, (int)ay, (int)az, atom);
-        if (s != VC_OK) { err = s; continue; }
-        for (u32 z = 0; z < A; ++z) { u32 vz = az*A + z; if (vz >= r->nz) break;
-        for (u32 y = 0; y < A; ++y) { u32 vy = ay*A + y; if (vy >= r->ny) break;
-        for (u32 x = 0; x < A; ++x) { u32 vx = ax*A + x; if (vx >= r->nx) break;
-            out_vol[((size_t)vz*r->ny + vy)*r->nx + vx] = atom[(z*A + y)*A + x];
-        }}}
+// Build a transient reader view over the writer's live map. Caller must hold the
+// writer's lock (shared is enough) so the map can't move underfoot.
+static vc_archive writer_view(vc_writer *w) {
+    vc_archive a;
+    a.buf = w->map; a.len = w->map_len; a.dims0 = w->dims0; a.nlod = w->nlod;
+    a.l1_off = rd_u64m(w->map + FH_L1OFF);
+    a.l1_cap = rd_u64m(w->map + FH_L1CAP);
+    for (int l=0;l<VC_NLOD;++l) a.base_q[l] = atomic_load_explicit(&w->base_q[l], memory_order_acquire);
+    return a;
+}
+
+// Decode an already-written atom back from the writer (used to cascade the LOD
+// pyramid: read a lower LOD, downscale, write the next). Reads under the shared
+// lock so concurrent appends (which may remap) are safe.
+vc_status vc_writer_decode_atom(vc_writer *w, int lod, u32 az, u32 ay, u32 ax,
+                                u8 out[VC_ATOM3]) {
+    if (!w || lod < 0 || lod >= w->nlod || !out) return VC_ERR_RANGE;
+    pthread_rwlock_rdlock(&w->lock);
+    vc_archive a = writer_view(w);
+    vc_status s = vc_decode_atom(&a, lod, (int)ax, (int)ay, (int)az, out);
+    pthread_rwlock_unlock(&w->lock);
+    return s;
+}
+
+// Coverage of an already-written atom in the writer (PRESENT/KNOWN_ZERO/ABSENT).
+vc_cover vc_writer_coverage(vc_writer *w, int lod, u32 az, u32 ay, u32 ax) {
+    if (!w || lod < 0 || lod >= w->nlod) return VC_ABSENT;
+    pthread_rwlock_rdlock(&w->lock);
+    vc_archive a = writer_view(w);
+    vc_cover c = vc_atom_coverage(&a, lod, az, ay, ax);
+    pthread_rwlock_unlock(&w->lock);
+    return c;
+}
+
+// Batched decode of a 2x2x2 block of source atoms with the base coords
+// (az0,ay0,ax0) (must be even). Takes the shared lock ONCE and decodes all 8
+// (vs 8-16 lock ops), which is what makes the cascade scale. `out8` is 8 atoms
+// in (dz,dy,dx) order; absent/zero atoms are zeroed. *any set if any present.
+vc_status vc_writer_decode_2x2x2(vc_writer *w, int lod, u32 az0, u32 ay0, u32 ax0,
+                                 u8 out8[8][VC_ATOM3], int *any) {
+    if (!w || lod < 0 || lod >= w->nlod || !out8) return VC_ERR_RANGE;
+    int a_any = 0;
+    pthread_rwlock_rdlock(&w->lock);
+    vc_archive a = writer_view(w);
+    vc_dims d = lod_dims_of(a.dims0, lod);
+    u32 acx=(d.nx+A-1)/A, acy=(d.ny+A-1)/A, acz=(d.nz+A-1)/A;
+    for (int dz=0; dz<2; ++dz) for (int dy=0; dy<2; ++dy) for (int dx=0; dx<2; ++dx) {
+        int idx = (dz*2+dy)*2+dx;
+        u32 az=az0+dz, ay=ay0+dy, ax=ax0+dx;
+        u8 *o = out8[idx];
+        if (az>=acz||ay>=acy||ax>=acx) { memset(o,0,A3); continue; }
+        u64 off=0; u32 len=0; u8 dc=0;
+        u8 fl = resolve_atom(&a, lod, az, ay, ax, &off, &len, &dc);
+        if (fl == AF_PRESENT && off!=ABSENT && len>=1 && off+len<=a.len) {
+            decode_atom_payload(a.buf+off, len, a.base_q[lod], o); a_any=1;
+        } else memset(o,0,A3);  // ABSENT/ZERO -> zeros
     }
-    return err;
+    pthread_rwlock_unlock(&w->lock);
+    if (any) *any = a_any;
+    return VC_OK;
 }
 
 vc_status vc_decode_region(vc_archive *a, int lod, vc_box box, u8 *out) {
-    if (!a || lod < 0 || (u32)lod >= a->nmembers || !out) return VC_ERR_RANGE;
-    const member_rec *r = &a->recs[lod];
-    if (box.x1 > r->nx || box.y1 > r->ny || box.z1 > r->nz) return VC_ERR_RANGE;
+    if (!a || lod < 0 || lod >= a->nlod || !out) return VC_ERR_RANGE;
+    vc_dims d = lod_dims_of(a->dims0, lod);
+    if (box.x1 > d.nx || box.y1 > d.ny || box.z1 > d.nz) return VC_ERR_RANGE;
     if (box.x0 >= box.x1 || box.y0 >= box.y1 || box.z0 >= box.z1) return VC_ERR_RANGE;
-    u32 ox = box.x1 - box.x0, oy = box.y1 - box.y0;
+    u32 ox = box.x1-box.x0, oy = box.y1-box.y0;
     u8 atom[A3];
-    u32 ax0 = box.x0 / A, ax1 = (box.x1 - 1) / A;
-    u32 ay0 = box.y0 / A, ay1 = (box.y1 - 1) / A;
-    u32 az0 = box.z0 / A, az1 = (box.z1 - 1) / A;
-    for (u32 az = az0; az <= az1; ++az)
-    for (u32 ay = ay0; ay <= ay1; ++ay)
-    for (u32 ax = ax0; ax <= ax1; ++ax) {
-        vc_status s = vc_decode_atom(a, lod, (int)ax, (int)ay, (int)az, atom);
+    u32 ax0=box.x0/A, ax1=(box.x1-1)/A, ay0=box.y0/A, ay1=(box.y1-1)/A, az0=box.z0/A, az1=(box.z1-1)/A;
+    for (u32 az=az0; az<=az1; ++az)
+    for (u32 ay=ay0; ay<=ay1; ++ay)
+    for (u32 ax=ax0; ax<=ax1; ++ax) {
+        vc_status s = vc_decode_atom(a, lod, (int)ax,(int)ay,(int)az, atom);
         if (s != VC_OK) return s;
-        for (u32 z = 0; z < A; ++z) { u32 vz = az*A + z; if (vz < box.z0 || vz >= box.z1) continue;
-        for (u32 y = 0; y < A; ++y) { u32 vy = ay*A + y; if (vy < box.y0 || vy >= box.y1) continue;
-        for (u32 x = 0; x < A; ++x) { u32 vx = ax*A + x; if (vx < box.x0 || vx >= box.x1) continue;
-            out[((size_t)(vz-box.z0)*oy + (vy-box.y0))*ox + (vx-box.x0)] = atom[(z*A + y)*A + x];
+        for (u32 z=0; z<A; ++z){ u32 vz=az*A+z; if(vz<box.z0||vz>=box.z1) continue;
+        for (u32 y=0; y<A; ++y){ u32 vy=ay*A+y; if(vy<box.y0||vy>=box.y1) continue;
+        for (u32 x=0; x<A; ++x){ u32 vx=ax*A+x; if(vx<box.x0||vx>=box.x1) continue;
+            out[((size_t)(vz-box.z0)*oy + (vy-box.y0))*ox + (vx-box.x0)] = atom[(z*A+y)*A+x];
         }}}
     }
-    // No deblock (dropped — see vc_decode_lod). Region output is exactly the
-    // per-atom decode scattered into place.
     return VC_OK;
 }
 
-// ---------------------------------------------------------------------------
-// Benchmark-only encode hooks (compiled only with -DVC_BENCH). Reuse the same
-// internal pipeline as vc_encode; the only difference is they expose / accept
-// the per-LOD base_q so the cost of the rate-search bisection can be separated
-// from the cost of the actual single-pass encode.
-// ---------------------------------------------------------------------------
-#ifdef VC_BENCH
-// Optional per-LOD progress hook (bench-only). Called after each LOD member is
-// encoded: (lod, dims, chosen q, member bytes, raw voxels of that LOD).
-void (*vc_bench_lod_cb)(int lod, vc_dims d, float q, u64 member_bytes, u64 raw) = NULL;
-// Cap the number of LODs encoded (bench-only). 0 = all VC_NLOD. Set to 1 to
-// measure native-resolution LOD0 only (LODs are independent, so this is just
-// "encode the one member we score" — no pyramid).
-int vc_bench_max_lods = 0;
-static vc_status vc_bench_encode_impl(const u8 *vol, vc_dims dims,
-                                      float target_ratio, const float *qin,
-                                      u8 **out_archive, size_t *out_len,
-                                      float qout[VC_NLOD], int *nlod_out) {
-    build_tables();
-    bbuf arc = {0};
-    bb_u32(&arc, VC_MAGIC);
-    bb_u32(&arc, VC_VERSION);
-    bb_u32(&arc, VC_ATOM);
-    bb_u32(&arc, CHUNK_ATOMS);
-    member_rec recs[VC_NLOD];
-    int nmembers = 0;
-    u8 *cur = (u8 *)vol; vc_dims cd = dims;
-    u8 *owned = NULL;
-    for (int lod = 0; lod < VC_NLOD; ++lod) {
-        float q = qin ? qin[nmembers] : pick_q_for_ratio(cur, cd, target_ratio);
-        if (qout) qout[nmembers] = q;
-        encode_member(cur, cd, q, &arc, &recs[nmembers]);
-        if (vc_bench_lod_cb)
-            vc_bench_lod_cb(lod, cd, q, recs[nmembers].length,
-                            (u64)cd.nx * cd.ny * cd.nz);
-        nmembers++;
-        if (cd.nx <= 1 && cd.ny <= 1 && cd.nz <= 1) break;
-        if (vc_bench_max_lods && nmembers >= vc_bench_max_lods) break;
-        vc_dims nd; u8 *nv = downsample2x(cur, cd, &nd);
-        if (owned) free(owned);
-        owned = nv; cur = nv; cd = nd;
+// ===========================================================================
+// Test-only helpers (not part of the public API; used by tests to form LODs).
+// ===========================================================================
+#ifdef VC_TESTHOOKS
+u8 *vc_test_downsample2x(const u8 *vol, vc_dims in, vc_dims *out);
+u8 *vc_test_downsample2x(const u8 *vol, vc_dims in, vc_dims *out) {
+    u32 ox=(in.nx+1)/2, oy=(in.ny+1)/2, oz=(in.nz+1)/2;
+    if(!ox)ox=1;
+    if(!oy)oy=1;
+    if(!oz)oz=1;
+    u8 *o=(u8*)vc_xmalloc((size_t)ox*oy*oz);
+    for(u32 z=0;z<oz;++z)for(u32 y=0;y<oy;++y)for(u32 x=0;x<ox;++x){
+        u32 x0=x*2,y0=y*2,z0=z*2,acc=0,n=0;
+        for(u32 dz=0;dz<2;++dz){u32 zz=z0+dz;if(zz>=in.nz)continue;
+        for(u32 dy=0;dy<2;++dy){u32 yy=y0+dy;if(yy>=in.ny)continue;
+        for(u32 dx=0;dx<2;++dx){u32 xx=x0+dx;if(xx>=in.nx)continue;
+            acc+=vol[((size_t)zz*in.ny+yy)*in.nx+xx];n++;}}}
+        o[((size_t)z*oy+y)*ox+x]=(u8)((acc+n/2)/(n?n:1));
     }
-    if (owned) free(owned);
-    u64 dir_off = arc.len;
-    bb_u32(&arc, (u32)nmembers);
-    for (int i = 0; i < nmembers; ++i) {
-        bb_u64(&arc, recs[i].rel_offset);
-        bb_u64(&arc, recs[i].length);
-    }
-    u64 dir_len = arc.len - dir_off;
-    bb_align(&arc, 8);
-    bb_u64(&arc, dir_off);
-    bb_u64(&arc, dir_len);
-    bb_u32(&arc, VC_VERSION);
-    bb_u32(&arc, VC_MAGIC);
-    *out_archive = arc.p; *out_len = arc.len;
-    if (nlod_out) *nlod_out = nmembers;
-    return VC_OK;
+    out->nx=ox;out->ny=oy;out->nz=oz; return o;
 }
-vc_status vc_bench_encode_full(const u8 *vol, vc_dims dims, float target_ratio,
-                               u8 **out_archive, size_t *out_len,
-                               float qout[VC_NLOD], int *nlod_out) {
-    return vc_bench_encode_impl(vol, dims, target_ratio, NULL,
-                                out_archive, out_len, qout, nlod_out);
-}
-vc_status vc_bench_encode_singlepass(const u8 *vol, vc_dims dims,
-                                     const float qin[VC_NLOD], int nlod,
-                                     u8 **out_archive, size_t *out_len) {
-    (void)nlod;
-    return vc_bench_encode_impl(vol, dims, 0.0f, qin,
-                                out_archive, out_len, NULL, NULL);
-}
-// Encode ONE 16^3 atom at base_q `q`; return payload bytes and (optionally)
-// reconstruct it into `recon`. Used to measure per-block-q vs global-q quality
-// at equal bytes, without touching the archive format. Returns the EXACT bytes
-// the real codec would spend on this atom (uniform atoms cost 0 payload bytes).
-void vc_bench_reset_tables(void) { g_tables_ready = 0; build_tables(); }
-u32 vc_bench_atom_rt(const u8 vox[VC_ATOM3], float q, u8 recon[VC_ATOM3]) {
+
+// Encode one 32^3 atom at an explicit q, return payload bytes, and (optionally)
+// reconstruct it into `recon`. For calibration sweeps / floor analysis.
+u32 vc_test_atom_rt(const u8 vox[VC_ATOM3], float q, u8 *recon);
+u32 vc_test_atom_rt(const u8 vox[VC_ATOM3], float q, u8 *recon) {
     build_tables();
-    bbuf pay = {0}; int uni; u8 uval, dcv;
-    u32 len = encode_atom(vox, q, &pay, &uni, &uval, &dcv);
-    if (uni) { if (recon) memset(recon, uval, A3); free(pay.p); return 0; }
-    if (recon) decode_atom_payload(pay.p, pay.len, q, recon);
+    bbuf pay = {0}; int z=0; u8 dc=0;
+    u32 len = encode_atom(vox, q, &pay, &z, &dc);
+    if (z) { if (recon) memset(recon, 0, A3); free(pay.p); return 0; }
+    if (recon) decode_atom_payload(pay.p, len, q, recon);
     free(pay.p);
     return len;
 }
 #endif
-
-
