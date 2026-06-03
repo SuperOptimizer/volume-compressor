@@ -57,26 +57,36 @@ Occupancy is sparse over the address space but dense and clustered where present
 therefore a sparse map of regions, each pointing to a dense block of atom slots.
 
 ### Level 1 — region hash table (open-addressed, linear probe)
-Keyed on region. One entry per touched region (few). Mutated in place. Grows by
-rehashing into a fresh table at EOF when load exceeds ~70% (rare; L1 is small).
+Keyed on region. One entry per touched region (few). Mutated in place. The table
+is **preallocated** from the LOD0 dims at create time, sized so it can hold every
+possible region without ever exceeding load — so on the normal path it **never
+rehashes** and the base never moves, which is what makes the writer lock-free
+(§7). A legacy rehash-on-grow path exists for completeness but is not used by the
+lock-free region create/zero path.
 
     L1 entry (16B): [u64 region_key][u64 block_ref]
-      block_ref == 0            → region never inserted   (ABSENT: unknown)
-      block_ref == ZERO_REGION  → known all-zero region   (no L2 block)
-      else                      → byte offset of the dense L2 block
+      block_ref == 0               → region never inserted    (ABSENT: unknown)
+      block_ref == ZERO_REGION (1) → known all-zero region    (no L2 block)
+      block_ref == CLAIMED (2)     → transient: a thread won the CAS and is
+                                     allocating the block right now; readers/other
+                                     writers for this key spin until it resolves
+      else                         → byte offset of the dense L2 block
 
 ### Level 2 — dense block per populated region
 `R³` fixed slots, direct-indexed by local coord — no hashing, no probing.
-Allocated (zeroed) at EOF the first time any atom in the region is touched.
+Allocated (zeroed) at EOF the first time any atom in the region is touched —
+allocated ONLY by the thread that wins the region's CAS claim, so a lost race
+wastes no disk block (the file size is deterministic and minimal).
 
     slot index = (lz*R + ly)*R + lx
-    slot (16B): [u64 offset][u32 len][u8 flags][u8 uval][u8 dc][u8 pad]
-      flags == AF_ABSENT (0)  → unwritten           (ABSENT: unknown)
-      flags &  AF_ZERO        → known-zero atom, no payload
-      flags &  AF_UNIFORM     → uniform `uval`, no payload
-      else                    → real payload at `offset`, `len` bytes
+    slot (16B): [u64 offset][u32 len][u8 flags][u8 dc][u16 pad]
+      flags == AF_ABSENT  (0)  → unwritten              (ABSENT: unknown)
+      flags == AF_PRESENT (1)  → real payload at `offset`, `len` bytes; `dc` = DC
+      flags == AF_ZERO    (2)  → known-zero atom, no payload  (KNOWN_ZERO)
 
-`offset` is the atomic commit word (§7).
+There is NO uniform-fill state: the only "no payload" case is AF_ZERO (a whole-
+zero atom), since real volume data is never near-uniform. `offset` is the atomic
+commit word (§7); `dc` carries the atom's DC term for AF_PRESENT slots.
 
 --------------------------------------------------------------------------------
 ## 5. Coverage: known-zero vs not-yet-downloaded
@@ -98,7 +108,7 @@ first-class state — a block can exist while some of its slots stay ABSENT):
     2. block_ref == ZERO_REGION       → KNOWN_ZERO   (all atoms in region known 0)
     3. block present, slot AF_ABSENT  → ABSENT       (atom unknown)
     4. block present, slot AF_ZERO    → KNOWN_ZERO   (atom known 0)
-    5. block present, real/uniform    → PRESENT
+    5. block present, slot AF_PRESENT → PRESENT       (real payload)
 
 Exposed without decoding via `vc_atom_coverage` (§9).
 
@@ -107,9 +117,12 @@ Exposed without decoding via `vc_atom_coverage` (§9).
 
     [file header]   magic, version, atom=32, layout=SPARSE2, R, lod0 dims
     [index header]  base_q[8], L1 capacity, L1 count, L1 table offset, write cursor
-    [L1 hash table] capacity × 16B                  ← mutated in place
+    [L1 hash table] capacity × 16B                  ← preallocated, mutated in place
     [L2 blocks + atom payloads, interleaved]        ← append at EOF, never rewritten
-    [trailer]       points at the index header; magic
+
+There is NO trailer/footer: the single index header at the front is authoritative,
+and the L1 table + all blocks are reachable from it. An archive is fully described
+by its header — readers `vc_open` it and resolve coverage/payloads via the index.
 
 All multi-byte fields little-endian. The header validates magic/version/atom/
 layout/R on open and rejects a mismatch (the codec misdecodes silently across a
@@ -119,21 +132,31 @@ different atom size, so this guard is mandatory).
 ## 7. Concurrency (multi-thread, single-process)
 
 In-process only; multi-process is NOT supported. All access goes through the
-API — consumers poking the mmap directly is unsupported and discouraged. One
-RW-lock per open archive plus atomic publish:
+API — consumers poking the mmap directly is unsupported and discouraged. The
+writer is **lock-free on the common path**: the L1 table is preallocated and
+never rehashes, and the file is one fixed huge `MAP_NORESERVE` reservation whose
+base never moves (it only grows via `ftruncate`), so no operation needs to move
+the mapping. Publication is by atomic CAS + release/acquire ordering:
 
-- **READ** — shared lock; readers run concurrently.
-- **APPEND into an existing block** — shared lock; reserve an EOF payload range
-  by atomic `fetch_add` on the write cursor (writers fill disjoint ranges in
-  parallel), write all slot fields, then RELEASE-store the slot's 8-byte
-  `offset` LAST as the commit word. Readers ACQUIRE-load `offset` and see either
-  ABSENT or a fully-written slot — never a torn one.
-- **STRUCTURAL ops** (allocate an L2 block, rehash L1, grow/remap the file) —
-  EXCLUSIVE lock. Rare relative to atom appends. File growth + remap is hidden
-  behind this lock inside the API.
+- **READ** — lock-free. ACQUIRE-load the L1 `block_ref` and the slot `offset`;
+  a reader sees either ABSENT or a fully-written slot, never a torn one.
+- **APPEND a payload** — reserve a disjoint EOF range by atomic `fetch_add` on
+  the write cursor (parallel writers fill disjoint ranges), write all slot fields,
+  then RELEASE-store the slot's 8-byte `offset` LAST as the commit word.
+- **CREATE a region** (allocate its L2 block) — two-phase lock-free claim:
+  CAS-publish a transient `CLAIMED` sentinel into the empty L1 bucket; only the
+  CAS winner then allocates+zeros the block and RELEASE-stores its real offset.
+  Losers (and concurrent readers) spin on `CLAIMED` until the offset appears.
+  Because the block is allocated only after winning, a lost race wastes no disk
+  block → the file size is deterministic and minimal.
+- **GROW the file** — the one place a short mutex (`grow_mu`) is taken, to
+  serialize `ftruncate`. On the fixed huge map (Linux) the base pointer does not
+  move, so no remap and no reader coordination is needed. (A non-fixed-map
+  fallback that munmap/mmaps exists for platforms without the huge reservation;
+  there a per-open rwlock guards the remap. The Linux EC2 path is fixed-map.)
 
-Single API surface (no separate single-threaded variant — the shared-lock read
-path is effectively free).
+Single API surface (no separate single-threaded variant — the lock-free read and
+append paths are already contention-free).
 
 --------------------------------------------------------------------------------
 ## 8. Lifecycle: write-once, append-only
@@ -148,36 +171,30 @@ format reserves nothing for it.)
 --------------------------------------------------------------------------------
 ## 9. Rate control / base_q
 
-One `base_q` per LOD, stored in `base_q[8]` in the index header. It must be set
-before any atom of the LOD is stored, since the reader decodes every atom of a
-LOD with that single base_q. Two ways:
+One `base_q` per LOD, stored in `base_q[8]` in the index header, set explicitly
+via `vc_set_base_q(w, lod, q)` BEFORE any atom of that LOD is stored (the reader
+decodes every atom of a LOD with that single base_q).
 
-  - Explicit (recommended for export): `vc_set_base_q(w, lod, q)` before the
-    first append. The producer calibrates offline — sample many present atoms,
-    bracket the target ratio on a coarse q ladder, then log-interpolate
-    (~3 measurements; log(ratio) ≈ linear in log(q)). Seeding each LOD's bracket
-    from the previous LOD's q converges later LODs in 1–2 tries.
-  - Auto: if left unset, the writer freezes q from the FIRST non-zero atom of the
-    LOD. Cheap but a single-atom estimate is noisy — prefer explicit for quality.
+There is **NO calibration** — no offline sampling, no auto-q-from-first-atom. The
+caller chooses q directly and, if the achieved ratio isn't what it wants, re-runs
+with a different q0 (in practice 1–3 runs). The exporter uses a simple per-level
+rule `q[l] = q0 * falloff^l` with caller-supplied `q0` and `falloff`. q is floored
+at 0.05.
 
 CRITICAL — the ratio is measured over PRESENT (non-zero) atoms ONLY. Zero/mask
-atoms (usually the majority — a scroll is a blob in a large zero-padded box)
-never enter calibration, so the mask does NOT inflate the achieved ratio. "10x"
-means 10x on real material. (A "vs full raw" number IS mask-inflated and is
-informational only.)
+atoms (usually the majority — a scroll is a blob in a large zero-padded box) do
+NOT inflate the achieved ratio. "10x" means 10x on real material. (A "vs full
+raw" number IS mask-inflated and is informational only.)
 
-q floor is 0.05, not 0.5. MEASURED on 45µm scroll data: present-atom ratio is
-~5x at q=0.5 and ~10x at q≈1.0, with valid output down to q≈0.05 (~1.6x). A 0.5
-floor wrongly clamped LOD0 to 5x and collapsed adjacent LODs to identical q.
+MEASURED on 45µm scroll data: present-atom ratio is ~5× at q=0.5 and ~10× at
+q≈1.0, valid down to q≈0.05 (~1.6×).
 
-Per-LOD target ratio: LOD0 dominates the byte budget by far (in a real scroll,
-level 0 ≈ 83% of all bytes; each coarser level is ≥4× smaller). So the overall
-archive ratio is governed almost entirely by LOD0, and compressing coarse LODs
-hard saves a negligible number of bytes while visibly hurting the zoomed-out
-views users see first. The writer therefore targets a LOWER ratio (higher
-quality) at coarser levels — halving the target ratio per level, floored at 1.0
-(near-lossless). The headline ratio is effectively LOD0's; coarse levels get
-their quality back for free.
+Per-LOD quality: LOD0 dominates the byte budget by far (level 0 ≈ 83% of all
+bytes; each coarser level is ≥4× smaller). So the overall ratio is governed
+almost entirely by LOD0, and compressing coarse LODs hard saves negligible bytes
+while visibly hurting the zoomed-out views users see first. So the caller uses a
+`falloff < 1` to give coarser levels HIGHER quality (lower q) — nearly free,
+since those levels are tiny. The headline ratio is effectively LOD0's.
 
 --------------------------------------------------------------------------------
 ## 10. API
@@ -186,22 +203,38 @@ their quality back for free.
 
     vc_writer *vc_create(const char *path, vc_dims lod0_dims, float target_ratio);
 
-    // One 32³ atom at atom coords.
+    // Per-LOD quantizer step. There is NO calibration: the caller sets base_q for
+    // each LOD explicitly (e.g. q[l] = q0 * falloff^l) and re-runs at a different
+    // q0 if the achieved ratio isn't what it wants. `target_ratio` in vc_create is
+    // a nominal header value only; base_q is what actually drives quality.
+    vc_status vc_set_base_q(vc_writer*, int lod, float q);
+
+    // One 32³ atom at atom coords. All-zero input is stored as AF_ZERO (no payload);
+    // a PRESENT atom never decodes to all-zero (that case is folded to AF_ZERO).
     vc_status vc_append_atom(vc_writer*, int lod, uint32_t az, uint32_t ay, uint32_t ax,
                              const uint8_t vox[VC_ATOM3]);
 
     // Arbitrary caller "append box": origin and size MUST be multiples of 32
-    // voxels (splits cleanly into 32³ atoms). Any size (e.g. a downloaded 128³ or
-    // 256³ chunk) at any 32-aligned offset; MAY straddle index-region boundaries
-    // — atoms are scattered into whatever regions they fall in (find-or-create per
-    // region). Callers are fully decoupled from the 1024³ region granularity.
+    // voxels. MAY straddle index-region boundaries — atoms are scattered into
+    // whatever regions they fall in. Callers are decoupled from region granularity.
     vc_status vc_append_box(vc_writer*, int lod, vc_box voxel_box, const uint8_t *voxels);
 
     // Mark known-zero without storing payload (coverage = KNOWN_ZERO).
     vc_status vc_mark_zero_atom(vc_writer*, int lod, uint32_t az, uint32_t ay, uint32_t ax);
     vc_status vc_mark_zero_region(vc_writer*, int lod, uint32_t rz, uint32_t ry, uint32_t rx);
 
+    // Read back from a still-open WRITER (used to build coarse LODs from finer ones
+    // in a single pass without reopening): coverage + decode of already-written
+    // atoms, and a fused 2×2×2-parent decode for downscaling the next level.
+    vc_cover  vc_writer_coverage(vc_writer*, int lod, uint32_t az, uint32_t ay, uint32_t ax);
+    vc_status vc_writer_decode_atom(vc_writer*, int lod, uint32_t az, uint32_t ay, uint32_t ax,
+                                    uint8_t out[VC_ATOM3]);
+    vc_status vc_writer_decode_2x2x2(vc_writer*, int lod, uint32_t az0, uint32_t ay0, uint32_t ax0,
+                                     uint8_t out[/* (2*32)^3 */]);
+
     void vc_writer_close(vc_writer*);
+
+    uint32_t vc_region_atoms(void);   // R in atoms (== 32; region = 1024 voxels)
 
 ### Reader
 
@@ -213,6 +246,8 @@ their quality back for free.
     // Decode one 32³ atom. ABSENT/KNOWN_ZERO → zeros.
     vc_status vc_decode_atom(vc_archive*, int lod, int ax, int ay, int az,
                              uint8_t out[VC_ATOM3]);
+    // Decode an arbitrary 32-aligned box (assembles the covered atoms).
+    vc_status vc_decode_region(vc_archive*, int lod, vc_box box, uint8_t *out);
 
     typedef enum { VC_ABSENT, VC_KNOWN_ZERO, VC_PRESENT } vc_cover;
     vc_cover  vc_atom_coverage(const vc_archive*, int lod,
