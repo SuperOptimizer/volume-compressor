@@ -33,6 +33,9 @@
 #include <string.h>
 #if defined(__unix__) || defined(__APPLE__)
 #include <unistd.h>   /* ftruncate, fileno (sink rewind on retry) */
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/resource.h>   /* setrlimit: raise FD cap for high concurrency */
+#endif
 #endif
 #include <time.h>
 
@@ -117,8 +120,21 @@ static void curl_global_ref(void) {
      * caller proceed while init was still running. Serialize under a mutex so
      * concurrent s3_client_new() (e.g. opening two volumes at once) is safe. */
     pthread_mutex_lock(&g_curl_init_mtx);
-    if (g_curl_refcount++ == 0)
+    if (g_curl_refcount++ == 0) {
         curl_global_init(CURL_GLOBAL_DEFAULT);
+        /* Each concurrent transfer is a socket = an FD. The default soft cap
+         * (often 1024) silently throttles high-concurrency clients: past a few
+         * hundred parallel GETs, socket()/connect() fail with EMFILE and curl
+         * reports CURLE_COULDNT_CONNECT — looks like S3 throttling but is local.
+         * Raise the soft limit toward the hard limit once, at init. */
+#if defined(__unix__) || defined(__APPLE__)
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+            rl.rlim_cur = rl.rlim_max;     /* raise soft to hard (no privilege needed) */
+            setrlimit(RLIMIT_NOFILE, &rl); /* best-effort; ignore failure */
+        }
+#endif
+    }
     pthread_mutex_unlock(&g_curl_init_mtx);
 }
 static void curl_global_unref(void) {
