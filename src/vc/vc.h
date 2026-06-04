@@ -133,6 +133,13 @@ vc_status vc_decode_region(vc_archive *a, int lod, vc_box box, uint8_t *out);
 vc_cover vc_atom_coverage(const vc_archive *a, int lod,
                           uint32_t az, uint32_t ay, uint32_t ax);
 
+// Resolve an atom to its compressed payload byte range [*off,*off+*len) WITHOUT
+// decoding (also returns coverage). Lets a streaming reader fetch exact bytes or a
+// repacker copy payloads verbatim. *off/*len are 0 for ABSENT/KNOWN_ZERO.
+vc_cover vc_atom_payload_range(const vc_archive *a, int lod,
+                               uint32_t az, uint32_t ay, uint32_t ax,
+                               uint64_t *off, uint32_t *len);
+
 // Override the fail-fast panic hook (default aborts).
 void vc_set_panic_hook(void (*hook)(const char *msg));
 

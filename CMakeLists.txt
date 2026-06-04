@@ -129,6 +129,12 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tools/vc_verify.c)
   target_link_libraries(vc_verify PRIVATE vc CURL::libcurl Threads::Threads)
 endif()
 
+# vc_repack: v1 -> v2 container rewrite (region-contiguous + directory). libvc only.
+if(EXISTS ${CMAKE_SOURCE_DIR}/tools/vc_repack.c)
+  add_executable(vc_repack tools/vc_repack.c)
+  target_link_libraries(vc_repack PRIVATE vc Threads::Threads)
+endif()
+
 # --- tests / benches -------------------------------------------------------
 enable_testing()
 if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_vc.c)
@@ -166,4 +172,10 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_streaming.c)
   add_executable(vc_test_streaming tests/test_streaming.c)
   target_link_libraries(vc_test_streaming PRIVATE vc)
   add_test(NAME streaming COMMAND vc_test_streaming)
+endif()
+
+if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_repack.c AND TARGET vc_repack)
+  add_executable(vc_test_repack tests/test_repack.c)
+  target_link_libraries(vc_test_repack PRIVATE vc)
+  add_test(NAME repack COMMAND vc_test_repack $<TARGET_FILE:vc_repack>)
 endif()

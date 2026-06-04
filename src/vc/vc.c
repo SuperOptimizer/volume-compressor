@@ -703,6 +703,20 @@ uint32_t vc_region_atoms(void) { return R_ATOMS; }
 #define FH_BASEQ 72
 #define FILE_HDR 128u
 
+// v2 container: region-contiguous layout + a direct-indexed region directory
+// (no hash). Same 128B header, same MAGIC/ATOM/RGN/NLOD/NX/NY/NZ/TRATIO/BASEQ
+// fields; the v1 L1 fields (40..71) are repurposed. Codec/payloads identical to
+// v1 (vc_repack copies them verbatim). See vc_repack + resolve_atom v2 branch.
+#define VC_VERSION2 2u
+#define FH2_DIROFF  40   // u64: file offset of the region directory
+#define FH2_DIRCNT  48   // u64: directory entry count (== total regions, all LODs)
+#define FH2_TOTLEN  56   // u64: total archive length (bytes)
+// Region directory entry (16B): [u64 blob_off][u32 blob_len][u32 flags]
+#define V2_DIR_ENTRY 16u
+#define V2_RGN_ABSENT 0u   // region never written (no blob)
+#define V2_RGN_ZERO   1u   // whole region known-zero (no blob)
+#define V2_RGN_DATA   2u   // present: blob_off/blob_len point to its [slots|payloads]
+
 // split-mix64 finalizer — good integer hash for the packed region key.
 static inline u64 mix64(u64 x) {
     x += 0x9E3779B97F4A7C15ull;
@@ -722,6 +736,28 @@ static vc_dims lod_dims_of(vc_dims d0, int lod) {
         d.nx = (d.nx + 1) / 2; d.ny = (d.ny + 1) / 2; d.nz = (d.nz + 1) / 2;
     }
     return d;
+}
+
+// v2 region grid: region count per axis at a LOD (1024-voxel regions). Same math
+// as the writer's max_regions tally (atoms = ceil(dim/A); regions = ceil(atoms/R)).
+static void lod_region_grid(vc_dims d0, int lod, u32 *nrz, u32 *nry, u32 *nrx) {
+    vc_dims d = lod_dims_of(d0, lod);
+    *nrx = ((d.nx + A - 1)/A + R_ATOMS - 1)/R_ATOMS;
+    *nry = ((d.ny + A - 1)/A + R_ATOMS - 1)/R_ATOMS;
+    *nrz = ((d.nz + A - 1)/A + R_ATOMS - 1)/R_ATOMS;
+}
+// Linear region index across the whole pyramid (LOD-major, then z,y,x within a
+// LOD). `prefix[lod]` is the running sum of region counts of LODs < lod; build it
+// once with lod_region_prefix. Used to index the v2 directory directly (no hash).
+static u64 lod_region_prefix(vc_dims d0, int nlod, u64 prefix[VC_NLOD + 1]) {
+    u64 acc = 0;
+    for (int l = 0; l < nlod; ++l) {
+        prefix[l] = acc;
+        u32 nrz, nry, nrx; lod_region_grid(d0, l, &nrz, &nry, &nrx);
+        acc += (u64)nrz * nry * nrx;
+    }
+    prefix[nlod] = acc;
+    return acc;   // total region count across all LODs
 }
 static int dims_valid(vc_dims d) {
     return d.nx && d.ny && d.nz &&
@@ -1215,7 +1251,10 @@ struct vc_archive {
     const u8 *buf; size_t len;            // buf==NULL => streaming mode (use read/ud)
     vc_read_fn read; void *read_ud;       // streaming byte source (NULL => flat buf)
     vc_dims dims0; int nlod;
-    u64 l1_off, l1_cap;
+    int version;                          // 1 = v1 (L1 hash), 2 = v2 (region directory)
+    u64 l1_off, l1_cap;                   // v1 only
+    u64 dir_off;                          // v2 only: region directory file offset
+    u64 region_prefix[VC_NLOD + 1];       // v2 only: LOD-major region linear-index base
     float base_q[VC_NLOD];
 };
 
@@ -1240,27 +1279,46 @@ static const u8 *payload_ptr(const vc_archive *a, u64 off, u32 len) {
     return paybuf;
 }
 
+// Parse + validate the 128B header (common to flat and streaming open) into a
+// freshly-zeroed archive `a` whose buf/read/len are already set. Detects v1 vs
+// v2 by FH_VER and fills the version-specific index fields. Returns 0 on success.
+static int archive_parse_header(vc_archive *a, const u8 *hdr, u64 len) {
+    if (rd_u32m(hdr+FH_MAGIC) != VC_MAGIC) return -1;
+    if (rd_u32m(hdr+FH_ATOM)  != VC_ATOM)  return -1;
+    if (rd_u32m(hdr+FH_RGN)   != R_ATOMS)  return -1;
+    u32 ver = rd_u32m(hdr+FH_VER);
+    u32 nlod = rd_u32m(hdr+FH_NLOD);
+    if (nlod == 0 || nlod > VC_NLOD) return -1;
+    a->len = len; a->nlod = (int)nlod;
+    a->dims0.nx = rd_u32m(hdr+FH_NX);
+    a->dims0.ny = rd_u32m(hdr+FH_NY);
+    a->dims0.nz = rd_u32m(hdr+FH_NZ);
+    for (int l=0;l<VC_NLOD;++l) a->base_q[l] = rd_f32m(hdr+FH_BASEQ+l*4);
+    if (ver == VC_VERSION2) {
+        a->version = 2;
+        a->dir_off = rd_u64m(hdr+FH2_DIROFF);
+        u64 dir_cnt = rd_u64m(hdr+FH2_DIRCNT);
+        if (a->dir_off > len || dir_cnt > (len - a->dir_off) / V2_DIR_ENTRY) return -1;
+        u64 total = lod_region_prefix(a->dims0, a->nlod, a->region_prefix);
+        if (total != dir_cnt) return -1;   // directory must cover every region
+        return 0;
+    }
+    if (ver != VC_VERSION) return -1;
+    if (rd_u32m(hdr+FH_LAYOUT) != VC_LAYOUT_SPARSE2) return -1;
+    a->version = 1;
+    a->l1_off = rd_u64m(hdr+FH_L1OFF);
+    a->l1_cap = rd_u64m(hdr+FH_L1CAP);
+    if (a->l1_cap == 0 || (a->l1_cap & (a->l1_cap-1))) return -1;        // power of two
+    if (a->l1_off > len || a->l1_cap > (len - a->l1_off) / L1_ENTRY) return -1;
+    return 0;
+}
+
 vc_archive *vc_open(const u8 *archive, size_t len) {
     build_tables();
     if (!archive || len < FILE_HDR) return NULL;
-    if (rd_u32m(archive+FH_MAGIC) != VC_MAGIC) return NULL;
-    if (rd_u32m(archive+FH_VER) != VC_VERSION) return NULL;
-    if (rd_u32m(archive+FH_ATOM) != VC_ATOM) return NULL;
-    if (rd_u32m(archive+FH_LAYOUT) != VC_LAYOUT_SPARSE2) return NULL;
-    if (rd_u32m(archive+FH_RGN) != R_ATOMS) return NULL;
-    u32 nlod = rd_u32m(archive+FH_NLOD);
-    if (nlod == 0 || nlod > VC_NLOD) return NULL;
-    u64 l1_off = rd_u64m(archive+FH_L1OFF);
-    u64 l1_cap = rd_u64m(archive+FH_L1CAP);
-    if (l1_cap == 0 || (l1_cap & (l1_cap-1))) return NULL;   // power of two
-    if (l1_off > len || l1_cap > (len - l1_off) / L1_ENTRY) return NULL;
     vc_archive *a = (vc_archive *)vc_xcalloc(1, sizeof(*a));
-    a->buf = archive; a->len = len; a->nlod = (int)nlod;
-    a->dims0.nx = rd_u32m(archive+FH_NX);
-    a->dims0.ny = rd_u32m(archive+FH_NY);
-    a->dims0.nz = rd_u32m(archive+FH_NZ);
-    a->l1_off = l1_off; a->l1_cap = l1_cap;
-    for (int l=0;l<VC_NLOD;++l) a->base_q[l] = rd_f32m(archive+FH_BASEQ+l*4);
+    a->buf = archive;
+    if (archive_parse_header(a, archive, len) != 0) { free(a); return NULL; }
     return a;
 }
 
@@ -1273,24 +1331,9 @@ vc_archive *vc_open_streaming(vc_read_fn read, void *ud, uint64_t total_len) {
     if (!read || total_len < FILE_HDR) return NULL;
     u8 hdr[FILE_HDR];
     if (read(ud, 0, FILE_HDR, hdr) != VC_OK) return NULL;
-    if (rd_u32m(hdr+FH_MAGIC) != VC_MAGIC) return NULL;
-    if (rd_u32m(hdr+FH_VER) != VC_VERSION) return NULL;
-    if (rd_u32m(hdr+FH_ATOM) != VC_ATOM) return NULL;
-    if (rd_u32m(hdr+FH_LAYOUT) != VC_LAYOUT_SPARSE2) return NULL;
-    if (rd_u32m(hdr+FH_RGN) != R_ATOMS) return NULL;
-    u32 nlod = rd_u32m(hdr+FH_NLOD);
-    if (nlod == 0 || nlod > VC_NLOD) return NULL;
-    u64 l1_off = rd_u64m(hdr+FH_L1OFF);
-    u64 l1_cap = rd_u64m(hdr+FH_L1CAP);
-    if (l1_cap == 0 || (l1_cap & (l1_cap-1))) return NULL;
-    if (l1_off > total_len || l1_cap > (total_len - l1_off) / L1_ENTRY) return NULL;
     vc_archive *a = (vc_archive *)vc_xcalloc(1, sizeof(*a));
-    a->buf = NULL; a->read = read; a->read_ud = ud; a->len = total_len; a->nlod = (int)nlod;
-    a->dims0.nx = rd_u32m(hdr+FH_NX);
-    a->dims0.ny = rd_u32m(hdr+FH_NY);
-    a->dims0.nz = rd_u32m(hdr+FH_NZ);
-    a->l1_off = l1_off; a->l1_cap = l1_cap;
-    for (int l=0;l<VC_NLOD;++l) a->base_q[l] = rd_f32m(hdr+FH_BASEQ+l*4);
+    a->buf = NULL; a->read = read; a->read_ud = ud;
+    if (archive_parse_header(a, hdr, total_len) != 0) { free(a); return NULL; }
     return a;
 }
 void vc_close(vc_archive *a) { free(a); }
@@ -1317,21 +1360,45 @@ static u64 reader_block(const vc_archive *a, u64 key) {
 }
 
 // Resolve an atom's slot: returns flags, and (offset,len,dc) for PRESENT.
-static u8 resolve_atom(const vc_archive *a, int lod, u32 az, u32 ay, u32 ax,
-                       u64 *off, u32 *len, u8 *dc) {
-    u64 key = region_key(lod, az/R_ATOMS, ay/R_ATOMS, ax/R_ATOMS);
-    u64 blk = reader_block(a, key);
-    if (blk == 0) return AF_ABSENT;
-    if (blk == VC_ZERO_REGION) return AF_ZERO;
-    if (blk + L2_BLOCK_BYTES > a->len) return AF_ABSENT; // corrupt guard
-    u8 slot[ATOM_SLOT];   // [u64 offset][u32 length][u8 flags][u8 dc][u16 pad]
-    if (rd_bytes(a, blk + slot_index(az,ay,ax)*ATOM_SLOT, ATOM_SLOT, slot) != 0) return AF_ABSENT;
-    // ACQUIRE-load the commit word (offset) before trusting the other fields.
+// Read one atom slot at `slot_off` (a 16B [u64 off][u32 len][u8 flags][u8 dc][u16])
+// and unpack a PRESENT atom's payload range. Shared by v1 and v2 resolve paths.
+static u8 resolve_slot(const vc_archive *a, u64 slot_off, u64 *off, u32 *len, u8 *dc) {
+    u8 slot[ATOM_SLOT];
+    if (rd_bytes(a, slot_off, ATOM_SLOT, slot) != 0) return AF_ABSENT;
     u64 o = rd_u64m(slot);
     atomic_thread_fence(memory_order_acquire);
     u8 flags = slot[12];
     if (flags == AF_PRESENT) { *off = o; *len = rd_u32m(slot+8); *dc = slot[13]; }
     return flags;
+}
+
+// v2: locate a region's blob via the direct-indexed directory, then read its slot.
+static u8 resolve_atom_v2(const vc_archive *a, int lod, u32 az, u32 ay, u32 ax,
+                          u64 *off, u32 *len, u8 *dc) {
+    u32 nrz, nry, nrx; lod_region_grid(a->dims0, lod, &nrz, &nry, &nrx);
+    u32 rz = az/R_ATOMS, ry = ay/R_ATOMS, rx = ax/R_ATOMS;
+    if (rz >= nrz || ry >= nry || rx >= nrx) return AF_ABSENT;
+    u64 regidx = a->region_prefix[lod] + ((u64)rz*nry + ry)*nrx + rx;
+    if (regidx >= a->region_prefix[a->nlod]) return AF_ABSENT;
+    u8 ent[V2_DIR_ENTRY];   // [u64 blob_off][u32 blob_len][u32 flags]
+    if (rd_bytes(a, a->dir_off + regidx*V2_DIR_ENTRY, V2_DIR_ENTRY, ent) != 0) return AF_ABSENT;
+    u32 flags = rd_u32m(ent + 12);
+    if (flags == V2_RGN_ABSENT) return AF_ABSENT;
+    if (flags == V2_RGN_ZERO)   return AF_ZERO;
+    u64 blob_off = rd_u64m(ent);
+    if (blob_off + L2_BLOCK_BYTES > a->len) return AF_ABSENT;   // corrupt guard
+    return resolve_slot(a, blob_off + slot_index(az,ay,ax)*ATOM_SLOT, off, len, dc);
+}
+
+static u8 resolve_atom(const vc_archive *a, int lod, u32 az, u32 ay, u32 ax,
+                       u64 *off, u32 *len, u8 *dc) {
+    if (a->version == 2) return resolve_atom_v2(a, lod, az, ay, ax, off, len, dc);
+    u64 key = region_key(lod, az/R_ATOMS, ay/R_ATOMS, ax/R_ATOMS);
+    u64 blk = reader_block(a, key);
+    if (blk == 0) return AF_ABSENT;
+    if (blk == VC_ZERO_REGION) return AF_ZERO;
+    if (blk + L2_BLOCK_BYTES > a->len) return AF_ABSENT; // corrupt guard
+    return resolve_slot(a, blk + slot_index(az,ay,ax)*ATOM_SLOT, off, len, dc);
 }
 
 vc_status vc_decode_atom(vc_archive *a, int lod, int ax, int ay, int az,
@@ -1359,6 +1426,22 @@ vc_cover vc_atom_coverage(const vc_archive *a, int lod, u32 az, u32 ay, u32 ax) 
     u8 flags = resolve_atom(a, lod, az, ay, ax, &off, &len, &dc);
     if (flags == AF_PRESENT) return VC_PRESENT;
     if (flags == AF_ZERO)    return VC_KNOWN_ZERO;
+    return VC_ABSENT;
+}
+
+// Resolve an atom to its on-disk payload byte range WITHOUT decoding (also returns
+// coverage). For a PRESENT atom *off/*len give the compressed payload extent — what
+// a streaming reader must fetch, or what a repacker copies verbatim. 0 for
+// non-PRESENT. In streaming mode the L2 block/slot must be reachable via the read cb.
+vc_cover vc_atom_payload_range(const vc_archive *a, int lod,
+                               u32 az, u32 ay, u32 ax,
+                               uint64_t *off, uint32_t *len) {
+    if (off) *off = 0; if (len) *len = 0;
+    if (!a || lod < 0 || lod >= a->nlod) return VC_ABSENT;
+    u64 o = 0; u32 l = 0; u8 dc = 0;
+    u8 flags = resolve_atom(a, lod, az, ay, ax, &o, &l, &dc);
+    if (flags == AF_PRESENT) { if (off) *off = o; if (len) *len = l; return VC_PRESENT; }
+    if (flags == AF_ZERO) return VC_KNOWN_ZERO;
     return VC_ABSENT;
 }
 
