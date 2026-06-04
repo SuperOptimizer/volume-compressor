@@ -163,7 +163,12 @@ int g_scan_threads = 1;   // worker count for fetching the coarse occupancy leve
 #define CM_OCC_LEVEL 4   // preferred occupancy level: 4/ (16x). Coarser (5/, 32x)
                          // averages faint edge data to zero; 4/ keeps more of the
                          // feathered surface. A 0/ chunk maps to (chunk/16)^3 voxels.
+// Optional separate root for the coarse occupancy level (e.g. a local mirror of
+// just N/ synced ahead of time), so the mask probe reads from fast local disk
+// while voxel data still streams from the (remote) main root. NULL -> use `zarr`.
+const char *g_occ_zarr = NULL;
 static int cm_fill_from_coarse(chunkmap *cm, const char *zarr, const zlevel *z0){
+    if(g_occ_zarr) zarr = g_occ_zarr;   // read the coarse mask level from here
     // Prefer CM_OCC_LEVEL; if it's absent or its factor doesn't tile a 0/ chunk
     // cleanly, fall back to the next-coarsest usable level (then finer).
     int bestL=-1; zlevel cl; u32 f=1;
@@ -579,7 +584,7 @@ static void *monitor_thread(void *arg){
 
 // ------------------------------------------------------------------ main
 int main(int argc, char **argv){
-    if(argc<3){fprintf(stderr,"usage: %s <zarr0> <out.vca> [--ratio R][--threads N][--downscale box|cbox][--alpha A][--mem MB][--tile T]\n",argv[0]);return 2;}
+    if(argc<3){fprintf(stderr,"usage: %s <zarr0> <out.vca> [--q Q][--q-falloff F][--threads N][--downscale box|cbox][--alpha A][--mem MB][--tile T][--occupancy-zarr ROOT][--progress S]\n",argv[0]);return 2;}
     setvbuf(stdout,NULL,_IOLBF,0);
     const char *zarr=argv[1], *out=argv[2];
     float q0=1.0f, qfall=0.5f, alpha=0.5f; int nthreads=0; long mem_mb=1024; int tile_req=0;
@@ -595,6 +600,7 @@ int main(int argc, char **argv){
         else if(!strcmp(argv[i],"--tile")&&i+1<argc)tile_req=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--log-io"))log_io=1;
         else if(!strcmp(argv[i],"--progress")&&i+1<argc)progress_s=atof(argv[++i]);
+        else if(!strcmp(argv[i],"--occupancy-zarr")&&i+1<argc)g_occ_zarr=argv[++i];
     }
     if(nthreads<=0){long n=sysconf(_SC_NPROCESSORS_ONLN);nthreads=n>2?(int)n-1:1;}
 
