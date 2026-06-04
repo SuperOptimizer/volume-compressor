@@ -112,6 +112,15 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tools/vc_export_stream.c)
   target_link_libraries(vc_export_stream PRIVATE vc CURL::libcurl Threads::Threads)
 endif()
 
+if(EXISTS ${CMAKE_SOURCE_DIR}/tools/vc_verify.c)
+  add_executable(vc_verify
+    tools/vc_verify.c
+    tools/third_party/cJSON.c
+    tools/third_party/libs3/libs3.c)
+  target_include_directories(vc_verify PRIVATE tools/third_party/libs3)
+  target_link_libraries(vc_verify PRIVATE vc CURL::libcurl Threads::Threads)
+endif()
+
 # --- tests / benches -------------------------------------------------------
 enable_testing()
 if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_vc.c)

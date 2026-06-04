@@ -42,10 +42,26 @@ typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64;
 // vendored libs3 makes concurrent transfers safe: NOSIGNAL + curl-init mutex).
 static s3_client *g_s3 = NULL;             // NULL until first S3 path seen
 static int src_is_s3(const char *p){ return strncmp(p,"s3://",5)==0; }
+// Per-request credential resolver: cache-served IMDSv2 (EC2 instance role),
+// refreshed before expiry -> safe for multi-hour exports on rotating STS creds.
+static s3_status src_cred_provider(void *ud, s3_credentials *out){
+    (void)ud; return s3_credentials_load(NULL, out);
+}
 static void src_init_s3(void){
     if(g_s3) return;
-    s3_config cfg; memset(&cfg,0,sizeof cfg);   // anonymous (public Vesuvius bucket)
+    s3_config cfg; memset(&cfg,0,sizeof cfg);
     cfg.max_retries=5;
+    // Resolve creds once up front (IMDS/SSO/env) so a misconfigured host fails
+    // loudly here, not mid-stream; empty -> anonymous (public buckets).
+    s3_credentials probe; memset(&probe,0,sizeof probe);
+    if(s3_credentials_load(NULL,&probe)==S3_OK){
+        cfg.cred_provider=src_cred_provider;
+        if(probe.region&&probe.region[0]) cfg.region=strdup(probe.region);
+        s3_credentials_free(&probe);
+        fprintf(stderr,"s3: using resolved credentials (IMDS/SSO/env)\n");
+    } else {
+        fprintf(stderr,"s3: no credentials found; using anonymous access\n");
+    }
     g_s3=s3_client_new(&cfg);
     if(!g_s3){ fprintf(stderr,"s3_client_new failed\n"); exit(1); }
 }
