@@ -27,6 +27,14 @@ endif()
 # and ARM NEON are all reached from the SAME source via this one compiler flag.
 set(VC_MARCH "native" CACHE STRING "target ISA for -march (native|x86-64-v3|x86-64-v4|armv8-a+simd|<empty>)")
 
+# DO NOT add -msve-vector-bits=256 (or 512). On AArch64/SVE both gcc 15 and
+# clang 21 MISCOMPILE at fixed vector width >=256: a UB-free divide/modulo-by-
+# constant + select loop (e.g. the all-zero scan in encode_atom) silently
+# produces wrong results (whole atoms read as zero). Confirmed wrong-code in the
+# SVE fixed-width backend (gcc wires the wrong predicate into the masked store);
+# x86 AVX2/AVX-512 and SVE vector-length-agnostic ("scalable", the default) are
+# all correct. Leave SVE length-agnostic — that is also the idiomatic, fast path.
+
 # Portable single binary via function multiversioning (target_clones): the hot
 # decode kernels are cloned for AVX-512/AVX2/generic and the best is chosen at
 # runtime — ONE binary runs optimally on any x86, no -march needed (decode ~80%
