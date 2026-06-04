@@ -167,6 +167,7 @@ int g_scan_threads = 1;   // worker count for fetching the coarse occupancy leve
 // just N/ synced ahead of time), so the mask probe reads from fast local disk
 // while voxel data still streams from the (remote) main root. NULL -> use `zarr`.
 const char *g_occ_zarr = NULL;
+int g_io_threads = 0;   // downloader-pool size (0 = auto: 2x compute, capped)
 static int cm_fill_from_coarse(chunkmap *cm, const char *zarr, const zlevel *z0){
     if(g_occ_zarr) zarr = g_occ_zarr;   // read the coarse mask level from here
     // Prefer CM_OCC_LEVEL; if it's absent or its factor doesn't tile a 0/ chunk
@@ -269,9 +270,67 @@ typedef struct {
     u32 ntx,nty; long nbands; // XY-tile grid + total (tile,band) units
     u32 nbz;                  // Z-bands per XY column
     atomic_long next, present, zero, skipped;
+    struct bandq *q;          // download->compute handoff queue (NULL = inline mode)
 } sched;
 
 typedef struct { sched *sc; int top; plvl lv[VC_NLOD]; u8 atom[A*A*A]; long present, zero; } cube;
+
+// ------------------------------------------------------------------ I/O pool
+// Decoupled producer/consumer: a pool of N downloader threads fetches each band's
+// present source chunks (pure back-to-back S3 GETs, hiding per-object latency),
+// and a pool of M=ncpu compute threads runs the Z-cascade on already-resident
+// bands. The handoff unit is a `bandbuf`: a band's (tx,ty,bz) plus its prefetched
+// chunks keyed by (ccz,ccy,ccx). A bounded ready-queue caps in-flight RAM. This
+// keeps the latency-bound download off the compute threads' critical path: with
+// the old single inline pool only ~15% of workers were ever computing (the rest
+// parked in s3_get); here the downloaders saturate S3 concurrency while compute
+// stays fed. The cascade code is unchanged — only the chunk SOURCE moves to the
+// prefetched map (cb_get) instead of an inline src_get.
+typedef struct { u32 ccz,ccy,ccx; u8 *bytes; size_t len; } cchunk;  // one fetched chunk
+typedef struct {
+    long ti;                 // (tile,band) unit index
+    cchunk *chunks; int nch; // prefetched present chunks for this band
+    int empty;               // 1 => band is fully absent (stamp KNOWN_ZERO, no chunks)
+} bandbuf;
+
+typedef struct bandq {
+    bandbuf *slot; int cap, head, tail, count;
+    int closed;              // producers done -> consumers drain then exit
+    int active_prod;         // live producers (last one closes the queue)
+    pthread_mutex_t m; pthread_cond_t not_full, not_empty;
+} bandq;
+
+static void bandq_init(bandq *q, int cap, int nprod){
+    q->slot=calloc(cap,sizeof *q->slot); q->cap=cap; q->head=q->tail=q->count=0;
+    q->closed=0; q->active_prod=nprod;
+    pthread_mutex_init(&q->m,NULL); pthread_cond_init(&q->not_full,NULL); pthread_cond_init(&q->not_empty,NULL);
+}
+static void bandq_push(bandq *q, bandbuf b){
+    pthread_mutex_lock(&q->m);
+    while(q->count==q->cap) pthread_cond_wait(&q->not_full,&q->m);
+    q->slot[q->tail]=b; q->tail=(q->tail+1)%q->cap; q->count++;
+    pthread_cond_signal(&q->not_empty); pthread_mutex_unlock(&q->m);
+}
+// Pop a band. Returns 1 with *out filled, or 0 when queue is drained AND closed.
+static int bandq_pop(bandq *q, bandbuf *out){
+    pthread_mutex_lock(&q->m);
+    while(q->count==0 && !q->closed) pthread_cond_wait(&q->not_empty,&q->m);
+    if(q->count==0 && q->closed){ pthread_mutex_unlock(&q->m); return 0; }
+    *out=q->slot[q->head]; q->head=(q->head+1)%q->cap; q->count--;
+    pthread_cond_signal(&q->not_full); pthread_mutex_unlock(&q->m);
+    return 1;
+}
+static void bandq_producer_done(bandq *q){
+    pthread_mutex_lock(&q->m);
+    if(--q->active_prod==0){ q->closed=1; pthread_cond_broadcast(&q->not_empty); }
+    pthread_mutex_unlock(&q->m);
+}
+// Look up a prefetched chunk in a band buffer (linear; nch is small per band).
+static const u8 *cb_get(const bandbuf *bb, u32 ccz,u32 ccy,u32 ccx, size_t *len){
+    for(int i=0;i<bb->nch;++i) if(bb->chunks[i].ccz==ccz&&bb->chunks[i].ccy==ccy&&bb->chunks[i].ccx==ccx){
+        *len=bb->chunks[i].len; return bb->chunks[i].bytes; }
+    return NULL;
+}
 
 // A region at level L covers REG=1024 voxels/axis at level L = REG*2^L LOD0
 // voxels. It is DEFINITE-ZERO iff every source chunk overlapping that LOD0 extent
@@ -290,6 +349,47 @@ static int region_definite_zero(const chunkmap *cm, const zlevel *z0, int L,
     for(u32 qz=cza;qz<=czb;++qz)for(u32 qy=cya;qy<=cyb;++qy)for(u32 qx=cxa;qx<=cxb;++qx)
         if(cm->present[((size_t)qz*cm->ncy+qy)*cm->ncx+qx]) return 0;  // some data
     return 1;
+}
+
+// Downloader (producer): claim (tile,band) units, prefetch each band's present
+// source chunks into a bandbuf, enqueue. Pure I/O — back-to-back GETs keep S3
+// concurrency saturated independent of the compute threads' pace.
+static void *download_worker(void *arg){
+    sched *sc=(sched*)arg; const zlevel *z0=sc->z0; u32 SB=sc->SB, BAND=sc->BAND;
+    for(;;){
+        long ti=atomic_fetch_add(&sc->next,1);
+        if(ti>=sc->nbands) break;
+        u32 bz   = ti % sc->nbz;
+        u32 txy  = ti / sc->nbz;
+        u32 ty   = txy / sc->ntx, tx = txy % sc->ntx;
+        u32 vx0=tx*SB, vy0=ty*SB, vz0=bz*BAND;
+        u32 vx1=vx0+SB<sc->px?vx0+SB:sc->px;
+        u32 vy1=vy0+SB<sc->py?vy0+SB:sc->py;
+        u32 vz1=vz0+BAND<sc->pz?vz0+BAND:sc->pz;
+        // chunk footprint of this band (clamped to true volume; padding chunks absent)
+        u32 cxa=vx0/z0->cx, cxb=(vx1-1)/z0->cx, cya=vy0/z0->cy, cyb=(vy1-1)/z0->cy;
+        u32 cza=vz0/z0->cz, czb=(vz1-1)/z0->cz;
+        // present-chunk list for this band
+        cchunk *chunks=NULL; int nch=0, cap=0; int any=0;
+        for(u32 qz=cza;qz<=czb;++qz){ if(qz>=sc->cm->ncz)break;
+          for(u32 qy=cya;qy<=cyb;++qy){ if(qy>=sc->cm->ncy)break;
+            for(u32 qx=cxa;qx<=cxb;++qx){ if(qx>=sc->cm->ncx)break;
+              if(!sc->cm->present[((size_t)qz*sc->cm->ncy+qy)*sc->cm->ncx+qx]) continue;
+              any=1;
+              char pth[1200]; snprintf(pth,sizeof pth,"%s/%u/%u/%u",z0->dir,qz,qy,qx);
+              atomic_fetch_add(&g_io_open,1);
+              size_t gn=0; u8 *got=src_get(pth,&gn);
+              if(!got){ atomic_fetch_add(&g_io_miss,1); continue; }  // raced/absent
+              atomic_fetch_add(&g_io_bytes,(long)gn);
+              if(nch==cap){ cap=cap?cap*2:16; chunks=realloc(chunks,cap*sizeof *chunks); }
+              chunks[nch].ccz=qz; chunks[nch].ccy=qy; chunks[nch].ccx=qx;
+              chunks[nch].bytes=got; chunks[nch].len=gn; nch++;
+        }}}
+        bandbuf b={ ti, chunks, nch, any?0:1 };
+        bandq_push(sc->q, b);
+    }
+    bandq_producer_done(sc->q);
+    return NULL;
 }
 
 static void push_plane(cube *c, int L, const u8 *plane);
@@ -389,9 +489,9 @@ static void *tile_worker(void *arg){
         C.lv[L].slab=malloc((size_t)mnx*mny*A);
     }
 
-    for(;;){
-        long ti=atomic_fetch_add(&sc->next,1);
-        if(ti>=sc->nbands) break;
+    bandbuf bb;
+    while(bandq_pop(sc->q, &bb)){
+        long ti=bb.ti;
         u32 bz   = ti % sc->nbz;
         u32 txy  = ti / sc->nbz;
         u32 ty   = txy / sc->ntx, tx = txy % sc->ntx;
@@ -404,38 +504,24 @@ static void *tile_worker(void *arg){
         u32 vz1=vz0+BAND<sc->pz?vz0+BAND:sc->pz;
         u32 corex=vx1-vx0, corey=vy1-vy0;
 
-        // FULLY-EMPTY-BAND fast path. If every source chunk covering this band is
-        // absent (a-priori occupancy), the band is all zero: NO read, NO downscale,
-        // NO codec. But we must NOT just `continue` — the band still OWNS LOD0..fine
-        // atoms, and its coarse-level atoms live in regions shared with neighbouring
-        // tiles (a LOD2 region spans 4x4 tiles), so the prepass can't have marked
-        // them. So we directly STAMP every atom this band owns as KNOWN_ZERO — the
-        // minimum possible work (a slot write per atom, no 32^3 data touched). This
-        // is the bulk of the volume (~80% of chunks absent) and skips ALL the
-        // expensive per-band work for it while keeping ABSENT=0.
-        if(sc->cm){
-            int any=0;
-            // chunk extent covering this band (clamped to the true volume; padding
-            // chunks are absent by definition).
-            u32 cxa=vx0/z0->cx, cxb=(vx1-1)/z0->cx, cya=vy0/z0->cy, cyb=(vy1-1)/z0->cy;
-            u32 cza=vz0/z0->cz, czb=(vz1-1)/z0->cz;
-            for(u32 qz=cza;qz<=czb&&!any;++qz){ if(qz>=sc->cm->ncz)break;
-              for(u32 qy=cya;qy<=cyb&&!any;++qy){ if(qy>=sc->cm->ncy)break;
-                for(u32 qx=cxa;qx<=cxb;++qx){ if(qx>=sc->cm->ncx)break;
-                  if(sc->cm->present[((size_t)qz*sc->cm->ncy+qy)*sc->cm->ncx+qx]){any=1;break;} }}}
-            if(!any){
-                // stamp KNOWN_ZERO for every owned atom at LOD0..fine
-                for(int L=0;L<=fine;++L){
-                    u32 az0=(vz0>>L)/A, ay0=(vy0>>L)/A, ax0=(vx0>>L)/A;
-                    u32 nz=((vz1-vz0)>>L)/A, nyc=((vy1-vy0)>>L)/A, nxc=((vx1-vx0)>>L)/A;
-                    for(u32 az=0;az<nz;++az)for(u32 ay=0;ay<nyc;++ay)for(u32 ax=0;ax<nxc;++ax)
-                        vc_mark_zero_atom(sc->w,L,az0+az,ay0+ay,ax0+ax);
-                    C.zero += (long)nz*nyc*nxc;
-                }
-                atomic_fetch_add(&sc->zero,C.zero);
-                C.present=0; C.zero=0;
-                atomic_fetch_add(&sc->skipped,1); continue;
+        // FULLY-EMPTY-BAND fast path (downloader pre-determined bb.empty). The band
+        // still OWNS LOD0..fine atoms (and its coarse atoms share regions with
+        // neighbouring tiles, so the prepass can't have marked them) — STAMP every
+        // owned atom KNOWN_ZERO (a slot write, no 32^3 data touched). This is the
+        // bulk of the volume (~74% absent) and skips ALL per-band codec work.
+        if(bb.empty){
+            for(int L=0;L<=fine;++L){
+                u32 az0=(vz0>>L)/A, ay0=(vy0>>L)/A, ax0=(vx0>>L)/A;
+                u32 nz=((vz1-vz0)>>L)/A, nyc=((vy1-vy0)>>L)/A, nxc=((vx1-vx0)>>L)/A;
+                for(u32 az=0;az<nz;++az)for(u32 ay=0;ay<nyc;++ay)for(u32 ax=0;ax<nxc;++ax)
+                    vc_mark_zero_atom(sc->w,L,az0+az,ay0+ay,ax0+ax);
+                C.zero += (long)nz*nyc*nxc;
             }
+            atomic_fetch_add(&sc->zero,C.zero);
+            C.present=0; C.zero=0;
+            atomic_fetch_add(&sc->skipped,1);
+            free(bb.chunks);
+            continue;
         }
 
         // Cascade buffers. corex/corey are multiples of the region size (1024)
@@ -471,29 +557,12 @@ static void *tile_worker(void *arg){
             }
             if(need_zero) memset(bbuf,0,(size_t)cz*l0->nx*l0->ny);
             for(u32 ccy=cya;ccy<=cyb;++ccy)for(u32 ccx=cxa;ccx<=cxb;++ccx){
-                // The a-priori occupancy map already knows which chunks exist. Never
-                // open() a chunk it says is absent — bbuf is already zero there (the
-                // memset above ran because need_zero is forced when any covering
-                // chunk is absent). This removes a pointless syscall per absent chunk
-                // (the volume is ~80% absent chunks -> the dominant open() cost).
-                if(sc->cm && (ccz>=sc->cm->ncz||ccy>=sc->cm->ncy||ccx>=sc->cm->ncx ||
-                              !sc->cm->present[((size_t)ccz*sc->cm->ncy+ccy)*sc->cm->ncx+ccx])){
-                    atomic_fetch_add(&g_io_miss,1); continue;
-                }
-                char pth[1200]; snprintf(pth,sizeof pth,"%s/%u/%u/%u",z0->dir,ccz,ccy,ccx);
-                atomic_fetch_add(&g_io_open,1);
-                if(src_is_s3(pth)){
-                    size_t gn=0; u8 *got=src_get(pth,&gn);          // S3 GET
-                    if(!got){ atomic_fetch_add(&g_io_miss,1); continue; }
-                    if(gn==cb) memcpy(chk,got,cb); else { memset(chk,0,cb); if(gn) memcpy(chk,got,gn<cb?gn:cb); }
-                    free(got);
-                }else{
-                    int fd=open(pth,O_RDONLY);
-                    if(fd<0){ atomic_fetch_add(&g_io_miss,1); continue; }
-                    if(read(fd,chk,cb)!=(ssize_t)cb) memset(chk,0,cb);
-                    close(fd);
-                }
-                atomic_fetch_add(&g_io_bytes,cb);
+                // Chunk bytes were PREFETCHED by the downloader pool into bb; just
+                // look them up (no I/O here — that is the whole point of the split).
+                // Absent chunks aren't in bb -> bbuf stays zero (need_zero forced it).
+                size_t gn=0; const u8 *got=cb_get(&bb, ccz,ccy,ccx, &gn);
+                if(!got) continue;
+                if(gn==cb) memcpy(chk,got,cb); else { memset(chk,0,cb); if(gn) memcpy(chk,got,gn<cb?gn:cb); }
                 u32 gx0=ccx*cx, gy0=ccy*cy;
                 u32 ox0=gx0>vx0?gx0:vx0, ox1=(gx0+cx)<vx1?(gx0+cx):vx1;
                 u32 oy0=gy0>vy0?gy0:vy0, oy1=(gy0+cy)<vy1?(gy0+cy):vy1;
@@ -513,6 +582,9 @@ static void *tile_worker(void *arg){
         finish_cube(&C);
         atomic_fetch_add(&sc->present,C.present); atomic_fetch_add(&sc->zero,C.zero);
         C.present=0; C.zero=0;
+        // release this band's prefetched chunk bytes (downloader malloc'd them)
+        for(int i=0;i<bb.nch;++i) free(bb.chunks[i].bytes);
+        free(bb.chunks);
     }
     for(int L=0;L<=fine;++L){ free(C.lv[L].pair); free(C.lv[L].slab); }
     free(bbuf);
@@ -601,6 +673,7 @@ int main(int argc, char **argv){
         else if(!strcmp(argv[i],"--log-io"))log_io=1;
         else if(!strcmp(argv[i],"--progress")&&i+1<argc)progress_s=atof(argv[++i]);
         else if(!strcmp(argv[i],"--occupancy-zarr")&&i+1<argc)g_occ_zarr=argv[++i];
+        else if(!strcmp(argv[i],"--io-threads")&&i+1<argc)g_io_threads=atoi(argv[++i]);
     }
     if(nthreads<=0){long n=sysconf(_SC_NPROCESSORS_ONLN);nthreads=n>2?(int)n-1:1;}
 
@@ -681,8 +754,12 @@ int main(int argc, char **argv){
     printf("occupancy scan: %ld/%ld source chunks present (%.0f%%) in %.2fs\n",
            cm_present,cm_total,100.0*cm_present/cm_total, now_s()-tcm);
 
-    sched sc={ w,&z0,nlod, px,py,pz, method,alpha,SB,BAND,fine, &cm, ntx,nty,nbands,nbz, 0, 0,0,0 };
-    int nt2=nthreads>256?256:nthreads;
+    sched sc={ w,&z0,nlod, px,py,pz, method,alpha,SB,BAND,fine, &cm, ntx,nty,nbands,nbz, 0,0,0,0, NULL };
+    int nt2=nthreads>256?256:nthreads;          // compute threads (M = ~ncpu)
+    // Downloader pool size N: enough concurrent S3 GETs to hide per-object latency
+    // and keep the M compute threads fed. Benchmarks knee ~64-128 per libs3 client;
+    // default to 2x compute (capped) so downloaders run ahead. Override --io-threads.
+    int io_threads = g_io_threads>0 ? g_io_threads : (nt2*2>192?192:nt2*2);
 
     // PREPASS: from the a-priori chunk data, mark every DEFINITE-ZERO region
     // (all covering source chunks absent => no data) as ZERO_REGION. The region
@@ -707,8 +784,20 @@ int main(int argc, char **argv){
     pthread_t montid; int have_mon = progress_s>0;
     if(have_mon) pthread_create(&montid,NULL,monitor_thread,&mon);
 
-    pthread_t th[256];
+    // Two decoupled pools sharing a bounded ready-queue. Downloaders (N) prefetch
+    // each band's present chunks; compute threads (M) drain the queue and run the
+    // cascade on resident bands. Queue depth = lookahead window: how many bands the
+    // downloaders may run ahead of compute (caps in-flight band RAM). The last
+    // downloader to finish closes the queue so compute threads drain then exit.
+    int qdepth = nt2*3; if(qdepth<16) qdepth=16;
+    int nio = io_threads>256?256:io_threads;
+    bandq bq; bandq_init(&bq, qdepth, nio);
+    sc.q=&bq;
+    printf("pipeline: %d downloaders -> queue(depth %d) -> %d compute threads\n", nio, qdepth, nt2);
+    pthread_t dl[256], th[256];
+    for(int i=0;i<nio;++i) pthread_create(&dl[i],NULL,download_worker,&sc);
     for(int i=0;i<nt2;++i) pthread_create(&th[i],NULL,tile_worker,&sc);
+    for(int i=0;i<nio;++i) pthread_join(dl[i],NULL);
     for(int i=0;i<nt2;++i) pthread_join(th[i],NULL);
     printf("  bands skipped (a-priori empty): %ld / %ld\n", atomic_load(&sc.skipped), nbands);
 
