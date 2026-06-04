@@ -147,12 +147,14 @@ VC_MULTIVERSION static void dctA_lines_fwd(i32 *restrict blk) {
         { int nz = 0; for (u32 i = 0; i < A; ++i) if (v[i]) { nz = 1; break; } if (!nz) continue; }
         i32 s[HALF], d[HALF];
         for (u32 n = 0; n < HALF; ++n) { s[n] = v[n] + v[A-1-n]; d[n] = v[n] - v[A-1-n]; }
-#if defined(__clang__)
-        // clang lowers the reduction-over-n form below into a slow horizontal
-        // reduction (3.5× slower encode). The mathematically-identical k-parallel
-        // form — outputs as the vectorized axis, broadcast s[n]/d[n], no per-output
-        // reduction — fixes clang (63→154 MB/s). gcc, however, is FASTER with the
-        // reduction form (230 vs 165), so we pick per-compiler. Same results.
+#if defined(__clang__) || defined(__aarch64__)
+        // clang (any arch) and gcc-on-aarch64 lower the reduction-over-n form
+        // below into a slow scalar/horizontal reduction. The mathematically-
+        // identical k-parallel form — outputs as the vectorized axis, broadcast
+        // s[n]/d[n], no per-output reduction — vectorizes cleanly: ~4.3× faster
+        // on Neoverse-V2 (gcc) and fixes clang on x86. gcc-on-x86 is instead
+        // FASTER with the reduction form (230 vs 165 MB/s) so it keeps it below.
+        // Bit-identical either way.
         i32 acc[A]; for (u32 k = 0; k < A; ++k) acc[k] = rnd;
         for (u32 n = 0; n < HALF; ++n) {
             i32 sn = s[n], dn = d[n];
