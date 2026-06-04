@@ -1212,11 +1212,33 @@ void vc_writer_close(vc_writer *w) {
 // Reader
 // ===========================================================================
 struct vc_archive {
-    const u8 *buf; size_t len;
+    const u8 *buf; size_t len;            // buf==NULL => streaming mode (use read/ud)
+    vc_read_fn read; void *read_ud;       // streaming byte source (NULL => flat buf)
     vc_dims dims0; int nlod;
     u64 l1_off, l1_cap;
     float base_q[VC_NLOD];
 };
+
+// Fetch [off,off+len) into dst. Flat-buffer mode: memcpy from a->buf. Streaming
+// mode: delegate to the caller's read callback (which fetches/caches remotely).
+// Returns 0 on success, nonzero on a short/failed read or out-of-bounds.
+static int rd_bytes(const vc_archive *a, u64 off, u32 len, u8 *dst) {
+    if (a->read) return a->read(a->read_ud, off, len, dst) == VC_OK ? 0 : -1;
+    if (off + len > a->len) return -1;
+    memcpy(dst, a->buf + off, len);
+    return 0;
+}
+
+// Return a readable pointer to a payload [off,len). Flat mode: a->buf+off
+// (zero-copy, unchanged). Streaming mode: fetch into a thread-local scratch
+// (payloads are bounded by the encoder's A3*4+64 max). NULL on failure.
+static const u8 *payload_ptr(const vc_archive *a, u64 off, u32 len) {
+    if (!a->read) return a->buf + off;
+    static _Thread_local u8 paybuf[A3 * 4 + 64];
+    if (len > sizeof paybuf) return NULL;
+    if (rd_bytes(a, off, len, paybuf) != 0) return NULL;
+    return paybuf;
+}
 
 vc_archive *vc_open(const u8 *archive, size_t len) {
     build_tables();
@@ -1241,6 +1263,36 @@ vc_archive *vc_open(const u8 *archive, size_t len) {
     for (int l=0;l<VC_NLOD;++l) a->base_q[l] = rd_f32m(archive+FH_BASEQ+l*4);
     return a;
 }
+
+// Streaming open: never holds the whole archive. `read` is invoked on demand for
+// the header (here), L1 probe entries, L2 slots, and payloads. `total_len` is the
+// true archive size. Same validation + decode path as vc_open; the only
+// difference is bytes come from the callback (see rd_bytes) instead of a->buf.
+vc_archive *vc_open_streaming(vc_read_fn read, void *ud, uint64_t total_len) {
+    build_tables();
+    if (!read || total_len < FILE_HDR) return NULL;
+    u8 hdr[FILE_HDR];
+    if (read(ud, 0, FILE_HDR, hdr) != VC_OK) return NULL;
+    if (rd_u32m(hdr+FH_MAGIC) != VC_MAGIC) return NULL;
+    if (rd_u32m(hdr+FH_VER) != VC_VERSION) return NULL;
+    if (rd_u32m(hdr+FH_ATOM) != VC_ATOM) return NULL;
+    if (rd_u32m(hdr+FH_LAYOUT) != VC_LAYOUT_SPARSE2) return NULL;
+    if (rd_u32m(hdr+FH_RGN) != R_ATOMS) return NULL;
+    u32 nlod = rd_u32m(hdr+FH_NLOD);
+    if (nlod == 0 || nlod > VC_NLOD) return NULL;
+    u64 l1_off = rd_u64m(hdr+FH_L1OFF);
+    u64 l1_cap = rd_u64m(hdr+FH_L1CAP);
+    if (l1_cap == 0 || (l1_cap & (l1_cap-1))) return NULL;
+    if (l1_off > total_len || l1_cap > (total_len - l1_off) / L1_ENTRY) return NULL;
+    vc_archive *a = (vc_archive *)vc_xcalloc(1, sizeof(*a));
+    a->buf = NULL; a->read = read; a->read_ud = ud; a->len = total_len; a->nlod = (int)nlod;
+    a->dims0.nx = rd_u32m(hdr+FH_NX);
+    a->dims0.ny = rd_u32m(hdr+FH_NY);
+    a->dims0.nz = rd_u32m(hdr+FH_NZ);
+    a->l1_off = l1_off; a->l1_cap = l1_cap;
+    for (int l=0;l<VC_NLOD;++l) a->base_q[l] = rd_f32m(hdr+FH_BASEQ+l*4);
+    return a;
+}
 void vc_close(vc_archive *a) { free(a); }
 
 vc_status vc_lod_dims(const vc_archive *a, int lod, vc_dims *out) {
@@ -1255,7 +1307,8 @@ static u64 reader_block(const vc_archive *a, u64 key) {
     u64 mask = a->l1_cap - 1;
     u64 i = mix64(key) & mask;
     for (;;) {
-        const u8 *e = a->buf + a->l1_off + i*L1_ENTRY;
+        u8 e[L1_ENTRY];   // one bucket: [u64 key][u64 block_ref]
+        if (rd_bytes(a, a->l1_off + i*L1_ENTRY, L1_ENTRY, e) != 0) return 0;
         u64 bref = rd_u64m(e + 8);
         if (bref == 0) return 0;
         if (rd_u64m(e) == key) return bref;
@@ -1271,7 +1324,8 @@ static u8 resolve_atom(const vc_archive *a, int lod, u32 az, u32 ay, u32 ax,
     if (blk == 0) return AF_ABSENT;
     if (blk == VC_ZERO_REGION) return AF_ZERO;
     if (blk + L2_BLOCK_BYTES > a->len) return AF_ABSENT; // corrupt guard
-    const u8 *slot = a->buf + blk + slot_index(az,ay,ax)*ATOM_SLOT;
+    u8 slot[ATOM_SLOT];   // [u64 offset][u32 length][u8 flags][u8 dc][u16 pad]
+    if (rd_bytes(a, blk + slot_index(az,ay,ax)*ATOM_SLOT, ATOM_SLOT, slot) != 0) return AF_ABSENT;
     // ACQUIRE-load the commit word (offset) before trusting the other fields.
     u64 o = rd_u64m(slot);
     atomic_thread_fence(memory_order_acquire);
@@ -1290,7 +1344,9 @@ vc_status vc_decode_atom(vc_archive *a, int lod, int ax, int ay, int az,
     u8 flags = resolve_atom(a, lod, az, ay, ax, &off, &len, &dc);
     if (flags == AF_PRESENT) {
         if (off == ABSENT || len < 1 || off + len > a->len) { memset(out,0,A3); return VC_ERR_FORMAT; }
-        decode_atom_payload(a->buf + off, len, a->base_q[lod], out);
+        const u8 *pay = payload_ptr(a, off, len);
+        if (!pay) { memset(out,0,A3); return VC_ERR_FORMAT; }
+        decode_atom_payload(pay, len, a->base_q[lod], out);
         return VC_OK;
     }
     memset(out, 0, A3);   // ABSENT or ZERO -> zeros
@@ -1309,7 +1365,7 @@ vc_cover vc_atom_coverage(const vc_archive *a, int lod, u32 az, u32 ay, u32 ax) 
 // Build a transient reader view over the writer's live map. Caller must hold the
 // writer's lock (shared is enough) so the map can't move underfoot.
 static vc_archive writer_view(vc_writer *w) {
-    vc_archive a;
+    vc_archive a = {0};   // read/read_ud must be NULL -> flat-buffer mode
     a.buf = w->map; a.len = w->map_len; a.dims0 = w->dims0; a.nlod = w->nlod;
     a.l1_off = rd_u64m(w->map + FH_L1OFF);
     a.l1_cap = rd_u64m(w->map + FH_L1CAP);

@@ -104,6 +104,19 @@ typedef struct vc_archive vc_archive;
 // Open an archive from an in-memory buffer (typically an mmap of the file).
 // Borrows the buffer — it must outlive the handle.
 vc_archive *vc_open(const uint8_t *archive, size_t len);
+
+// Byte-source callback for streaming open: fill dst with exactly `len` bytes
+// starting at `off` in the archive. Return VC_OK on success. The implementation
+// typically range-fetches + caches (e.g. from S3) behind this. Called on demand
+// for the header, L1 index probes, L2 slots, and atom payloads.
+typedef vc_status (*vc_read_fn)(void *ud, uint64_t off, uint32_t len, uint8_t *dst);
+
+// Open an archive WITHOUT holding it whole in memory: libvc walks its index and
+// decodes by pulling byte ranges through `read` on demand. `total_len` is the
+// true archive size. Decode results are identical to vc_open on the same bytes;
+// only the byte source differs. The callback must outlive the handle.
+vc_archive *vc_open_streaming(vc_read_fn read, void *ud, uint64_t total_len);
+
 void        vc_close(vc_archive *a);
 
 // LOD0 dims, and derived dims of any LOD (strict 2x pyramid).
