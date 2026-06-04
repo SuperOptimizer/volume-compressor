@@ -140,6 +140,18 @@ vc_cover vc_atom_payload_range(const vc_archive *a, int lod,
                                uint32_t az, uint32_t ay, uint32_t ax,
                                uint64_t *off, uint32_t *len);
 
+// Container version: 1 = v1 (sparse hash index), 2 = v2 (region-contiguous +
+// directory). 0 if a is NULL.
+int vc_archive_version(const vc_archive *a);
+
+// v2 only: the contiguous on-disk blob [*off,*off+*len) holding a whole region's
+// slots + payloads — a streaming reader fetches it in ONE range-GET to serve every
+// atom in the region. Returns region coverage; *off/*len are 0 unless PRESENT (and
+// always 0 for a v1 archive). Region coords are in index-region units.
+vc_cover vc_region_blob_range(const vc_archive *a, int lod,
+                              uint32_t rz, uint32_t ry, uint32_t rx,
+                              uint64_t *off, uint64_t *len);
+
 // Override the fail-fast panic hook (default aborts).
 void vc_set_panic_hook(void (*hook)(const char *msg));
 

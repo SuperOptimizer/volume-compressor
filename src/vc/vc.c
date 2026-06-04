@@ -1445,6 +1445,31 @@ vc_cover vc_atom_payload_range(const vc_archive *a, int lod,
     return VC_ABSENT;
 }
 
+// Archive container version (1 = v1 sparse-hash, 2 = v2 region-contiguous).
+int vc_archive_version(const vc_archive *a) { return a ? a->version : 0; }
+
+// v2 ONLY: the contiguous on-disk blob [*off, *off+*len) holding an entire
+// region's slots + payloads. A streaming reader can fetch this in ONE range-GET
+// to serve every atom in the region. Returns the region's coverage (DATA/ZERO/
+// ABSENT); *off/*len are 0 unless DATA. Returns VC_ABSENT (and 0,0) for v1.
+vc_cover vc_region_blob_range(const vc_archive *a, int lod, u32 rz, u32 ry, u32 rx,
+                              uint64_t *off, uint64_t *len) {
+    if (off) *off = 0; if (len) *len = 0;
+    if (!a || a->version != 2 || lod < 0 || lod >= a->nlod) return VC_ABSENT;
+    u32 nrz, nry, nrx; lod_region_grid(a->dims0, lod, &nrz, &nry, &nrx);
+    if (rz >= nrz || ry >= nry || rx >= nrx) return VC_ABSENT;
+    u64 regidx = a->region_prefix[lod] + ((u64)rz*nry + ry)*nrx + rx;
+    if (regidx >= a->region_prefix[a->nlod]) return VC_ABSENT;
+    u8 ent[V2_DIR_ENTRY];
+    if (rd_bytes(a, a->dir_off + regidx*V2_DIR_ENTRY, V2_DIR_ENTRY, ent) != 0) return VC_ABSENT;
+    u32 flags = rd_u32m(ent + 12);
+    if (flags == V2_RGN_ZERO) return VC_KNOWN_ZERO;
+    if (flags != V2_RGN_DATA) return VC_ABSENT;
+    if (off) *off = rd_u64m(ent);
+    if (len) *len = rd_u32m(ent + 8);
+    return VC_PRESENT;
+}
+
 // Build a transient reader view over the writer's live map. Caller must hold the
 // writer's lock (shared is enough) so the map can't move underfoot.
 static vc_archive writer_view(vc_writer *w) {
