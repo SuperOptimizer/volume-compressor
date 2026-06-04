@@ -149,3 +149,9 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_realdata.c)
   # real-data test needs the decoded raw volume; gated by VC_TESTDATA env var
   add_test(NAME realdata COMMAND vc_test_realdata)
 endif()
+
+if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_concurrent.c)
+  add_executable(vc_test_concurrent tests/test_concurrent.c)
+  target_link_libraries(vc_test_concurrent PRIVATE vc Threads::Threads)
+  add_test(NAME concurrent COMMAND vc_test_concurrent)
+endif()

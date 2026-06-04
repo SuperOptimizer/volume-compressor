@@ -742,7 +742,8 @@ struct vc_writer {
     int     fd;
     u8     *map;            // mmap base (stable for the writer's life on Linux)
     u64     map_len;        // mapped length (== reservation on Linux)
-    u64     file_len;       // file length actually backed by ftruncate
+    _Atomic u64 file_len;   // file length backed by ftruncate; read lock-free in
+                            // writer_alloc, written under grow_mu -> must be atomic
     int     fixed_map;      // 1 = base never moves (Linux huge map); 0 = remap mode
     pthread_mutex_t grow_mu;// serializes ftruncate/remap growth
     pthread_rwlock_t lock;  // guards L1 structural mutations (region create/rehash)
@@ -769,23 +770,25 @@ static void wr_f32m(u8 *p, float v){ memcpy(p,&v,4); }
 // In remap mode (macOS) it remaps, which moves the base, so remap-mode callers
 // must hold the rwlock exclusively around any raw-pointer use (see writer_alloc).
 static int writer_ensure(vc_writer *w, u64 need) {
-    if (need <= w->file_len) return 0;
+    if (need <= atomic_load_explicit(&w->file_len, memory_order_acquire)) return 0;
     pthread_mutex_lock(&w->grow_mu);
-    if (need <= w->file_len) { pthread_mutex_unlock(&w->grow_mu); return 0; }
+    u64 cur = atomic_load_explicit(&w->file_len, memory_order_relaxed);
+    if (need <= cur) { pthread_mutex_unlock(&w->grow_mu); return 0; }
     // grow the file in big steps to amortize the metadata ops
-    u64 nl = w->file_len ? w->file_len : FILE_HDR;
+    u64 nl = cur ? cur : FILE_HDR;
     while (nl < need) nl += VC_GROW_STEP;
     if (w->fixed_map) {
         if (nl > w->map_len) nl = w->map_len;   // bounded by the reservation
         if (need > w->map_len) { pthread_mutex_unlock(&w->grow_mu); return -1; } // exceeded 10TB
         if (ftruncate(w->fd, (off_t)nl) != 0) { pthread_mutex_unlock(&w->grow_mu); return -1; }
-        w->file_len = nl;                        // base pointer unchanged
+        atomic_store_explicit(&w->file_len, nl, memory_order_release); // base unchanged
     } else {
         if (ftruncate(w->fd, (off_t)nl) != 0) { pthread_mutex_unlock(&w->grow_mu); return -1; }
         munmap(w->map, w->map_len);
         void *nm = mmap(NULL, nl, PROT_READ|PROT_WRITE, MAP_SHARED, w->fd, 0);
         if (nm == MAP_FAILED) { pthread_mutex_unlock(&w->grow_mu); return -1; }
-        w->map = (u8 *)nm; w->map_len = nl; w->file_len = nl;
+        w->map = (u8 *)nm; w->map_len = nl;
+        atomic_store_explicit(&w->file_len, nl, memory_order_release);
     }
     pthread_mutex_unlock(&w->grow_mu);
     return 0;
@@ -796,7 +799,8 @@ static int writer_ensure(vc_writer *w, u64 need) {
 static u64 writer_alloc(vc_writer *w, u64 n, int have_excl) {
     (void)have_excl;
     u64 off = atomic_fetch_add(&w->cursor, n);
-    if (off + n > w->file_len) writer_ensure(w, off + n);
+    if (off + n > atomic_load_explicit(&w->file_len, memory_order_acquire))
+        writer_ensure(w, off + n);
     return off;
 }
 
@@ -851,6 +855,12 @@ static inline _Atomic u64 *atomptr(u8 *p) { return (_Atomic u64 *)p; }
 // single commit word: a reader that sees block_ref!=0 is guaranteed (via the CAS
 // release) to also see the matching key. We therefore write `key` BEFORE the CAS
 // that publishes block_ref.
+// THREAD-SAFETY: this reads w->map lock-free. Safe in fixed_map mode (Linux huge
+// reservation) where the base NEVER moves. In remap mode (the non-Linux fallback)
+// writer_ensure() can munmap+remap w->map under a concurrent reader here -> a
+// use-after-munmap race (TSan flags it when the 10TB reservation is unavailable,
+// e.g. under TSan's own shadow). Not hit by the Linux/fixed_map exporter. KNOWN:
+// remap-mode parallel append needs the base pinned (rwlock or never-unmap) first.
 static u64 region_block_lockfree(vc_writer *w, u64 key, int create) {
     u64 cap = rd_u64m(w->map + FH_L1CAP);
     u64 off = rd_u64m(w->map + FH_L1OFF);
@@ -1188,9 +1198,10 @@ void vc_writer_close(vc_writer *w) {
     u64 used = atomic_load(&w->cursor);
     wr_u64m(w->map + FH_CURSOR, used);
     // sync only the backed prefix (map_len may be a 10TB reservation).
-    msync(w->map, w->file_len, MS_SYNC);
+    u64 flen = atomic_load(&w->file_len);
+    msync(w->map, flen, MS_SYNC);
     munmap(w->map, w->map_len);
-    if (used && used < w->file_len) { if (ftruncate(w->fd, (off_t)used) != 0) {/*ignore*/} }
+    if (used && used < flen) { if (ftruncate(w->fd, (off_t)used) != 0) {/*ignore*/} }
     close(w->fd);
     pthread_rwlock_destroy(&w->lock);
     pthread_mutex_destroy(&w->grow_mu);
