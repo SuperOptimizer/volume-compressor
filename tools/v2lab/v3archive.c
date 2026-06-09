@@ -226,10 +226,18 @@ void v3_vsrc_set_chunk(void *vp, int cz,int cy,int cx, uint8_t *buf128 /*owned*/
     if(s->chunk[ci]) free((void*)s->chunk[ci]);
     s->chunk[ci]=buf128; s->clen[ci]=buf128?(size_t)128*128*128:0;
 }
-int v3_build_from_vsrc(void *vp, const char *outpath, int dim, float quality){
+int v3_build_from_vsrc(void *vp, const char *outpath, int dim, float quality,
+                       const char *metadata, size_t meta_len){
     v2_codec_init(); v2_set_quality(quality);
     int V=dim; vsrc *vs=vp;
-    abuf b={0}; a_zero(&b,V3_HDR);
+    /* format v4: header(256B) + metadata carve-out up to V3_META_END (128KB); data starts there. */
+    abuf b={0}; a_zero(&b,V3_META_END);
+    size_t mlen=meta_len;
+    if(metadata && mlen){
+        if(mlen>V3_META_CAP){ fprintf(stderr,"v3: metadata %zu B exceeds %u B capacity — truncating
+",mlen,(unsigned)V3_META_CAP); mlen=V3_META_CAP; }
+        memcpy(b.p+V3_HDR, metadata, mlen);
+    } else mlen=0;
     uint64_t roots[8]={0};
     const u8 *lodvol=NULL; u8 *owned=NULL; int d=V;
     for(int lod=0; lod<8 && d>=V2_BLK; ++lod){
@@ -245,6 +253,7 @@ int v3_build_from_vsrc(void *vp, const char *outpath, int dim, float quality){
     a_u32(&b,V3H_NX,V); a_u32(&b,V3H_NY,V); a_u32(&b,V3H_NZ,V);
     for(int l=0;l<8;++l) a_u64(&b,V3H_ROOTOFF+l*8,roots[l]);
     a_u64(&b,V3H_TOTLEN,b.len);
+    a_u64(&b,V3H_METAOFF,V3_HDR); a_u64(&b,V3H_METACAP,V3_META_CAP); a_u64(&b,V3H_METALEN,mlen);
     FILE *of=fopen(outpath,"wb"); if(!of){ perror("fopen out"); free_vsrc(vs); return 1; }
     fwrite(b.p,1,b.len,of); fclose(of);
     free(b.p); free_vsrc(vs);
