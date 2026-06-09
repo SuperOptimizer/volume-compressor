@@ -31,6 +31,12 @@ int v3_build_from_zarr(const char *zarr_root, const char *outpath, int dim, floa
 // Read the metadata region from a built/mmap'd archive. Returns a pointer INTO `arc` (not
 // owned) + its byte length via *out_len. The region is zero-padded after the stored bytes.
 const char *v3_metadata(const uint8_t *arc, size_t *out_len);
+// FUSED export: build from a vsrc the caller fills with PREPROCESSED 128^3 chunks.
+void *v3_vsrc_alloc(int dim);
+void  v3_vsrc_set_chunk(void *vsrc, int cz,int cy,int cx, uint8_t *buf128);
+int   v3_build_from_vsrc(void *vsrc, const char *outpath, int dim, float quality,
+                         const char *metadata, size_t meta_len);
+
 
 // ---- random-access decode from a built/mmap'd archive ----
 // (decode a single 16^3 block, or a whole 256^3 chunk; the viewer path.)

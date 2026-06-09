@@ -234,8 +234,7 @@ int v3_build_from_vsrc(void *vp, const char *outpath, int dim, float quality,
     abuf b={0}; a_zero(&b,V3_META_END);
     size_t mlen=meta_len;
     if(metadata && mlen){
-        if(mlen>V3_META_CAP){ fprintf(stderr,"v3: metadata %zu B exceeds %u B capacity — truncating
-",mlen,(unsigned)V3_META_CAP); mlen=V3_META_CAP; }
+        if(mlen>V3_META_CAP){ fprintf(stderr,"v3: metadata %zu B exceeds %u B capacity\n",mlen,(unsigned)V3_META_CAP); mlen=V3_META_CAP; }
         memcpy(b.p+V3_HDR, metadata, mlen);
     } else mlen=0;
     uint64_t roots[8]={0};
