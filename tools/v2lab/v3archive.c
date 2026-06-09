@@ -208,11 +208,19 @@ static uint64_t write_node(abuf*b,const v3vol *V,int level,int bz,int by,int bx)
     return (uint64_t)nat;
 }
 
-int v3_build_from_zarr(const char *root, const char *outpath, int dim, float quality){
+int v3_build_from_zarr(const char *root, const char *outpath, int dim, float quality,
+                       const char *metadata, size_t meta_len){
     v2_codec_init(); v2_set_quality(quality);
     int V=dim;
     vsrc *vs=load_zarr_vsrc(root,V,128);
-    abuf b={0}; a_zero(&b,V3_HDR);
+    // Reserve header(256B) + metadata region up to V3_META_END; ALL archive data starts at
+    // V3_META_END (128KB). The metadata region [256, 128KB) is zero-padded then overwritten.
+    abuf b={0}; a_zero(&b,V3_META_END);
+    size_t mlen=meta_len;
+    if(metadata && mlen){
+        if(mlen>V3_META_CAP){ fprintf(stderr,"v3: metadata %zu B exceeds %u B capacity — truncating\n",mlen,(unsigned)V3_META_CAP); mlen=V3_META_CAP; }
+        memcpy(b.p+V3_HDR, metadata, mlen);   // write at offset 256
+    } else mlen=0;
     uint64_t roots[8]={0};
     const u8 *lodvol=NULL; u8 *owned=NULL; int d=V;
     for(int lod=0; lod<8 && d>=V2_BLK; ++lod){
@@ -228,6 +236,7 @@ int v3_build_from_zarr(const char *root, const char *outpath, int dim, float qua
     a_u32(&b,V3H_NX,V); a_u32(&b,V3H_NY,V); a_u32(&b,V3H_NZ,V);
     for(int l=0;l<8;++l) a_u64(&b,V3H_ROOTOFF+l*8,roots[l]);
     a_u64(&b,V3H_TOTLEN,b.len);
+    a_u64(&b,V3H_METAOFF,V3_HDR); a_u64(&b,V3H_METACAP,V3_META_CAP); a_u64(&b,V3H_METALEN,mlen);
     FILE *of=fopen(outpath,"wb"); if(!of){ perror("fopen out"); free_vsrc(vs); return 1; }
     fwrite(b.p,1,b.len,of); fclose(of);
     free(b.p); free_vsrc(vs);
@@ -235,6 +244,12 @@ int v3_build_from_zarr(const char *root, const char *outpath, int dim, float qua
 }
 
 // ---------------------------------------------------------------- reader
+const char *v3_metadata(const uint8_t *arc, size_t *out_len){
+    uint64_t off, len; memcpy(&off,arc+V3H_METAOFF,8); memcpy(&len,arc+V3H_METALEN,8);
+    if(!off) off=V3_HDR;                     // tolerate older/zero header: default region start
+    if(out_len) *out_len=(size_t)len;
+    return (const char*)(arc+off);
+}
 struct v3_reader { const uint8_t *arc; size_t len; uint64_t roots[8];
     u8 *cmask; uint64_t cmask_key; };     // cached decoded chunk mask
 v3_reader *v3_open(const uint8_t *arc, size_t len, float quality){

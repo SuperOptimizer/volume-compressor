@@ -21,7 +21,16 @@
 // `dim` must be a multiple of 256 (chunk-aligned; padding is the export pipeline's job —
 // this errors out otherwise). `quality` is the v2 base_q dial. Writes `outpath`.
 // Returns 0 on success. Memory-lean: LOD0 is read via chunk-mmap (working-set resident).
-int v3_build_from_zarr(const char *zarr_root, const char *outpath, int dim, float quality);
+//
+// `metadata`/`meta_len`: optional caller-supplied free-form text (JSON/TOML/INI/...) stored
+// verbatim in the file's metadata region [256, 128KB). Pass (NULL,0) for none. Truncated +
+// a warning if it exceeds the capacity (V3_META_CAP). Read it back with v3_metadata().
+int v3_build_from_zarr(const char *zarr_root, const char *outpath, int dim, float quality,
+                       const char *metadata, size_t meta_len);
+
+// Read the metadata region from a built/mmap'd archive. Returns a pointer INTO `arc` (not
+// owned) + its byte length via *out_len. The region is zero-padded after the stored bytes.
+const char *v3_metadata(const uint8_t *arc, size_t *out_len);
 
 // ---- random-access decode from a built/mmap'd archive ----
 // (decode a single 16^3 block, or a whole 256^3 chunk; the viewer path.)

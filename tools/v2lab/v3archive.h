@@ -50,8 +50,17 @@
 #define V3H_NZ    20
 #define V3H_ROOTOFF 24             // u64[8]: per-LOD root-node file offset (0 = empty LOD)
 #define V3H_TOTLEN  88             // u64 total archive length
-#define V3_HDR 128u
-#define V3_VERSION 3u
+// --- user metadata region (v4): a fixed 128KB carve-out directly after the header for
+// caller-supplied free-form text (JSON/TOML/INI/...). All ARCHIVE DATA begins at V3_META_END
+// (128KB), a round offset. The region is zero-padded; METALEN = bytes actually used. Readers
+// that don't care can ignore it; the offset-0 "empty" sentinel still holds (data never at 0). ---
+#define V3H_METAOFF 96             // u64: metadata region start offset (= V3_HDR = 256)
+#define V3H_METACAP 104            // u64: metadata region capacity in bytes (= V3_META_END - V3_HDR)
+#define V3H_METALEN 112            // u64: bytes of metadata actually written (rest zero-padded)
+#define V3_HDR 256u                // header size (256B; metadata region begins here)
+#define V3_META_END (128u*1024u)   // archive data begins at this offset (128KB)
+#define V3_META_CAP (V3_META_END - V3_HDR)   // usable metadata bytes (128KB - 256)
+#define V3_VERSION 4u              // bumped: 256B header + 128KB metadata carve-out; data at 128KB
 
 // occupancy bitmap helpers
 static inline int v3_bit_get(const uint8_t*bm,int i){ return (bm[i>>3]>>(i&7))&1; }
