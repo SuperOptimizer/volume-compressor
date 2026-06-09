@@ -1,12 +1,13 @@
 // ============================================================================
 // v3archive.c — FROZEN v3 archive container (2026-06-09). See v3archive_api.h.
 // Depends on v2codec (one direction). Format constants in v3archive.h; sparse-tree
-// reader in v3read.h. This file owns: zarr chunk-mmap source, LOD decimation, block
+// reader in v3read.h. This file owns: zarr chunk source (local mmap or S3 via libs3), LOD decimation, block
 // gather, chunk-mask gather, the sparse-tree writer, and the build/decode drivers.
 // ============================================================================
 #include "v3archive_api.h"
 #include "v3archive.h"
 #include "v3read.h"
+#include "../third_party/libs3/libs3.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -16,13 +17,48 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+// ---- optional S3 source: a zarr root starting with s3:// is fetched via libs3.
+// One shared client, created lazily on first S3 use (resolved creds, else anonymous).
+static s3_client *g_v3_s3 = NULL;
+static s3_status v3_s3_cred(void *ud, s3_credentials *out){ (void)ud; return s3_credentials_load(NULL,out); }
+static void v3_s3_ensure(void){
+    if(g_v3_s3) return;
+    s3_config cfg; memset(&cfg,0,sizeof cfg);
+    s3_credentials probe; memset(&probe,0,sizeof probe);
+    if(s3_credentials_load(NULL,&probe)==S3_OK){
+        cfg.cred_provider=v3_s3_cred;
+        if(probe.region&&probe.region[0]) cfg.region=strdup(probe.region);
+        s3_credentials_free(&probe);
+    }
+    g_v3_s3=s3_client_new(&cfg);
+    if(!g_v3_s3){ fprintf(stderr,"v3: s3_client_new failed\n"); exit(1); }
+}
+// Fetch one object (S3 url or local path) into a malloc'd buffer; NULL on 404/error.
+static uint8_t *v3_src_get(const char *path, size_t *len){
+    if(s3_url_is_s3(path)){
+        v3_s3_ensure();
+        s3_response r; memset(&r,0,sizeof r);
+        s3_status st=s3_get(g_v3_s3,path,&r);
+        uint8_t *out=NULL;
+        if(st==S3_OK && r.status==200 && r.body){ out=malloc(r.body_len); if(out){ memcpy(out,r.body,r.body_len); if(len)*len=r.body_len; } }
+        s3_response_free(&r);
+        return out;
+    }
+    int fd=open(path,O_RDONLY); if(fd<0) return NULL;
+    struct stat st; if(fstat(fd,&st)!=0){ close(fd); return NULL; }
+    size_t n=(size_t)st.st_size; uint8_t *b=malloc(n); if(!b){ close(fd); return NULL; }
+    ssize_t g=read(fd,b,n); close(fd);
+    if(g!=(ssize_t)n){ free(b); return NULL; }
+    if(len)*len=n; return b;
+}
+
 typedef uint8_t u8;
 #define V3_CHUNK_ALIGN 256
 
 // ---------------------------------------------------------------- volume source
 // LOD0: chunk-mmap'd zarr (working-set resident). LOD1+: contiguous decimated buffers.
 typedef struct {
-    int V, CH, G; const u8 **chunk; size_t *clen;
+    int V, CH, G; const u8 **chunk; size_t *clen; int owned; /* owned=1: chunks malloc'd (S3), else mmap'd */
 } vsrc;
 static inline u8 vsrc_get(const vsrc *s, int z,int y,int x){
     if((unsigned)z>=(unsigned)s->V||(unsigned)y>=(unsigned)s->V||(unsigned)x>=(unsigned)s->V) return 0;
@@ -44,21 +80,32 @@ static vsrc *load_zarr_vsrc(const char *root, int V, int CH){
     }
     int G=(V+CH-1)/CH; vsrc *s=calloc(1,sizeof *s); s->V=V; s->CH=CH; s->G=G;
     s->chunk=calloc((size_t)G*G*G,sizeof(const u8*)); s->clen=calloc((size_t)G*G*G,sizeof(size_t));
-    size_t clen=(size_t)CH*CH*CH; char p[1024]; int present=0;
+    size_t clen=(size_t)CH*CH*CH; char p[2048]; int present=0;
+    int is_s3 = s3_url_is_s3(root);
+    s->owned = is_s3;
     for(int c0=0;c0<G;++c0)for(int c1=0;c1<G;++c1)for(int c2=0;c2<G;++c2){
         int ci=(c0*G+c1)*G+c2;
         snprintf(p,sizeof p,"%s/0/%d/%d/%d",root,c0,c1,c2);
-        int fd=open(p,O_RDONLY); if(fd<0) continue;
-        struct stat st; if(fstat(fd,&st)!=0||(size_t)st.st_size<clen){ close(fd); continue; }
-        const u8 *m=mmap(NULL,clen,PROT_READ,MAP_PRIVATE,fd,0); close(fd);
-        if(m==MAP_FAILED) continue;
-        s->chunk[ci]=m; s->clen[ci]=clen; present++;
+        if(is_s3){
+            // S3: fetch the chunk into a malloc'd buffer (cannot mmap). Missing -> absent (all zero).
+            size_t glen=0; u8 *m=v3_src_get(p,&glen);
+            if(!m) continue;
+            if(glen<clen){ free(m); continue; }   // truncated/short -> skip (treated as absent)
+            s->chunk[ci]=m; s->clen[ci]=clen; present++;
+        } else {
+            int fd=open(p,O_RDONLY); if(fd<0) continue;
+            struct stat st; if(fstat(fd,&st)!=0||(size_t)st.st_size<clen){ close(fd); continue; }
+            const u8 *m=mmap(NULL,clen,PROT_READ,MAP_PRIVATE,fd,0); close(fd);
+            if(m==MAP_FAILED) continue;
+            s->chunk[ci]=m; s->clen[ci]=clen; present++;
+        }
     }
-    fprintf(stderr,"vsrc: %d/%d chunks mmap'd (CH=%d, V=%d)\n",present,G*G*G,CH,V);
+    fprintf(stderr,"vsrc: %d/%d chunks %s (CH=%d, V=%d)\n",present,G*G*G, is_s3?"fetched(S3)":"mmap'd", CH,V);
     return s;
 }
 static void free_vsrc(vsrc *s){ if(!s)return; for(size_t i=0;i<(size_t)s->G*s->G*s->G;++i)
-    if(s->chunk[i]) munmap((void*)s->chunk[i],s->clen[i]); free(s->chunk); free(s->clen); free(s); }
+    if(s->chunk[i]){ if(s->owned) free((void*)s->chunk[i]); else munmap((void*)s->chunk[i],s->clen[i]); }
+    free(s->chunk); free(s->clen); free(s); }
 // 2x box-decimate (mean of nonzero children; all-zero stays 0). vsrc and contiguous variants.
 static u8 *decimate(const u8 *src,int D){ int H=D/2; u8 *o=calloc((size_t)H*H*H,1);
     for(int z=0;z<H;++z)for(int y=0;y<H;++y)for(int x=0;x<H;++x){ int s=0,c=0;
