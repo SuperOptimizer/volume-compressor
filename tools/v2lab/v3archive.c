@@ -208,6 +208,50 @@ static uint64_t write_node(abuf*b,const v3vol *V,int level,int bz,int by,int bx)
     return (uint64_t)nat;
 }
 
+// ---- FUSED export support: build from a vsrc the CALLER fills (e.g. with preprocessed chunks).
+// v3_vsrc_alloc allocates an empty 128^3-chunk vsrc; v3_vsrc_set_chunk hands ownership of a
+// malloc'd 128^3 buffer for chunk (cz,cy,cx) (NULL = absent/air). v3_build_from_vsrc encodes it
+// (all LODs) exactly like v3_build_from_zarr. Lets fysics preprocess each chunk then encode --
+// one pass, no intermediate zarr. (vsrc is opaque to the caller via void*.)
+void *v3_vsrc_alloc(int dim){
+    int V=dim, CH=128, G=(V+CH-1)/CH;
+    if(V % V3_CHUNK_ALIGN != 0){ fprintf(stderr,"v3_vsrc_alloc: dim %d not %d-multiple\n",V,V3_CHUNK_ALIGN); return NULL; }
+    vsrc *s=calloc(1,sizeof *s); s->V=V; s->CH=CH; s->G=G; s->owned=1;
+    s->chunk=calloc((size_t)G*G*G,sizeof(const u8*)); s->clen=calloc((size_t)G*G*G,sizeof(size_t));
+    return s;
+}
+void v3_vsrc_set_chunk(void *vp, int cz,int cy,int cx, uint8_t *buf128 /*owned*/){
+    vsrc *s=vp; if(!s) return; int G=s->G; if(cz>=G||cy>=G||cx>=G) { free(buf128); return; }
+    int ci=(cz*G+cy)*G+cx;
+    if(s->chunk[ci]) free((void*)s->chunk[ci]);
+    s->chunk[ci]=buf128; s->clen[ci]=buf128?(size_t)128*128*128:0;
+}
+int v3_build_from_vsrc(void *vp, const char *outpath, int dim, float quality){
+    v2_codec_init(); v2_set_quality(quality);
+    int V=dim; vsrc *vs=vp;
+    abuf b={0}; a_zero(&b,V3_HDR);
+    uint64_t roots[8]={0};
+    const u8 *lodvol=NULL; u8 *owned=NULL; int d=V;
+    for(int lod=0; lod<8 && d>=V2_BLK; ++lod){
+        v3vol vv = lodvol ? (v3vol){lodvol,d,NULL} : (v3vol){NULL,d,vs};
+        g_nchunks=(d+255)/256;
+        roots[lod]=write_node(&b,&vv,V3_SPARSE_LEVELS-1,0,0,0);
+        if(d/2<V2_BLK){ ++lod; break; }
+        u8 *next = lodvol ? decimate(lodvol,d) : decimate_vsrc(vs,d);
+        if(owned) free(owned); owned=next; lodvol=next; d/=2;
+    }
+    if(owned) free(owned);
+    a_u32(&b,V3H_MAGIC,V3_MAGIC); a_u32(&b,V3H_VER,V3_VERSION);
+    a_u32(&b,V3H_NX,V); a_u32(&b,V3H_NY,V); a_u32(&b,V3H_NZ,V);
+    for(int l=0;l<8;++l) a_u64(&b,V3H_ROOTOFF+l*8,roots[l]);
+    a_u64(&b,V3H_TOTLEN,b.len);
+    FILE *of=fopen(outpath,"wb"); if(!of){ perror("fopen out"); free_vsrc(vs); return 1; }
+    fwrite(b.p,1,b.len,of); fclose(of);
+    free(b.p); free_vsrc(vs);
+    return 0;
+}
+
+
 int v3_build_from_zarr(const char *root, const char *outpath, int dim, float quality,
                        const char *metadata, size_t meta_len){
     v2_codec_init(); v2_set_quality(quality);
