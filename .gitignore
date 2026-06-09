@@ -72,3 +72,8 @@ data
 /bench_c4d_1024
 /score
 /crash-*
+
+# vca streaming cache artifacts (local runtime, can be huge — never commit)
+*.vcacache
+*.vcacache.bits
+s3___*
