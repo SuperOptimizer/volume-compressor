@@ -1,0 +1,10 @@
+# compiled lab binaries (build artifacts — rebuild from the .c sources)
+fdct_bench
+v1_whole
+v2lab
+v2lab_af
+v2lab_db
+v3build
+v3build_cm
+v3dectest
+v3enc
