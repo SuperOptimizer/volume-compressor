@@ -58,10 +58,12 @@ if [ "$ROLE" = "deleter" ]; then
   command -v lftp >/dev/null || apt-get install -y -qq lftp >/dev/null
   [ -n "${DELETE_PATHS:-}" ] || { echo "deleter needs DELETE_PATHS"; exit 1; }
   HOST=$(sed -n 's|sftp://\([^/:]*\).*|\1|p' <<<"$SFTP"); PORT=$(sed -n 's|sftp://[^/:]*:\([0-9]*\).*|\1|p' <<<"$SFTP")
+  LOGIN=$(awk '{for(i=1;i<NF;i++) if($i=="login") print $(i+1)}' /etc/volcomp-netrc | head -1)
   cat > /usr/local/bin/volcomp-delete <<EOF2
 #!/bin/bash
 # recursive delete of the listed remote trees over one persistent SFTP session; logs to /var/log/volcomp-delete.log
-exec lftp -p ${PORT:-22} "sftp://$HOST" -e "set sftp:auto-confirm yes; set net:timeout 60; set net:max-retries 20; set net:reconnect-interval-base 5; set cmd:fail-exit no; $(for d in $DELETE_PATHS; do printf 'rm -r -f %s; ' "$d"; done) ls -la /; bye"
+export LFTP_PASSWORD=\$(awk '{for(i=1;i<NF;i++) if(\$i=="password") print \$(i+1)}' /etc/volcomp-netrc | head -1)
+exec lftp --env-password -u $LOGIN -p ${PORT:-22} "sftp://$HOST" -e "set sftp:auto-confirm yes; set sftp:connect-program 'ssh -a -x -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'; set net:timeout 60; set net:max-retries 20; set net:reconnect-interval-base 5; set cmd:fail-exit no; $(for d in $DELETE_PATHS; do printf 'echo == rm -r %s; rm -r -f %s; ' "$d" "$d"; done) echo == remaining:; ls /; bye"
 EOF2
   chmod 755 /usr/local/bin/volcomp-delete
   cat > /etc/systemd/system/volcomp-delete.service <<'EOF2'
