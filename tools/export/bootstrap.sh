@@ -42,9 +42,41 @@ volcomp encode 2>&1 | grep -q usage || test -x /usr/local/bin/volcomp
 install -m 755 tools/export/worker.py /usr/local/bin/volcomp-worker
 install -m 755 tools/export/coordinator.py /usr/local/bin/volcomp-coordinator
 
+umask 077
+if [ -n "${NETRC_CONTENT:-}" ]; then
+  printf '%s\n' "$NETRC_CONTENT" > /etc/volcomp-netrc
+  printf '%s\n' "$NETRC_CONTENT" > /root/.netrc   # lftp / curl on the VM itself
+fi
+umask 022
+
+if [ "$ROLE" = "deleter" ]; then
+  command -v lftp >/dev/null || apt-get install -y -qq lftp >/dev/null
+  [ -n "${DELETE_PATHS:-}" ] || { echo "deleter needs DELETE_PATHS"; exit 1; }
+  HOST=$(sed -n 's|sftp://\([^/:]*\).*|\1|p' <<<"$SFTP"); PORT=$(sed -n 's|sftp://[^/:]*:\([0-9]*\).*|\1|p' <<<"$SFTP")
+  cat > /usr/local/bin/volcomp-delete <<EOF2
+#!/bin/bash
+# recursive delete of the listed remote trees over one persistent SFTP session; logs to /var/log/volcomp-delete.log
+exec lftp -p ${PORT:-22} "sftp://$HOST" -e "set sftp:auto-confirm yes; set net:timeout 60; set net:max-retries 20; set net:reconnect-interval-base 5; set cmd:fail-exit no; $(for d in $DELETE_PATHS; do printf 'rm -r -f %s; ' "$d"; done) ls -la /; bye"
+EOF2
+  chmod 755 /usr/local/bin/volcomp-delete
+  cat > /etc/systemd/system/volcomp-delete.service <<'EOF2'
+[Unit]
+Description=volcomp: delete old SFTP export trees
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c '/usr/local/bin/volcomp-delete >> /var/log/volcomp-delete.log 2>&1'
+RemainAfterExit=yes
+EOF2
+  systemctl daemon-reload
+  systemctl start --no-block volcomp-delete
+  echo "deleter started: DELETE_PATHS=$DELETE_PATHS (log: /var/log/volcomp-delete.log)"
+  exit 0
+fi
+
 if [ "$ROLE" = "worker" ]; then
   umask 077
-  if [ -n "${NETRC_CONTENT:-}" ]; then printf '%s\n' "$NETRC_CONTENT" > /etc/volcomp-netrc; fi
   cat > /etc/volcomp-worker.env <<EOF
 COORDINATOR=$COORDINATOR
 SFTP=$SFTP

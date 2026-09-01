@@ -3,6 +3,7 @@
 
   fleet.py launch --role coordinator [--type v1_cpu_medium]
   fleet.py launch --role worker --count N [--type v1_cpu_medium]
+  fleet.py launch --role deleter                  one small VM that deletes the old SFTP trees (bootstrap --delete-paths)
   fleet.py list                                   fleet instances (named volcomp-coordinator / volcomp-worker-NNN)
   fleet.py wait                                   block until every fleet VM has an IP and answers SSH
   fleet.py bootstrap [--role worker|coordinator] [--commit SHA]
@@ -73,6 +74,8 @@ def role_of(inst):
         return "coordinator"
     if n.startswith("volcomp-worker-"):
         return "worker"
+    if n == "volcomp-deleter":
+        return "deleter"
     return None
 
 
@@ -110,7 +113,7 @@ def cmd_launch(a):
     for k in range(1000):
         if len(launched) >= n:
             break
-        name = f"volcomp-{a.role}" if a.role == "coordinator" else f"volcomp-worker-{k:03d}"
+        name = f"volcomp-worker-{k:03d}" if a.role == "worker" else f"volcomp-{a.role}"
         if name in existing:
             continue
         body = {"region": a.region, "instance_type": a.type, "ssh_key": pub, "username": a.user, "name": name,
@@ -118,8 +121,8 @@ def cmd_launch(a):
         r = call("POST", "/instances/launch-instance", body)
         print(f"launched {name}: {json.dumps(r)[:200]}")
         launched.append(name)
-    if a.role == "coordinator" and not launched:
-        print("coordinator already exists")
+    if a.role != "worker" and not launched:
+        print(f"{a.role} already exists")
 
 
 def cmd_list(a):
@@ -162,7 +165,7 @@ def coordinator_ip(prefer_internal=True):
 def cmd_bootstrap(a):
     with open(os.path.join(HERE, "bootstrap.sh")) as f:
         script = f.read()
-    coord_ip, coord = coordinator_ip(not a.public_coordinator)
+    coord_ip, coord = coordinator_ip(not a.public_coordinator) if instances("coordinator") else (None, {"ip_address": None})
     netrc = ""
     if a.netrc:
         with open(os.path.expanduser(a.netrc)) as f:
@@ -174,7 +177,7 @@ def cmd_bootstrap(a):
         role = role_of(i)
         env = {"ROLE": role, "COMMIT": a.commit, "REPO": REPO, "COORDINATOR": f"http://{coord_ip}:{a.port}",
                "SFTP": a.sftp or "", "NETRC_CONTENT": netrc, "Q": str(a.q), "PARALLEL": str(a.parallel),
-               "SAMPLES": str(a.samples), "PORT": str(a.port)}
+               "SAMPLES": str(a.samples), "PORT": str(a.port), "DELETE_PATHS": a.delete_paths or ""}
         exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items())
         print(f"== bootstrap {i['name']} ({role}) at {i['ip_address']}")
         r = subprocess.run(ssh_cmd(i["ip_address"], a.user, "sudo -E bash -s"), input=exports + script, text=True,
@@ -214,7 +217,7 @@ def main():
     ap.add_argument("--ssh-pub", default="~/.ssh/id_ed25519.pub")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("launch")
-    p.add_argument("--role", choices=["coordinator", "worker"], required=True)
+    p.add_argument("--role", choices=["coordinator", "worker", "deleter"], required=True)
     p.add_argument("--count", type=int, default=1)
     p.add_argument("--type", default="v1_cpu_medium")
     p.add_argument("--region", default="igl")
@@ -237,6 +240,7 @@ def main():
     p.add_argument("--samples", type=int, default=8)
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--public-coordinator", action="store_true", help="workers reach the coordinator by public IP")
+    p.add_argument("--delete-paths", help="deleter role: space-separated remote dirs to remove recursively")
     p.add_argument("--verbose", action="store_true")
     p.set_defaults(fn=cmd_bootstrap)
     p = sub.add_parser("ssh")
