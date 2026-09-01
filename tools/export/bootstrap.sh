@@ -4,6 +4,11 @@
 # NETRC_CONTENT, Q, PARALLEL, SAMPLES, PORT. Idempotent.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+# fresh images run unattended-upgrades at boot; wait for the package locks
+for i in $(seq 1 120); do
+  fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock >/dev/null 2>&1 || break
+  sleep 5
+done
 
 # latest stable clang from apt.llvm.org (the distro clang is too old for C23)
 if ! ls /usr/bin/clang-[0-9]* >/dev/null 2>&1 || [ "$(ls /usr/bin/clang-[0-9]* | sed 's/.*clang-//' | sort -n | tail -1)" -lt 18 ]; then
