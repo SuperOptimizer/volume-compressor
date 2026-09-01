@@ -1,0 +1,11 @@
+Checks: >
+  bugprone-*,
+  clang-analyzer-*,
+  performance-*,
+  readability-misplaced-array-index,
+  readability-enum-initial-value,
+  misc-include-cleaner,
+  -bugprone-easily-swappable-parameters,
+  -misc-include-cleaner
+WarningsAsErrors: 'bugprone-narrowing-conversions,bugprone-implicit-widening-of-multiplication-result,clang-analyzer-core.BitwiseShift,clang-analyzer-core.DivideZero'
+HeaderFilterRegex: '(src|tools|tests)/.*'

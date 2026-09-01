@@ -1,0 +1,7 @@
+BasedOnStyle: LLVM
+IndentWidth: 2
+ColumnLimit: 100
+AlignConsecutiveMacros: true
+AllowShortFunctionsOnASingleLine: Inline
+PointerAlignment: Right
+SortIncludes: true

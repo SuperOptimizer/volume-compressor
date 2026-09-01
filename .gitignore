@@ -53,3 +53,12 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# volcomp
+build*/
+corpus/tune/
+corpus/heldout/
+*.u8
+!tests/golden/*.u8
+*.volc
+!tests/golden/*.volc
