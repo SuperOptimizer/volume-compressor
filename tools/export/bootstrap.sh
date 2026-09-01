@@ -86,7 +86,14 @@ if [ "$ROLE" = "worker" ]; then
   umask 077
   # scratch: tmpfs when there is RAM for it (1 GiB per shard in flight), else disk; small VMs run 2 shards
   MEM_GB=$(awk '/MemTotal/{print int($2/1048576)}' /proc/meminfo)
-  if [ "$MEM_GB" -ge 6 ]; then TMP=/dev/shm/volcomp; else TMP=/var/tmp/volcomp; PARALLEL=$(( PARALLEL < 2 ? PARALLEL : 2 )); fi
+  if [ "$MEM_GB" -ge 6 ]; then
+    TMP=/dev/shm/volcomp
+  else
+    TMP=/var/tmp/volcomp; PARALLEL=$(( PARALLEL < 2 ? PARALLEL : 2 ))
+    if [ ! -f /swapfile ]; then  # small VMs: 4 GB of swap on the local disk as a safety margin
+      fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap -q /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    fi
+  fi
   cat > /etc/volcomp-worker.env <<EOF
 COORDINATOR=$COORDINATOR
 SFTP=$SFTP
