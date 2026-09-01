@@ -3,6 +3,7 @@
 #define BAKE_METRICS_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 /* Peak signal-to-noise ratio in dB; returns INFINITY for identical input. */

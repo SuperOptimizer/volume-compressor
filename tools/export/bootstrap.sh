@@ -5,9 +5,9 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-if ! command -v clang >/dev/null || ! command -v cmake >/dev/null || ! command -v ninja >/dev/null; then
+if ! command -v clang >/dev/null || ! command -v git >/dev/null; then
   apt-get update -qq
-  apt-get install -y -qq clang cmake ninja-build git curl python3 >/dev/null
+  apt-get install -y -qq clang git curl python3 >/dev/null
 fi
 grep -q -w avx2 /proc/cpuinfo && grep -q -w fma /proc/cpuinfo || { echo "CPU lacks AVX2/FMA"; exit 1; }
 
@@ -18,9 +18,13 @@ fi
 cd /opt/volume-compressor
 git fetch -q origin
 git checkout -q "$COMMIT" 2>/dev/null || git checkout -q "origin/$COMMIT"
-cmake -S . -B build/release -G Ninja -DCMAKE_BUILD_TYPE=Release -DVOLCOMP_NATIVE=ON -DVOLCOMP_BENCH=OFF >/dev/null
-cmake --build build/release --target volcomp_cli >/dev/null
-install -m 755 build/release/volcomp /usr/local/bin/volcomp
+# direct build (the distro CMake may be older than the project requires); clang < 18 spells C23 "c2x"
+STD=c23; clang -std=c23 -x c -E /dev/null >/dev/null 2>&1 || STD=c2x
+mkdir -p build
+clang -std=$STD -O3 -march=native -D_GNU_SOURCE -I. -Itools/bench -Itools/cli \
+  tools/cli/volcomp.c tools/bench/metrics.c -lm -o build/volcomp
+install -m 755 build/volcomp /usr/local/bin/volcomp
+volcomp 2>&1 | grep -q usage
 install -m 755 tools/export/worker.py /usr/local/bin/volcomp-worker
 install -m 755 tools/export/coordinator.py /usr/local/bin/volcomp-coordinator
 
