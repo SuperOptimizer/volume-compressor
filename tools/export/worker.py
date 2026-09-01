@@ -203,14 +203,11 @@ def process_unit(unit, a, pool):
         n_jobs, present = download_shard(unit, workdir, pool)
         t1 = time.time()
         shard = os.path.join(workdir, "out.shard")
-        info = {"present": 0, "payload": 0}
+        q = float(unit.get("q", a.q))  # the coordinator sets q per multiscale level
+        info = parse_kv(run([a.volcomp, "shard-pack", workdir, shard, f"--q={q}"]))
         if present:
-            info = parse_kv(run([a.volcomp, "shard-pack", workdir, shard, f"--q={a.q}"]))
-            v = parse_kv(run([a.volcomp, "shard-verify", shard, workdir, f"--samples={a.samples}"]))
-            info.update(v)
-        else:
-            # every chunk is masked/absent: still write a shard so readers get an all-missing index
-            info = parse_kv(run([a.volcomp, "shard-pack", workdir, shard, f"--q={a.q}"]))
+            info.update(parse_kv(run([a.volcomp, "shard-verify", shard, workdir, f"--samples={a.samples}"])))
+        # (an all-masked shard is still written so readers get an all-missing index)
         t2 = time.time()
         size = os.path.getsize(shard)
         key = shard_key(unit)
@@ -219,7 +216,7 @@ def process_unit(unit, a, pool):
         else:
             sftp_upload(shard, a.sftp, key, a.netrc)
         t3 = time.time()
-        log(f"done #{unit['id']} {key}: {present}/{n_jobs} chunks, {size / 1e6:.1f} MB, "
+        log(f"done #{unit['id']} {key}: q{q:g} {present}/{n_jobs} chunks, {size / 1e6:.1f} MB, "
             f"psnr_min {info.get('psnr_min', 0):.1f}, dl {t1 - t0:.1f}s enc {t2 - t1:.1f}s up {t3 - t2:.1f}s")
         return {"id": unit["id"], "bytes": size, "present": info.get("present", present),
                 "psnr_min": info.get("psnr_min"), "max_err": info.get("max_err")}
@@ -297,7 +294,7 @@ def main():
     p.add_argument("--local-out", help="store shards under this directory instead of uploading")
     p.add_argument("--parallel", type=int, default=4, help="shards in flight per process")
     p.add_argument("--connections", type=int, default=32, help="S3 connections per shard in flight")
-    p.add_argument("--q", type=float, default=8.0)
+    p.add_argument("--q", type=float, default=8.0, help="fallback only; the coordinator assigns q per level")
     p.add_argument("--samples", type=int, default=8, help="chunks per shard compared against the source (0 = all)")
     p.add_argument("--exit-when-idle", action="store_true")
     p.set_defaults(fn=cmd_run)

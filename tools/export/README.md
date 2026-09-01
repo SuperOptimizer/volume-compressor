@@ -3,7 +3,7 @@
 Re-encodes every uncompressed volume of the Vesuvius Challenge open-data bucket
 (`vesuvius-challenge-open-data`, 64 volumes, ~760 TB logical at level 0 plus the
 LOD pyramids) into zarr v3 `sharding_indexed` arrays — 1024³ shards of 128³
-`volcomp` chunks, q = 8 — under `sftp://dl.ash2txt.org:9238/volcomp/`, mirroring the
+`volcomp` chunks (q = 8 at native resolution, 4 / 2 / 1 at LOD levels 1 / 2 / ≥3: downscaling averages noise away, so coarser levels keep more) — under `sftp://dl.ash2txt.org:9238/volcomp/`, mirroring the
 bucket keys: `volcomp/<scroll>/volumes/<volume>.zarr/<level>/c/<sz>/<sy>/<sx>`.
 
 Everything is Python 3 standard library + the `volcomp` CLI + OpenSSH `sftp` (+`sshpass`); nothing to

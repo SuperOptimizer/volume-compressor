@@ -11,7 +11,8 @@ Compute VMs run tools/export/worker.py against the HTTP API below.
       already present are left alone (progress is never lost).
   coordinator.py metadata  --db export.db --out DIR [--q 8]
       Write the zarr v3 group/array metadata (OME-Zarr 0.5 multiscales,
-      sharding_indexed 1024^3 -> 128^3, codec "volcomp") into DIR mirroring
+      sharding_indexed 1024^3 -> 128^3, codec "volcomp" with q = 8 at level 0,
+      4 / 2 / 1 at levels 1 / 2 / >=3) into DIR mirroring
       the bucket keys; upload DIR to the SFTP destination with worker.py's
       `upload-tree` (or any sftp client).
   coordinator.py serve     --db export.db [--bind 0.0.0.0] [--port 8765] [--lease 900]
@@ -44,6 +45,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 BUCKET = "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com"
 SHARD = 1024
 CHUNK = 128
+Q_NATIVE = 8.0
+
+
+def level_q(level, q0=Q_NATIVE):
+    """Quantiser per multiscale level: q0 at native resolution, halved per 2x downscale,
+    floor 1 (downscaled levels average away noise, so they carry more signal per voxel)."""
+    return max(1.0, q0 / (2 ** level))
 S3NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
 
 # ----------------------------------------------------------------------------- S3 listing
@@ -174,6 +182,7 @@ def cmd_manifest(a):
 
 
 def array_metadata(shape, q):
+    """zarr v3 array metadata for one level; q is that level's quantiser."""
     return {
         "zarr_format": 3,
         "node_type": "array",
@@ -229,7 +238,7 @@ def cmd_metadata(a):
             d = os.path.join(root, str(lvl))
             os.makedirs(d, exist_ok=True)
             with open(os.path.join(d, "zarr.json"), "w") as f:
-                json.dump(array_metadata(info["shape"], a.q), f, indent=2)
+                json.dump(array_metadata(info["shape"], level_q(lvl, a.q)), f, indent=2)
         n += 1
     print(f"wrote metadata for {n} volumes under {a.out}")
 
@@ -269,7 +278,7 @@ class Coordinator:
             self.db.execute("UPDATE unit SET state='leased', worker=?, lease_until=?, attempts=attempts+1 WHERE id=?",
                             (worker, now + self.lease, uid))
         return {"id": uid, "volume": vol, "level": lvl, "shard": [sz, sy, sx], "shape": shape,
-                "lease_seconds": self.lease}
+                "q": level_q(lvl), "lease_seconds": self.lease}
 
     def done(self, body):
         with self.lock:
@@ -349,6 +358,10 @@ def cmd_requeue(a):
     db = open_db(a.db)
     n = db.execute("UPDATE unit SET state='todo', worker=NULL, lease_until=NULL, attempts=0, error=NULL "
                    "WHERE state IN ('leased','failed')").rowcount
+    if a.done_levels:
+        lv = [int(x) for x in a.done_levels.split(",")]
+        n += db.execute("UPDATE unit SET state='todo', worker=NULL, lease_until=NULL, attempts=0, error=NULL, "
+                        f"bytes=NULL, done_at=NULL WHERE state='done' AND level IN ({','.join('?' * len(lv))})", lv).rowcount
     print(f"requeued {n} units")
 
 
@@ -375,7 +388,7 @@ def main():
     p = sub.add_parser("metadata")
     p.add_argument("--db", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--q", type=float, default=8.0)
+    p.add_argument("--q", type=float, default=Q_NATIVE, help="native-resolution q; halved per level, floor 1")
     p.set_defaults(fn=cmd_metadata)
     p = sub.add_parser("serve")
     p.add_argument("--db", required=True)
@@ -388,6 +401,7 @@ def main():
     p.set_defaults(fn=cmd_report)
     p = sub.add_parser("requeue", help="put leased/failed units back in the queue")
     p.add_argument("--db", required=True)
+    p.add_argument("--done-levels", help="also redo finished units of these levels (comma list)")
     p.set_defaults(fn=cmd_requeue)
     a = ap.parse_args()
     a.fn(a)
