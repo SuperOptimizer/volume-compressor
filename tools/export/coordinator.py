@@ -239,7 +239,8 @@ def cmd_metadata(a):
 
 class Coordinator:
     def __init__(self, db, lease):
-        self.db, self.lease, self.lock = db, lease, threading.Lock()
+        self.db, self.lease, self.lock = db, lease, threading.RLock()
+        self.max_attempts = 8
         self._levels = {}  # volume -> {level: {"shape": ...}}; filled lazily so manifests can be added while serving
 
     def levels(self, vol):
@@ -253,16 +254,17 @@ class Coordinator:
     def claim(self, worker):
         with self.lock:
             now = time.time()
-            row = self.db.execute(
-                "SELECT id, volume, level, sz, sy, sx, attempts FROM unit WHERE state='todo' "
-                "OR (state='leased' AND lease_until < ?) ORDER BY attempts, volume, level, id LIMIT 1", (now,)).fetchone()
-            if row is None:
-                return None
-            uid, vol, lvl, sz, sy, sx, attempts = row
-            if attempts >= 8:
-                # give up on poison units so the queue can drain; they stay visible in /status
+            while True:
+                row = self.db.execute(
+                    "SELECT id, volume, level, sz, sy, sx, attempts FROM unit WHERE state='todo' "
+                    "OR (state='leased' AND lease_until < ?) ORDER BY attempts, volume, level, id LIMIT 1", (now,)).fetchone()
+                if row is None:
+                    return None
+                uid, vol, lvl, sz, sy, sx, attempts = row
+                if attempts < self.max_attempts:
+                    break
+                # give up on poison units so the queue can drain; they stay visible in /status as "failed"
                 self.db.execute("UPDATE unit SET state='failed' WHERE id=?", (uid,))
-                return self.claim(worker)
             shape = self.levels(vol)[lvl]["shape"]  # before the lease so a bad row cannot leak a lease
             self.db.execute("UPDATE unit SET state='leased', worker=?, lease_until=?, attempts=attempts+1 WHERE id=?",
                             (worker, now + self.lease, uid))
@@ -345,7 +347,8 @@ def cmd_serve(a):
 
 def cmd_requeue(a):
     db = open_db(a.db)
-    n = db.execute("UPDATE unit SET state='todo', worker=NULL, lease_until=NULL WHERE state IN ('leased','failed')").rowcount
+    n = db.execute("UPDATE unit SET state='todo', worker=NULL, lease_until=NULL, attempts=0, error=NULL "
+                   "WHERE state IN ('leased','failed')").rowcount
     print(f"requeued {n} units")
 
 
