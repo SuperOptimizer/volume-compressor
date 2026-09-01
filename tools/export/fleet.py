@@ -45,7 +45,8 @@ def api_key():
 def call(method, path, body=None, retries=5):
     data = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(API + path, data=data, method=method,
-                                 headers={"X-API-Key": api_key(), "Content-Type": "application/json"})
+                                 headers={"X-API-Key": api_key(), "Content-Type": "application/json",
+                                          "User-Agent": "volcomp-fleet/1.0 (curl-compatible)"})  # CF blocks urllib UA
     for attempt in range(retries):
         try:
             with urllib.request.urlopen(req, timeout=120) as r:
