@@ -21,6 +21,7 @@ shard, so a VM is bound by its S3 download rate. Shard keys mirror the bucket:
 """
 import argparse
 import concurrent.futures as cf
+import http.client
 import json
 import os
 import re
@@ -29,8 +30,10 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 BUCKET = "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com"
@@ -69,56 +72,100 @@ def api(url, path, body=None, retries=1000):
 
 # ----------------------------------------------------------------------------- S3 download
 
+BUCKET_HOST = "vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com"
+_tls = threading.local()
+
 
 class ChunkFetchError(Exception):
     pass
 
 
-def fetch_chunk(key, dest, retries=8):
-    """GET one source chunk. Returns True if stored, False if the key does not exist
-    (masked region). Anything else retries, then raises: a transient failure must
-    never be mistaken for a missing chunk."""
-    url = BUCKET + "/" + key
+def s3_conn(reset=False):
+    """One keep-alive HTTPS connection per thread (a fresh TLS handshake per 2 MiB
+    object was the bottleneck: ~25 MB/s per VM and a saturated CPU)."""
+    c = getattr(_tls, "conn", None)
+    if c is None or reset:
+        if c is not None:
+            try:
+                c.close()
+            except Exception:  # noqa: BLE001
+                pass
+        c = http.client.HTTPSConnection(BUCKET_HOST, timeout=120)
+        _tls.conn = c
+    return c
+
+
+def s3_request(path, retries=8):
+    """GET an object path (already URL-encoded). Returns bytes, or None on 404."""
+    err = "?"
     for attempt in range(retries):
         try:
-            with urllib.request.urlopen(url, timeout=120) as r:
-                data = r.read()
-            if len(data) != CHUNK_BYTES:
-                raise ChunkFetchError(f"{key}: {len(data)} bytes, expected {CHUNK_BYTES}")
-            tmp = dest + ".part"
-            with open(tmp, "wb") as f:
-                f.write(data)
-            os.replace(tmp, dest)
-            return True
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                return False
-            err = f"HTTP {e.code}"
-        except (urllib.error.URLError, socket.timeout, ConnectionError, OSError, ChunkFetchError) as e:
+            c = s3_conn(reset=attempt > 0)
+            c.request("GET", path, headers={"Connection": "keep-alive"})
+            r = c.getresponse()
+            body = r.read()
+            if r.status == 200:
+                return body
+            if r.status == 404:
+                return None
+            err = f"HTTP {r.status}"
+            if 400 <= r.status < 500 and r.status not in (408, 429):
+                raise ChunkFetchError(f"{path}: {err}")
+        except ChunkFetchError:
+            raise
+        except (http.client.HTTPException, socket.timeout, ConnectionError, OSError) as e:
             err = repr(e)
         time.sleep(min(30, 1.5 ** attempt))
-    raise ChunkFetchError(f"{key}: giving up after {retries} attempts ({err})")
+    raise ChunkFetchError(f"{path}: giving up after {retries} attempts ({err})")
+
+
+def s3_list_row(prefix):
+    """Keys under prefix (a single 128-chunk row: <vol><level>/<cz>/<cy>/), <= 1000 keys."""
+    q = urllib.parse.urlencode({"list-type": "2", "prefix": prefix, "max-keys": "1000"})
+    body = s3_request("/?" + q)
+    if body is None:
+        raise ChunkFetchError(f"list {prefix}: 404")
+    return set(re.findall(rb"<Key>([^<]+)</Key>", body))
+
+
+def fetch_chunk(key, dest):
+    """GET one source chunk into dest. True if stored, False if the key does not exist
+    (masked region). Transient failures retry and then raise: they are never
+    mistaken for a missing chunk."""
+    data = s3_request("/" + urllib.parse.quote(key))
+    if data is None:
+        return False
+    if len(data) != CHUNK_BYTES:
+        raise ChunkFetchError(f"{key}: {len(data)} bytes, expected {CHUNK_BYTES}")
+    tmp = dest + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, dest)
+    return True
 
 
 def download_shard(unit, workdir, pool):
     """Fetch the (up to) 512 chunks of one shard into workdir/z_y_x.u8.
-    Chunks outside the level's chunk grid are skipped; missing keys are masked air."""
+    Chunks outside the level's chunk grid are skipped. Each (cz, cy) row is listed
+    first (64 small requests per shard) so masked/absent chunks cost no GETs."""
     vol, lvl = unit["volume"], unit["level"]
     sz, sy, sx = unit["shard"]
     grid = [(n + 127) // 128 for n in unit["shape"]]
-    jobs = []
-    for z in range(SHARD_CHUNKS):
-        for y in range(SHARD_CHUNKS):
-            for x in range(SHARD_CHUNKS):
-                cz, cy, cx = sz * 8 + z, sy * 8 + y, sx * 8 + x
-                if cz >= grid[0] or cy >= grid[1] or cx >= grid[2]:
-                    continue
-                key = f"{vol}{lvl}/{cz}/{cy}/{cx}"
-                jobs.append(pool.submit(fetch_chunk, key, os.path.join(workdir, f"{z}_{y}_{x}.u8")))
+    rows = [(cz, cy) for cz in range(sz * 8, min(sz * 8 + 8, grid[0])) for cy in range(sy * 8, min(sy * 8 + 8, grid[1]))]
+    listed = list(pool.map(lambda r: s3_list_row(f"{vol}{lvl}/{r[0]}/{r[1]}/"), rows))
+    jobs, n_in_grid = [], 0
+    for (cz, cy), keys in zip(rows, listed):
+        for cx in range(sx * 8, min(sx * 8 + 8, grid[2])):
+            n_in_grid += 1
+            key = f"{vol}{lvl}/{cz}/{cy}/{cx}"
+            if key.encode() not in keys:
+                continue
+            dest = os.path.join(workdir, f"{cz - sz * 8}_{cy - sy * 8}_{cx - sx * 8}.u8")
+            jobs.append(pool.submit(fetch_chunk, key, dest))
     present = 0
     for j in jobs:
         present += bool(j.result())  # raises ChunkFetchError on a hard failure
-    return len(jobs), present
+    return n_in_grid, present
 
 
 # ----------------------------------------------------------------------------- pack / verify / upload
@@ -293,7 +340,7 @@ def main():
     p.add_argument("--netrc", help="netrc file with the SFTP credentials")
     p.add_argument("--local-out", help="store shards under this directory instead of uploading")
     p.add_argument("--parallel", type=int, default=4, help="shards in flight per process")
-    p.add_argument("--connections", type=int, default=32, help="S3 connections per shard in flight")
+    p.add_argument("--connections", type=int, default=16, help="keep-alive S3 connections per shard in flight")
     p.add_argument("--q", type=float, default=8.0, help="fallback only; the coordinator assigns q per level")
     p.add_argument("--samples", type=int, default=8, help="chunks per shard compared against the source (0 = all)")
     p.add_argument("--exit-when-idle", action="store_true")
