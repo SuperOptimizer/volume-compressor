@@ -5,10 +5,25 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-if ! command -v clang >/dev/null || ! command -v git >/dev/null; then
+# latest stable clang from apt.llvm.org (the distro clang is too old for C23)
+if ! ls /usr/bin/clang-[0-9]* >/dev/null 2>&1 || [ "$(ls /usr/bin/clang-[0-9]* | sed 's/.*clang-//' | sort -n | tail -1)" -lt 18 ]; then
   apt-get update -qq
-  apt-get install -y -qq clang git curl python3 >/dev/null
+  apt-get install -y -qq git curl python3 wget lsb-release software-properties-common gnupg >/dev/null
+  curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+  bash /tmp/llvm.sh >/dev/null 2>&1 || bash /tmp/llvm.sh   # no version argument = current stable
 fi
+CLANG=$(ls /usr/bin/clang-[0-9]* | sort -t- -k2 -n | tail -1)
+ln -sf "$CLANG" /usr/local/bin/clang
+# latest CMake release (official binary tarball) + ninja
+if ! [ -x /opt/cmake/bin/cmake ]; then
+  apt-get install -y -qq ninja-build curl >/dev/null
+  CMAKE_URL=$(curl -fsSL -H 'User-Agent: volcomp-bootstrap' https://api.github.com/repos/Kitware/CMake/releases/latest \
+    | grep -o 'https://[^"]*cmake-[0-9.]*-linux-x86_64.tar.gz' | head -1)
+  curl -fsSL "$CMAKE_URL" -o /tmp/cmake.tgz
+  rm -rf /opt/cmake && mkdir -p /opt/cmake && tar -xzf /tmp/cmake.tgz -C /opt/cmake --strip-components=1
+fi
+ln -sf /opt/cmake/bin/cmake /usr/local/bin/cmake
+echo "using $($CLANG --version | head -1), $(cmake --version | head -1)"
 grep -q -w avx2 /proc/cpuinfo && grep -q -w fma /proc/cpuinfo || { echo "CPU lacks AVX2/FMA"; exit 1; }
 
 # source + build at the pinned commit
@@ -18,12 +33,10 @@ fi
 cd /opt/volume-compressor
 git fetch -q origin
 git checkout -q "$COMMIT" 2>/dev/null || git checkout -q "origin/$COMMIT"
-# direct build (the distro CMake may be older than the project requires); clang < 18 spells C23 "c2x"
-STD=c23; clang -std=c23 -x c -E /dev/null >/dev/null 2>&1 || STD=c2x
-mkdir -p build
-clang -std=$STD -O3 -march=native -D_GNU_SOURCE -I. -Itools/bench -Itools/cli \
-  tools/cli/volcomp.c tools/bench/metrics.c -lm -o build/volcomp
-install -m 755 build/volcomp /usr/local/bin/volcomp
+cmake -S . -B build/release -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER="$CLANG" \
+  -DVOLCOMP_NATIVE=ON -DVOLCOMP_BENCH=OFF >/dev/null
+cmake --build build/release --target volcomp_cli >/dev/null
+install -m 755 build/release/volcomp /usr/local/bin/volcomp
 volcomp 2>&1 | grep -q usage
 install -m 755 tools/export/worker.py /usr/local/bin/volcomp-worker
 install -m 755 tools/export/coordinator.py /usr/local/bin/volcomp-coordinator
