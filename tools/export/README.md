@@ -85,4 +85,6 @@ requests per second at hundreds of workers).
 (`import volcomp_zarr` before `zarr.open`). The group `zarr.json` carries
 OME-Zarr 0.5 multiscales copied from the source `.zattrs`; array shapes are the
 true source shapes (edge shards are partial; chunks beyond the shape or in
-masked air are "missing" index entries and read back as the fill value 0).
+masked air are "missing" index entries and read back as the fill value 0;
+shards with no data at all are not written — a missing shard key is the fill
+value in zarr v3).

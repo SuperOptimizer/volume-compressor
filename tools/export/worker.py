@@ -251,13 +251,16 @@ def process_unit(unit, a, pool):
         t1 = time.time()
         shard = os.path.join(workdir, "out.shard")
         q = float(unit.get("q", a.q))  # the coordinator sets q per multiscale level
+        key = shard_key(unit)
+        if not present:
+            # all chunks masked/absent: no shard is written at all — in zarr v3 a missing
+            # shard key reads as the fill value, and this saves an SFTP session per empty shard
+            log(f"done #{unit['id']} {key}: q{q:g} 0/{n_jobs} chunks, empty (not written), dl {t1 - t0:.1f}s")
+            return {"id": unit["id"], "bytes": 0, "present": 0, "psnr_min": None, "max_err": None}
         info = parse_kv(run([a.volcomp, "shard-pack", workdir, shard, f"--q={q}"]))
-        if present:
-            info.update(parse_kv(run([a.volcomp, "shard-verify", shard, workdir, f"--samples={a.samples}"])))
-        # (an all-masked shard is still written so readers get an all-missing index)
+        info.update(parse_kv(run([a.volcomp, "shard-verify", shard, workdir, f"--samples={a.samples}"])))
         t2 = time.time()
         size = os.path.getsize(shard)
-        key = shard_key(unit)
         if a.local_out:
             local_store(shard, a.local_out, key)
         else:
