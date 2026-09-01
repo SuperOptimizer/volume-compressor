@@ -286,10 +286,28 @@ def process_unit(unit, a, pool):
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def sweep_scratch(tmp, max_age):
+    """Remove shard-* work directories older than max_age seconds: a killed worker (service
+    restart) leaves its in-flight downloads behind, and on a tmpfs scratch that fills the RAM."""
+    n = 0
+    for name in os.listdir(tmp):
+        d = os.path.join(tmp, name)
+        try:
+            if name.startswith("shard-") and time.time() - os.stat(d).st_mtime > max_age:
+                shutil.rmtree(d, ignore_errors=True)
+                n += 1
+        except OSError:
+            pass
+    if n:
+        log(f"removed {n} stale scratch directories from {tmp}")
+
+
 def cmd_run(a):
     if not a.local_out and not (a.sftp and a.netrc):
         sys.exit("need --sftp and --netrc, or --local-out")
     os.makedirs(a.tmp, exist_ok=True)
+    sweep_scratch(a.tmp, 0)  # nothing of ours can be in flight at startup: one worker process per scratch dir
+    last_sweep = time.time()
     worker_id = f"{socket.gethostname()}:{os.getpid()}"
     log(f"worker {worker_id} -> {a.coordinator}, {a.parallel} shards in flight")
     dl_pool = cf.ThreadPoolExecutor(max_workers=a.connections * a.parallel)
@@ -315,6 +333,9 @@ def cmd_run(a):
                 time.sleep(30)
                 continue
             idle_since = None
+            if time.time() - last_sweep > 600:
+                sweep_scratch(a.tmp, 3600)  # a unit never legitimately lives longer than its 15 min lease
+                last_sweep = time.time()
             done, _ = cf.wait(list(inflight), return_when=cf.FIRST_COMPLETED)
             for fut in done:
                 unit = inflight.pop(fut)
