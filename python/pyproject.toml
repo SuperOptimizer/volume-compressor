@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "volcomp-zarr"
+version = "1.0.0"
+description = "zarr v3 codec and ctypes binding for the volcomp uint8 volume compressor"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+zarr = ["zarr>=3.0", "numpy"]
+
+[project.entry-points."zarr.codecs"]
+volcomp = "volcomp_zarr:VolcompCodec"
+
+[tool.setuptools]
+packages = ["volcomp_zarr"]
+package-data = { volcomp_zarr = ["libvolcomp.so", "libvolcomp.dylib"] }

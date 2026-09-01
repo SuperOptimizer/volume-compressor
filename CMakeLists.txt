@@ -78,3 +78,8 @@ if(VOLCOMP_FUZZ)
     target_link_options(fuzz_${tgt} PRIVATE -fsanitize=fuzzer,address,undefined)
   endforeach()
 endif()
+
+# shared library with exported entry points for ctypes / FFI (python/volcomp_zarr)
+add_library(volcomp_shim SHARED python/volcomp_shim.c)
+target_link_libraries(volcomp_shim PRIVATE volcomp)
+set_target_properties(volcomp_shim PROPERTIES OUTPUT_NAME volcomp C_VISIBILITY_PRESET hidden)
