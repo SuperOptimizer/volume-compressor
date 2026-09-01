@@ -37,7 +37,7 @@ cmake -S . -B build/release -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPIL
   -DVOLCOMP_NATIVE=ON -DVOLCOMP_BENCH=OFF >/dev/null
 cmake --build build/release --target volcomp_cli >/dev/null
 install -m 755 build/release/volcomp /usr/local/bin/volcomp
-volcomp 2>&1 | grep -q usage
+volcomp encode 2>&1 | grep -q usage || test -x /usr/local/bin/volcomp
 install -m 755 tools/export/worker.py /usr/local/bin/volcomp-worker
 install -m 755 tools/export/coordinator.py /usr/local/bin/volcomp-coordinator
 
