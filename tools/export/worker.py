@@ -146,26 +146,38 @@ def fetch_chunk(key, dest):
 
 def download_shard(unit, workdir, pool):
     """Fetch the (up to) 512 chunks of one shard into workdir/z_y_x.u8.
-    Chunks outside the level's chunk grid are skipped. Each (cz, cy) row is listed
-    first (64 small requests per shard) so masked/absent chunks cost no GETs."""
+    Chunks outside the level's chunk grid are skipped. With an occupancy mask from
+    the coordinator (bit (cz*8+cy)*8+cx within the shard, dilated: set wherever the
+    coarsest level has data nearby) only masked-in chunks are requested and a 404 is
+    simply "absent". Without a mask each (cz, cy) row is listed first (64 small
+    requests per shard) so masked/absent chunks cost no GETs."""
     vol, lvl = unit["volume"], unit["level"]
     sz, sy, sx = unit["shard"]
     grid = [(n + 127) // 128 for n in unit["shape"]]
+    mask = bytes.fromhex(unit["mask"]) if unit.get("mask") else None
     rows = [(cz, cy) for cz in range(sz * 8, min(sz * 8 + 8, grid[0])) for cy in range(sy * 8, min(sy * 8 + 8, grid[1]))]
-    listed = list(pool.map(lambda r: s3_list_row(f"{vol}{lvl}/{r[0]}/{r[1]}/"), rows))
-    jobs, n_in_grid = [], 0
+    if mask is None:
+        listed = list(pool.map(lambda r: s3_list_row(f"{vol}{lvl}/{r[0]}/{r[1]}/"), rows))
+    else:
+        listed = [None] * len(rows)
+    jobs, n_in_grid, n_masked = [], 0, 0
     for (cz, cy), keys in zip(rows, listed):
         for cx in range(sx * 8, min(sx * 8 + 8, grid[2])):
             n_in_grid += 1
             key = f"{vol}{lvl}/{cz}/{cy}/{cx}"
-            if key.encode() not in keys:
+            if mask is not None:
+                bit = ((cz - sz * 8) * 8 + (cy - sy * 8)) * 8 + (cx - sx * 8)
+                if not mask[bit >> 3] >> (bit & 7) & 1:
+                    n_masked += 1
+                    continue
+            elif key.encode() not in keys:
                 continue
             dest = os.path.join(workdir, f"{cz - sz * 8}_{cy - sy * 8}_{cx - sx * 8}.u8")
             jobs.append(pool.submit(fetch_chunk, key, dest))
     present = 0
     for j in jobs:
         present += bool(j.result())  # raises ChunkFetchError on a hard failure
-    return n_in_grid, present
+    return n_in_grid - n_masked, present
 
 
 # ----------------------------------------------------------------------------- pack / verify / upload

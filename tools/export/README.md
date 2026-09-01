@@ -24,6 +24,26 @@ simply lets its leases expire. `/done` is idempotent, uploads are atomic
 (`<key>.part` → rename), and the manifest can be rebuilt at any time without
 losing progress, so the whole thing is safe to stop and resume.
 
+## Occupancy masks (`coordinator.py occupancy`)
+
+Most of every volume is masked air. Before (or while) the workers run, the
+coordinator downloads each volume's coarsest level (≤ 5; a level-5 voxel is a
+32³ block of native voxels, so the whole level is 1/32768 of the data) and runs
+`volcomp occupancy --chunks` on it once per level: a chunk of level *k* is
+"occupied" when any coarse voxel within its footprint, dilated by one coarse
+voxel, is nonzero. Every unit gets a 512-bit chunk mask and `est`, the number
+of occupied chunks; units with `est = 0` are marked done on the spot (a missing
+shard key is the fill value) and workers request only masked-in chunks (a 404
+is simply "absent"; no per-row listing). `report` uses Σ`est` of the remaining
+units for the ETA. Checked on a real volume: every chunk stored in S3 was
+masked in. The one thing the mask can drop is an isolated speck whose 32³ mean
+rounds to 0 with nothing nonzero in the neighbouring coarse voxels.
+
+```sh
+sudo systemd-run --unit volcomp-occupancy volcomp-coordinator occupancy --db /var/lib/volcomp/export.db --volcomp /usr/local/bin/volcomp --tmp /var/tmp/volcomp-occ
+journalctl -u volcomp-occupancy -f
+```
+
 ## Verification per shard (`volcomp shard-verify`)
 
 - index size and CRC-32C parse;
@@ -49,6 +69,7 @@ tools/export/fleet.py bootstrap --commit <sha> --sftp sftp://dl.ash2txt.org:9238
 # 2. queue + metadata (on the coordinator)
 tools/export/fleet.py ssh volcomp-coordinator
   sudo volcomp-coordinator manifest --db /var/lib/volcomp/export.db           # all 64 volumes, all levels
+  sudo volcomp-coordinator occupancy --db /var/lib/volcomp/export.db --volcomp /usr/local/bin/volcomp --tmp /var/tmp/volcomp-occ  # see below
   sudo volcomp-coordinator metadata --db /var/lib/volcomp/export.db --out /var/lib/volcomp/meta
   volcomp-worker upload-tree /var/lib/volcomp/meta --sftp sftp://dl.ash2txt.org:9238/volcomp --netrc ~/.volcomp-netrc
   volcomp-coordinator report --db /var/lib/volcomp/export.db                  # or curl :8765/status

@@ -6,6 +6,10 @@
  *   volcomp shard-verify in.shard DIR [--samples=N]
  *       index CRC + every chunk decodes; N (default 8, 0 = all) present chunks are
  *       compared with DIR/z_y_x.u8; a nonzero source chunk missing from the shard fails
+ *   volcomp occupancy in.u8|DIR out.bin [--shape=Z,Y,X] [--factor=F] [--dilate=D] [--grid=GZ,GY,GX] [--shards] [--chunks]
+ *       occupancy of a raw volume (or, --chunks, a directory of 128^3 chunks cz_cy_cx.u8) on an F^3-cell grid (1 where any voxel within the cell,
+ *       dilated by D voxels, is nonzero); --shards emits 64-byte per-shard chunk bitmasks.
+ *       Used on a downsampled level to know which chunks of finer levels hold data.
  * Input chunks are raw 128^3 u8 files (2097152 bytes), z-major. */
 #include "../../volcomp.h"
 #include "metrics.h"
@@ -136,10 +140,127 @@ static int shard_verify(const char *shard_path, const char *dir, long samples) {
   free(shard);
   return 0;
 }
+static bool parse_dims(int argc, char **argv, const char *name, unsigned d[3], unsigned def) {
+  d[0] = d[1] = d[2] = def;
+  for (int i = 4; i < argc; i++)
+    if (!strncmp(argv[i], name, strlen(name)))
+      return sscanf(argv[i] + strlen(name), "%u,%u,%u", &d[0], &d[1], &d[2]) == 3;
+  return true;
+}
+static bool has_flag(int argc, char **argv, const char *name) {
+  for (int i = 4; i < argc; i++)
+    if (!strcmp(argv[i], name)) return true;
+  return false;
+}
+typedef struct {
+  unsigned g[3], F, D;
+  uint8_t *cell;
+} occ_grid;
+/* mark every cell whose footprint, dilated by D voxels, contains a nonzero voxel of this row */
+static void occ_row(occ_grid *o, unsigned z, unsigned y, const uint8_t *row, unsigned x_begin, unsigned len) {
+  const unsigned F = o->F, D = o->D;
+  unsigned z0 = (z < D ? 0 : z - D) / F, z1 = (z + D) / F, y0 = (y < D ? 0 : y - D) / F, y1 = (y + D) / F;
+  if (z0 >= o->g[0]) return;
+  if (y0 >= o->g[1]) return;
+  if (z1 >= o->g[0]) z1 = o->g[0] - 1;
+  if (y1 >= o->g[1]) y1 = o->g[1] - 1;
+  for (unsigned i = 0; i < len; i++) {
+    if (!row[i]) continue;
+    unsigned x = x_begin + i, x0 = (x < D ? 0 : x - D) / F, x1 = (x + D) / F;
+    if (x0 >= o->g[2]) return;
+    if (x1 >= o->g[2]) x1 = o->g[2] - 1;
+    for (unsigned cz = z0; cz <= z1; cz++)
+      for (unsigned cy = y0; cy <= y1; cy++)
+        for (unsigned cx = x0; cx <= x1; cx++) o->cell[((size_t)cz * o->g[1] + cy) * o->g[2] + cx] = 1;
+    unsigned next = (x1 + 1) * F - D;  /* first x whose dilated range reaches a new cell */
+    if (next > x + 1) i = next - x_begin - 1;
+  }
+}
+/* occupancy of a Z*Y*X u8 volume on a grid of F^3-voxel cells (cell = one chunk of a finer
+ * level): a cell is set when any voxel within its footprint dilated by D voxels is nonzero.
+ * Input: a raw file, or with --chunks a directory of 128^3 chunk files cz_cy_cx.u8 (missing =
+ * zero). Plain output: gz*gy*gx bytes (grid from --grid or ceil(shape/F)). --shards: one
+ * 64-byte bitmask per 8^3 shard of cells, bit (cz*8+cy)*8+cx, shards in (sz,sy,sx) order. */
+static int occupancy(int argc, char **argv) {
+  const char *in_path = argv[2], *out_path = argv[3];
+  long f = parse_opt(argc, argv, "--factor=", 4), d = parse_opt(argc, argv, "--dilate=", 0);
+  unsigned sh[3];
+  occ_grid o = {.F = (unsigned)f, .D = (unsigned)d};
+  if (!parse_dims(argc, argv, "--shape=", sh, 128) || f < 1 || d < 0 || d >= f) {
+    fprintf(stderr, "bad --shape / --factor / --dilate (need 0 <= dilate < factor)\n");
+    return 1;
+  }
+  if (!parse_dims(argc, argv, "--grid=", o.g, 0)) return 1;
+  for (int i = 0; i < 3; i++)
+    if (!o.g[i]) o.g[i] = (unsigned)((sh[i] + f - 1) / f);
+  const size_t ncell = (size_t)o.g[0] * o.g[1] * o.g[2];
+  o.cell = calloc(1, ncell);
+  if (!has_flag(argc, argv, "--chunks")) {
+    size_t n;
+    uint8_t *v = read_file(in_path, &n);
+    if (!v || n != (size_t)sh[0] * sh[1] * sh[2]) {
+      fprintf(stderr, "%s: need exactly %zu bytes for shape %u,%u,%u\n", in_path, (size_t)sh[0] * sh[1] * sh[2], sh[0],
+              sh[1], sh[2]);
+      free(v);
+      return 2;
+    }
+    for (unsigned z = 0; z < sh[0]; z++)
+      for (unsigned y = 0; y < sh[1]; y++) occ_row(&o, z, y, v + ((size_t)z * sh[1] + y) * sh[2], 0, sh[2]);
+    free(v);
+  } else {
+    const unsigned C = VOLCOMP_CHUNK_DIM;
+    unsigned cg[3] = {(sh[0] + C - 1) / C, (sh[1] + C - 1) / C, (sh[2] + C - 1) / C};
+    size_t nread = 0;
+    for (unsigned cz = 0; cz < cg[0]; cz++)
+      for (unsigned cy = 0; cy < cg[1]; cy++)
+        for (unsigned cx = 0; cx < cg[2]; cx++) {
+          char path[4096];
+          snprintf(path, sizeof path, "%s/%u_%u_%u.u8", in_path, cz, cy, cx);
+          size_t n;
+          uint8_t *v = read_file(path, &n);
+          if (!v) continue;
+          if (n != VOLCOMP_CHUNK_VOXELS) {
+            fprintf(stderr, "%s: %zu bytes, expected %u\n", path, n, VOLCOMP_CHUNK_VOXELS);
+            free(v);
+            return 2;
+          }
+          nread++;
+          unsigned nz = sh[0] - cz * C < C ? sh[0] - cz * C : C, ny = sh[1] - cy * C < C ? sh[1] - cy * C : C,
+                   nx = sh[2] - cx * C < C ? sh[2] - cx * C : C;
+          for (unsigned z = 0; z < nz; z++)
+            for (unsigned y = 0; y < ny; y++)
+              occ_row(&o, cz * C + z, cy * C + y, v + ((size_t)z * C + y) * C, cx * C, nx);
+          free(v);
+        }
+    fprintf(stderr, "read %zu of %u chunks\n", nread, cg[0] * cg[1] * cg[2]);
+  }
+  int rc;
+  if (!has_flag(argc, argv, "--shards")) {
+    rc = write_file(out_path, o.cell, ncell);
+  } else {
+    size_t s[3] = {(o.g[0] + 7) / 8, (o.g[1] + 7) / 8, (o.g[2] + 7) / 8};
+    uint8_t *m = calloc(1, s[0] * s[1] * s[2] * 64);
+    size_t set = 0;
+    for (size_t cz = 0; cz < o.g[0]; cz++)
+      for (size_t cy = 0; cy < o.g[1]; cy++)
+        for (size_t cx = 0; cx < o.g[2]; cx++) {
+          if (!o.cell[(cz * o.g[1] + cy) * o.g[2] + cx]) continue;
+          size_t sidx = ((cz / 8) * s[1] + cy / 8) * s[2] + cx / 8, bit = ((cz % 8) * 8 + cy % 8) * 8 + cx % 8;
+          m[sidx * 64 + bit / 8] |= (uint8_t)(1u << (bit % 8));
+          set++;
+        }
+    rc = write_file(out_path, m, s[0] * s[1] * s[2] * 64);
+    printf("grid=%u,%u,%u shards=%zu,%zu,%zu occupied=%zu of %zu\n", o.g[0], o.g[1], o.g[2], s[0], s[1], s[2], set, ncell);
+    free(m);
+  }
+  free(o.cell);
+  return rc ? 2 : 0;
+}
 static int usage(void) {
   fprintf(stderr, "usage:\n  volcomp encode in.u8 out.volc --q=Q\n  volcomp decode in.volc out.u8\n"
                   "  volcomp verify in.volc ref.u8\n  volcomp shard-pack DIR out.shard --q=Q\n"
-                  "  volcomp shard-verify in.shard DIR [--samples=N]\n");
+                  "  volcomp shard-verify in.shard DIR [--samples=N]\n"
+                  "  volcomp occupancy in.u8|DIR out.bin [--shape=Z,Y,X] [--factor=F] [--dilate=D] [--grid=GZ,GY,GX] [--shards] [--chunks]\n");
   return 1;
 }
 
@@ -205,5 +326,6 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (!strcmp(cmd, "shard-verify")) return shard_verify(argv[2], argv[3], parse_opt(argc, argv, "--samples=", 8));
+  if (!strcmp(cmd, "occupancy")) return occupancy(argc, argv);
   return usage();
 }

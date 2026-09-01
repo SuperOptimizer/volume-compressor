@@ -24,17 +24,28 @@ Compute VMs run tools/export/worker.py against the HTTP API below.
       Print progress.
   coordinator.py requeue   --db export.db
       Return leased/failed units to the queue (e.g. after fixing a worker bug).
+  coordinator.py occupancy --db export.db --volcomp /usr/local/bin/volcomp --tmp DIR [--volume PREFIX ...]
+      Per volume: download the coarsest level (<= 5; a level-5 voxel spans 32^3 native
+      voxels), run `volcomp occupancy` on it once per level and store, for every unit, a
+      512-bit chunk mask (dilated by one coarse voxel) and `est`, the number of chunks
+      that can hold data. Workers only fetch masked-in chunks; units with est = 0 are
+      marked done without any transfer (a missing shard is the fill value). Safe to run
+      while serving; rerun with --force to recompute.
 
 The bucket is read anonymously over HTTPS; nothing here needs AWS credentials.
 """
 import argparse
+import concurrent.futures
 import json
 import math
 import os
+import shutil
 import socket
 import sqlite3
+import subprocess
 import sys
 import threading
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -110,6 +121,7 @@ CREATE TABLE IF NOT EXISTS unit (
   state TEXT NOT NULL DEFAULT 'todo', -- todo | leased | done
   worker TEXT, lease_until REAL, attempts INTEGER NOT NULL DEFAULT 0,
   bytes INTEGER, present INTEGER, psnr_min REAL, max_err INTEGER, done_at REAL, error TEXT,
+  est INTEGER, mask BLOB,             -- occupancy pass: chunks that may hold data, 512-bit mask (see occupancy)
   UNIQUE(volume, level, sz, sy, sx)
 );
 CREATE INDEX IF NOT EXISTS unit_state ON unit(state, lease_until);
@@ -121,7 +133,14 @@ def open_db(path):
     db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
+    db.execute("PRAGMA busy_timeout=30000")
     db.executescript(SCHEMA)
+    have = {r[1] for r in db.execute("PRAGMA table_info(unit)")}
+    for col, typ in (("est", "INTEGER"), ("mask", "BLOB")):  # databases created before the occupancy pass
+        if col not in have:
+            db.execute(f"ALTER TABLE unit ADD COLUMN {col} {typ}")
+    if "occ_level" not in {r[1] for r in db.execute("PRAGMA table_info(volume)")}:
+        db.execute("ALTER TABLE volume ADD COLUMN occ_level INTEGER")
     return db
 
 
@@ -265,11 +284,11 @@ class Coordinator:
             now = time.time()
             while True:
                 row = self.db.execute(
-                    "SELECT id, volume, level, sz, sy, sx, attempts FROM unit WHERE state='todo' "
+                    "SELECT id, volume, level, sz, sy, sx, attempts, mask FROM unit WHERE state='todo' "
                     "OR (state='leased' AND lease_until < ?) ORDER BY attempts, volume, level, id LIMIT 1", (now,)).fetchone()
                 if row is None:
                     return None
-                uid, vol, lvl, sz, sy, sx, attempts = row
+                uid, vol, lvl, sz, sy, sx, attempts, mask = row
                 if attempts < self.max_attempts:
                     break
                 # give up on poison units so the queue can drain; they stay visible in /status as "failed"
@@ -278,7 +297,7 @@ class Coordinator:
             self.db.execute("UPDATE unit SET state='leased', worker=?, lease_until=?, attempts=attempts+1 WHERE id=?",
                             (worker, now + self.lease, uid))
         return {"id": uid, "volume": vol, "level": lvl, "shard": [sz, sy, sx], "shape": shape,
-                "q": level_q(lvl), "lease_seconds": self.lease}
+                "q": level_q(lvl), "lease_seconds": self.lease, "mask": mask.hex() if mask else None}
 
     def done(self, body):
         with self.lock:
@@ -299,9 +318,14 @@ class Coordinator:
             per = [{"volume": v, "done": d, "total": t, "bytes": b or 0}
                    for v, d, t, b in self.db.execute(
                        "SELECT volume, SUM(state='done'), COUNT(*), SUM(bytes) FROM unit GROUP BY volume ORDER BY volume")]
-            recent = self.db.execute("SELECT COUNT(*) FROM unit WHERE state='done' AND done_at > ?", (time.time() - 600,)).fetchone()[0]
+            recent = self.db.execute("SELECT COUNT(*), COALESCE(SUM(present),0), COALESCE(SUM(bytes),0) FROM unit "
+                                     "WHERE state='done' AND done_at > ?", (time.time() - 600,)).fetchone()
+            est = self.db.execute("SELECT COALESCE(SUM(est),0), SUM(est IS NULL) FROM unit WHERE state IN ('todo','leased')").fetchone()
+            skipped = self.db.execute("SELECT COUNT(*) FROM unit WHERE state='done' AND error='occupancy:empty'").fetchone()[0]
         return {"units": tot, "output_bytes": out_bytes[0], "chunks_present": out_bytes[1],
-                "done_last_10min": recent, "volumes": per}
+                "done_last_10min": recent[0], "chunks_last_10min": recent[1], "bytes_last_10min": recent[2],
+                "est_chunks_remaining": est[0], "units_without_estimate": est[1] or 0, "skipped_empty": skipped,
+                "volumes": per}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -372,8 +396,95 @@ def cmd_report(a):
     print(f"units: {u.get('done', 0)}/{total} done, {u.get('leased', 0)} leased, {u.get('todo', 0)} todo, "
           f"{u.get('failed', 0)} failed; output {s['output_bytes'] / 1e9:.2f} GB, "
           f"{s['chunks_present']} chunks, {s['done_last_10min']} units in the last 10 min")
+    per_chunk = s["output_bytes"] / s["chunks_present"] if s["chunks_present"] else 0
+    rate = s["chunks_last_10min"] / 600.0
+    rem = s["est_chunks_remaining"]
+    print(f"occupancy: {s['skipped_empty']} units skipped as empty, {s['units_without_estimate']} units without an estimate; "
+          f"~{rem} chunks remaining (~{rem * per_chunk / 1e9:.0f} GB); last 10 min {s['chunks_last_10min']} chunks, "
+          f"{s['bytes_last_10min'] / 1e6 / 600:.1f} MB/s out"
+          + (f"; ETA {rem / rate / 3600:.1f} h at that rate" if rate > 0 and rem else ""))
     for v in s["volumes"]:
         print(f"  {v['done']:>7}/{v['total']:<7} {v['bytes'] / 1e9:9.2f} GB  {v['volume']}")
+
+
+# ----------------------------------------------------------------------------- occupancy
+
+
+OCC_LEVEL = 5  # a level-5 voxel spans a 32^3 block of native voxels; level-5 data is 1/32768 of native
+OCC_DILATE = 1  # coarse voxels: absorbs averaging/rounding at the edge of masked regions
+
+
+def cmd_occupancy(a):
+    db = open_db(a.db)
+    vols = [r[0] for r in db.execute("SELECT name FROM volume ORDER BY name")]
+    if a.volume:
+        want = [v if v.endswith("/") else v + "/" for v in a.volume]
+        vols = [v for v in vols if v in want]
+    os.makedirs(a.tmp, exist_ok=True)
+    t_all = time.time()
+    for vol in vols:
+        levels_json, occ_done = db.execute("SELECT levels, occ_level FROM volume WHERE name=?", (vol,)).fetchone()
+        if occ_done is not None and not a.force:
+            continue
+        levels = {int(k): v for k, v in json.loads(levels_json).items()}
+        L = min(OCC_LEVEL, max(levels))
+        shape = levels[L]["shape"]
+        cg = [math.ceil(n / CHUNK) for n in shape]
+        t0 = time.time()
+        work = tempfile.mkdtemp(prefix="occ-", dir=a.tmp)
+        try:
+            keys = [(cz, cy, cx) for cz in range(cg[0]) for cy in range(cg[1]) for cx in range(cg[2])]
+
+            def fetch(c):
+                data = http_get(BUCKET + "/" + urllib.parse.quote(f"{vol}{L}/{c[0]}/{c[1]}/{c[2]}"))
+                if data is None:
+                    return 0
+                if len(data) != CHUNK ** 3:
+                    raise RuntimeError(f"{vol}{L}/{c}: {len(data)} bytes")
+                with open(os.path.join(work, f"{c[0]}_{c[1]}_{c[2]}.u8"), "wb") as f:
+                    f.write(data)
+                return 1
+
+            with concurrent.futures.ThreadPoolExecutor(a.threads) as ex:
+                got = sum(ex.map(fetch, keys))
+            t1 = time.time()
+            summary = []
+            unit_levels = [r[0] for r in db.execute("SELECT DISTINCT level FROM unit WHERE volume=? ORDER BY level", (vol,))]
+            for k in unit_levels:
+                factor = 2 ** (7 + k - L)  # native chunk (128 voxels) measured in level-L voxels, times 2^k
+                grid = [math.ceil(n / CHUNK) for n in levels[k]["shape"]]
+                sgrid = [math.ceil(g / 8) for g in grid]
+                out = os.path.join(work, f"masks-{k}.bin")
+                r = subprocess.run([a.volcomp, "occupancy", work, out, f"--shape={shape[0]},{shape[1]},{shape[2]}",
+                                    f"--factor={factor}", f"--dilate={OCC_DILATE}", f"--grid={grid[0]},{grid[1]},{grid[2]}",
+                                    "--shards", "--chunks"], capture_output=True, text=True)
+                if r.returncode:
+                    raise RuntimeError(f"volcomp occupancy failed for {vol} level {k}: {r.stderr[-500:]}")
+                with open(out, "rb") as f:
+                    masks = f.read()
+                assert len(masks) == sgrid[0] * sgrid[1] * sgrid[2] * 64, (len(masks), sgrid)
+                rows, empties, est_sum = [], [], 0
+                for uid, sz, sy, sx in db.execute("SELECT id, sz, sy, sx FROM unit WHERE volume=? AND level=?", (vol, k)):
+                    i = ((sz * sgrid[1] + sy) * sgrid[2] + sx) * 64
+                    m = masks[i:i + 64]
+                    est = int.from_bytes(m, "little").bit_count()
+                    est_sum += est
+                    rows.append((est, m if est else None, uid))
+                    if est == 0:
+                        empties.append((uid,))
+                db.execute("BEGIN")
+                db.executemany("UPDATE unit SET est=?, mask=? WHERE id=?", rows)
+                n_skip = db.executemany("UPDATE unit SET state='done', bytes=0, present=0, done_at=strftime('%s','now'), "
+                                        "error='occupancy:empty', worker=NULL, lease_until=NULL WHERE id=? "
+                                        "AND state IN ('todo','failed')", empties).rowcount
+                db.execute("COMMIT")
+                summary.append(f"L{k}: {est_sum}/{len(rows) * 512} chunks, {len(empties)} empty units ({n_skip} skipped now)")
+            db.execute("UPDATE volume SET occ_level=? WHERE name=?", (L, vol))
+            print(f"{vol}: level {L} {shape} {got}/{len(keys)} chunks in {t1 - t0:.0f}s; " + "; ".join(summary)
+                  + f"; {time.time() - t1:.0f}s", flush=True)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+    print(f"occupancy done in {time.time() - t_all:.0f}s")
 
 
 def main():
@@ -403,6 +514,14 @@ def main():
     p.add_argument("--db", required=True)
     p.add_argument("--done-levels", help="also redo finished units of these levels (comma list)")
     p.set_defaults(fn=cmd_requeue)
+    p = sub.add_parser("occupancy", help="per-unit chunk masks from the coarsest level; marks empty units done")
+    p.add_argument("--db", required=True)
+    p.add_argument("--volcomp", default="volcomp")
+    p.add_argument("--tmp", default="/var/tmp/volcomp-occ")
+    p.add_argument("--volume", action="append")
+    p.add_argument("--threads", type=int, default=16)
+    p.add_argument("--force", action="store_true", help="recompute volumes that already have masks")
+    p.set_defaults(fn=cmd_occupancy)
     a = ap.parse_args()
     a.fn(a)
 
