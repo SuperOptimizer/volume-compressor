@@ -62,3 +62,5 @@ corpus/heldout/
 !tests/golden/*.u8
 *.volc
 !tests/golden/*.volc
+__pycache__/
+*.pyc
