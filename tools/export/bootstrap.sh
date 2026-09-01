@@ -32,7 +32,7 @@ if [ ! -d /opt/volume-compressor/.git ]; then
 fi
 cd /opt/volume-compressor
 git fetch -q origin
-git checkout -q "$COMMIT" 2>/dev/null || git checkout -q "origin/$COMMIT"
+git checkout -q --detach "origin/$COMMIT" 2>/dev/null || git checkout -q --detach "$COMMIT"
 cmake -S . -B build/release -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER="$CLANG" \
   -DVOLCOMP_NATIVE=ON -DVOLCOMP_BENCH=OFF >/dev/null
 cmake --build build/release --target volcomp_cli >/dev/null
