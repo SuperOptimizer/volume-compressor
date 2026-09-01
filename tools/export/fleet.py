@@ -176,19 +176,25 @@ def cmd_bootstrap(a):
     targets = instances(a.role)
     if not targets:
         raise SystemExit("no instances to bootstrap")
-    for i in targets:
+    def one(i):
         role = role_of(i)
         env = {"ROLE": role, "COMMIT": a.commit, "REPO": REPO, "COORDINATOR": f"http://{coord_ip}:{a.port}",
                "SFTP": a.sftp or "", "NETRC_CONTENT": netrc, "Q": str(a.q), "PARALLEL": str(a.parallel),
                "SAMPLES": str(a.samples), "PORT": str(a.port), "DELETE_PATHS": a.delete_paths or ""}
         exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items())
-        print(f"== bootstrap {i['name']} ({role}) at {i['ip_address']}")
-        r = subprocess.run(ssh_cmd(i["ip_address"], a.user, "sudo -E bash -s"), input=exports + script, text=True,
-                           capture_output=not a.verbose)
+        try:
+            r = subprocess.run(ssh_cmd(i["ip_address"], a.user, "sudo -E bash -s"), input=exports + script, text=True,
+                               capture_output=not a.verbose, timeout=a.timeout)
+        except subprocess.TimeoutExpired:
+            return f"== {i['name']} ({role}) at {i['ip_address']}: TIMEOUT after {a.timeout}s"
         if r.returncode:
-            print(f"   FAILED ({r.returncode}): {(r.stderr or '')[-800:]}")
-        else:
-            print("   ok")
+            return f"== {i['name']} ({role}) at {i['ip_address']}: FAILED ({r.returncode}): {(r.stderr or '')[-800:]}"
+        return f"== {i['name']} ({role}) at {i['ip_address']}: ok"
+
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as ex:
+        for line in ex.map(one, targets):
+            print(line, flush=True)
     print(f"coordinator API: http://{coord['ip_address']}:{a.port}/status (workers use {coord_ip})")
 
 
@@ -245,6 +251,8 @@ def main():
     p.add_argument("--public-coordinator", action="store_true", help="workers reach the coordinator by public IP")
     p.add_argument("--delete-paths", help="deleter role: space-separated remote dirs to remove recursively")
     p.add_argument("--verbose", action="store_true")
+    p.add_argument("--jobs", type=int, default=8, help="VMs bootstrapped concurrently")
+    p.add_argument("--timeout", type=int, default=1500, help="seconds per VM before giving up on it")
     p.set_defaults(fn=cmd_bootstrap)
     p = sub.add_parser("ssh")
     p.add_argument("name")
