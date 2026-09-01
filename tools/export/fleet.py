@@ -3,7 +3,7 @@
 
   fleet.py launch --role coordinator [--type v1_cpu_medium]
   fleet.py launch --role worker --count N [--type v1_cpu_medium]
-  fleet.py list                                   instances tagged project=volcomp-export
+  fleet.py list                                   fleet instances (named volcomp-coordinator / volcomp-worker-NNN)
   fleet.py wait                                   block until every fleet VM has an IP and answers SSH
   fleet.py bootstrap [--role worker|coordinator] [--commit SHA]
       ssh into each VM: install clang/cmake/git/curl/python3, clone the repo at the
@@ -65,13 +65,22 @@ def call(method, path, body=None, retries=5):
             raise SystemExit(f"{method} {path}: {e}")
 
 
+def role_of(inst):
+    """Fleet membership and role come from the instance name (the API does not
+    persist launch metadata): volcomp-coordinator / volcomp-worker-NNN."""
+    n = inst.get("name") or ""
+    if n == "volcomp-coordinator":
+        return "coordinator"
+    if n.startswith("volcomp-worker-"):
+        return "worker"
+    return None
+
+
 def instances(role=None):
     out = []
     for i in call("GET", "/instances") or []:
-        md = i.get("metadata") or {}
-        if md.get("project") != TAG["project"]:
-            continue
-        if role and md.get("role") != role:
+        r = role_of(i)
+        if r is None or (role and r != role):
             continue
         out.append(i)
     return sorted(out, key=lambda i: i.get("name") or "")
@@ -115,8 +124,7 @@ def cmd_launch(a):
 
 def cmd_list(a):
     for i in instances(a.role):
-        md = i.get("metadata") or {}
-        print(f"{i.get('name'):24} {md.get('role', ''):12} {i.get('power_status', ''):10} ip={i.get('ip_address')} "
+        print(f"{i.get('name'):24} {role_of(i):12} {i.get('power_status', ''):10} ip={i.get('ip_address')} "
               f"internal={i.get('internal_ip')} {i.get('cpu_cores')}c/{i.get('memory')}G {i.get('instance_type')} uuid={i.get('uuid')}")
 
 
@@ -163,7 +171,7 @@ def cmd_bootstrap(a):
     if not targets:
         raise SystemExit("no instances to bootstrap")
     for i in targets:
-        role = (i.get("metadata") or {}).get("role")
+        role = role_of(i)
         env = {"ROLE": role, "COMMIT": a.commit, "REPO": REPO, "COORDINATOR": f"http://{coord_ip}:{a.port}",
                "SFTP": a.sftp or "", "NETRC_CONTENT": netrc, "Q": str(a.q), "PARALLEL": str(a.parallel),
                "SAMPLES": str(a.samples), "PORT": str(a.port)}
