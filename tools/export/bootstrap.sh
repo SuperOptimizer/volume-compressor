@@ -8,7 +8,7 @@ export DEBIAN_FRONTEND=noninteractive
 # latest stable clang from apt.llvm.org (the distro clang is too old for C23)
 if ! ls /usr/bin/clang-[0-9]* >/dev/null 2>&1 || [ "$(ls /usr/bin/clang-[0-9]* | sed 's/.*clang-//' | sort -n | tail -1)" -lt 18 ]; then
   apt-get update -qq
-  apt-get install -y -qq git curl python3 wget lsb-release software-properties-common gnupg >/dev/null
+  apt-get install -y -qq git curl python3 wget lsb-release software-properties-common gnupg sshpass openssh-client >/dev/null
   curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
   bash /tmp/llvm.sh >/dev/null 2>&1 || bash /tmp/llvm.sh   # no version argument = current stable
 fi
@@ -23,6 +23,7 @@ if ! [ -x /opt/cmake/bin/cmake ]; then
   rm -rf /opt/cmake && mkdir -p /opt/cmake && tar -xzf /tmp/cmake.tgz -C /opt/cmake --strip-components=1
 fi
 ln -sf /opt/cmake/bin/cmake /usr/local/bin/cmake
+command -v sshpass >/dev/null || apt-get install -y -qq sshpass >/dev/null
 echo "using $($CLANG --version | head -1), $(cmake --version | head -1)"
 grep -q -w avx2 /proc/cpuinfo && grep -q -w fma /proc/cpuinfo || { echo "CPU lacks AVX2/FMA"; exit 1; }
 

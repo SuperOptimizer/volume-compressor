@@ -6,7 +6,7 @@ LOD pyramids) into zarr v3 `sharding_indexed` arrays — 1024³ shards of 128³
 `volcomp` chunks, q = 8 — under `sftp://dl.ash2txt.org:9238/volcomp/`, mirroring the
 bucket keys: `volcomp/<scroll>/volumes/<volume>.zarr/<level>/c/<sz>/<sy>/<sx>`.
 
-Everything is Python 3 standard library + the `volcomp` CLI + `curl`; nothing to
+Everything is Python 3 standard library + the `volcomp` CLI + OpenSSH `sftp` (+`sshpass`); nothing to
 pip-install on the VMs.
 
 ## Pieces

@@ -141,18 +141,52 @@ def shard_key(unit):
     return f"{unit['volume']}{unit['level']}/c/{sz}/{sy}/{sx}"
 
 
-def sftp_upload(local, sftp_root, key, netrc):
-    """Upload to <key>.part, then rename into place (readers never see a partial shard)."""
-    base = sftp_root.rstrip("/")
-    url = f"{base}/{key}.part"
-    m = re.match(r"(sftp://[^/]+)(/.*)?$", base)
+def netrc_password(netrc, host):
+    """password for host from a netrc file (machine H login U password P)."""
+    with open(netrc) as f:
+        toks = f.read().split()
+    for i, t in enumerate(toks):
+        if t == "machine" and i + 1 < len(toks) and toks[i + 1] == host and "password" in toks[i:]:
+            return toks[toks.index("password", i) + 1]
+    raise RuntimeError(f"no password for {host} in {netrc}")
+
+
+def netrc_login(netrc, host):
+    with open(netrc) as f:
+        toks = f.read().split()
+    for i, t in enumerate(toks):
+        if t == "machine" and i + 1 < len(toks) and toks[i + 1] == host and "login" in toks[i:]:
+            return toks[toks.index("login", i) + 1]
+    raise RuntimeError(f"no login for {host} in {netrc}")
+
+
+def sftp_batch(sftp_root, netrc, commands):
+    """Run an OpenSSH sftp batch (one connection) against sftp://host:port/dir.
+    Commands prefixed with '-' may fail without aborting the batch."""
+    m = re.match(r"sftp://([^/:]+)(?::(\d+))?(/.*)?$", sftp_root.rstrip("/"))
     if not m:
         raise RuntimeError("--sftp must look like sftp://host:port/dir")
-    path_prefix = (m.group(2) or "")
-    remote_part = f"{path_prefix}/{key}.part"
-    remote_final = f"{path_prefix}/{key}"
-    run(["curl", "-sS", "--netrc-file", netrc, "--insecure", "--ftp-create-dirs", "-T", local, url,
-         "-Q", f"-rm {remote_final}", "-Q", f"rename {remote_part} {remote_final}"])
+    host, port, prefix = m.group(1), m.group(2) or "22", (m.group(3) or "")
+    env = dict(os.environ, SSHPASS=netrc_password(netrc, host))
+    script = "".join(c.replace("{root}", prefix) + "\n" for c in commands)
+    r = subprocess.run(["sshpass", "-e", "sftp", "-q", "-o", "BatchMode=no", "-o", "PubkeyAuthentication=no",
+                        "-o", "PreferredAuthentications=password", "-o", "StrictHostKeyChecking=no",
+                        "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=30",
+                        "-b", "-", "-P", port, f"{netrc_login(netrc, host)}@{host}"],
+                       input=script, capture_output=True, text=True, env=env)
+    if r.returncode:
+        raise RuntimeError(f"sftp batch failed ({r.returncode}): {(r.stderr or r.stdout).strip()[-500:]}")
+
+
+def sftp_upload(local, sftp_root, key, netrc):
+    """Upload to <key>.part, then rename into place (readers never see a partial shard).
+    Parent directories are created on the way (mkdir is not recursive in sftp)."""
+    parts = key.split("/")
+    cmds = []
+    for i in range(1, len(parts)):
+        cmds.append("-mkdir {root}/" + "/".join(parts[:i]))
+    cmds += [f"put {local} {{root}}/{key}.part", f"-rm {{root}}/{key}", f"rename {{root}}/{key}.part {{root}}/{key}"]
+    sftp_batch(sftp_root, netrc, cmds)
 
 
 def local_store(local, root, key):
