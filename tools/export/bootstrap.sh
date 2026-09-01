@@ -84,12 +84,16 @@ fi
 
 if [ "$ROLE" = "worker" ]; then
   umask 077
+  # scratch: tmpfs when there is RAM for it (1 GiB per shard in flight), else disk; small VMs run 2 shards
+  MEM_GB=$(awk '/MemTotal/{print int($2/1048576)}' /proc/meminfo)
+  if [ "$MEM_GB" -ge 6 ]; then TMP=/dev/shm/volcomp; else TMP=/var/tmp/volcomp; PARALLEL=$(( PARALLEL < 2 ? PARALLEL : 2 )); fi
   cat > /etc/volcomp-worker.env <<EOF
 COORDINATOR=$COORDINATOR
 SFTP=$SFTP
 Q=$Q
 PARALLEL=$PARALLEL
 SAMPLES=$SAMPLES
+TMP=$TMP
 EOF
   cat > /etc/systemd/system/volcomp-worker.service <<'EOF'
 [Unit]
@@ -100,7 +104,7 @@ Wants=network-online.target
 [Service]
 EnvironmentFile=/etc/volcomp-worker.env
 ExecStart=/usr/bin/python3 /usr/local/bin/volcomp-worker run --coordinator ${COORDINATOR} --volcomp /usr/local/bin/volcomp \
-  --tmp /dev/shm/volcomp --sftp ${SFTP} --netrc /etc/volcomp-netrc --q ${Q} --parallel ${PARALLEL} --samples ${SAMPLES}
+  --tmp ${TMP} --sftp ${SFTP} --netrc /etc/volcomp-netrc --q ${Q} --parallel ${PARALLEL} --samples ${SAMPLES}
 Restart=always
 RestartSec=10
 Nice=5
