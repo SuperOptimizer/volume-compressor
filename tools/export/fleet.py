@@ -22,6 +22,7 @@ the VM; edit that file and `systemctl restart volcomp-worker` to change them.
 import argparse
 import json
 import os
+import secrets
 import shlex
 import subprocess
 import sys
@@ -113,7 +114,9 @@ def cmd_launch(a):
     for k in range(1000):
         if len(launched) >= n:
             break
-        name = f"volcomp-worker-{k:03d}" if a.role == "worker" else f"volcomp-{a.role}"
+        # workers get a random suffix: the API does not list an instance until creation
+        # finishes, so sequential numbering can collide with launches still in flight
+        name = f"volcomp-worker-{secrets.token_hex(3)}" if a.role == "worker" else f"volcomp-{a.role}"
         if name in existing:
             continue
         body = {"region": a.region, "instance_type": a.type, "ssh_key": pub, "username": a.user, "name": name,
