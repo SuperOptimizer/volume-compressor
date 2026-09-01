@@ -21,6 +21,8 @@ Compute VMs run tools/export/worker.py against the HTTP API below.
                  GET  /status                            -> totals and per-volume progress
   coordinator.py report    --db export.db
       Print progress.
+  coordinator.py requeue   --db export.db
+      Return leased/failed units to the queue (e.g. after fixing a worker bug).
 
 The bucket is read anonymously over HTTPS; nothing here needs AWS credentials.
 """
@@ -238,8 +240,15 @@ def cmd_metadata(a):
 class Coordinator:
     def __init__(self, db, lease):
         self.db, self.lease, self.lock = db, lease, threading.Lock()
-        self.volumes = {r[0]: {int(k): v for k, v in json.loads(r[1]).items()}
-                        for r in db.execute("SELECT name, levels FROM volume")}
+        self._levels = {}  # volume -> {level: {"shape": ...}}; filled lazily so manifests can be added while serving
+
+    def levels(self, vol):
+        if vol not in self._levels:
+            row = self.db.execute("SELECT levels FROM volume WHERE name=?", (vol,)).fetchone()
+            if row is None:
+                raise KeyError(vol)
+            self._levels[vol] = {int(k): v for k, v in json.loads(row[0]).items()}
+        return self._levels[vol]
 
     def claim(self, worker):
         with self.lock:
@@ -254,10 +263,11 @@ class Coordinator:
                 # give up on poison units so the queue can drain; they stay visible in /status
                 self.db.execute("UPDATE unit SET state='failed' WHERE id=?", (uid,))
                 return self.claim(worker)
+            shape = self.levels(vol)[lvl]["shape"]  # before the lease so a bad row cannot leak a lease
             self.db.execute("UPDATE unit SET state='leased', worker=?, lease_until=?, attempts=attempts+1 WHERE id=?",
                             (worker, now + self.lease, uid))
-        return {"id": uid, "volume": vol, "level": lvl, "shard": [sz, sy, sx],
-                "shape": self.volumes[vol][lvl]["shape"], "lease_seconds": self.lease}
+        return {"id": uid, "volume": vol, "level": lvl, "shard": [sz, sy, sx], "shape": shape,
+                "lease_seconds": self.lease}
 
     def done(self, body):
         with self.lock:
@@ -333,6 +343,12 @@ def cmd_serve(a):
         pass
 
 
+def cmd_requeue(a):
+    db = open_db(a.db)
+    n = db.execute("UPDATE unit SET state='todo', worker=NULL, lease_until=NULL WHERE state IN ('leased','failed')").rowcount
+    print(f"requeued {n} units")
+
+
 def cmd_report(a):
     s = Coordinator(open_db(a.db), 0).status()
     u = s["units"]
@@ -367,6 +383,9 @@ def main():
     p = sub.add_parser("report")
     p.add_argument("--db", required=True)
     p.set_defaults(fn=cmd_report)
+    p = sub.add_parser("requeue", help="put leased/failed units back in the queue")
+    p.add_argument("--db", required=True)
+    p.set_defaults(fn=cmd_requeue)
     a = ap.parse_args()
     a.fn(a)
 

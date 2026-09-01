@@ -55,6 +55,12 @@ def api(url, path, body=None, retries=1000):
                 if r.status == 204:
                     return None
                 return json.loads(r.read() or b"null")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")[:300]
+            if 400 <= e.code < 500:
+                raise RuntimeError(f"coordinator rejected {path}: HTTP {e.code} {body}")
+            log(f"coordinator error on {path}: HTTP {e.code} {body}; retrying")
+            time.sleep(min(60, 2 + attempt * 2))
         except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as e:
             log(f"coordinator unreachable ({e}); retrying")
             time.sleep(min(60, 2 + attempt * 2))
@@ -199,7 +205,12 @@ def cmd_run(a):
         inflight = {}
         while True:
             while len(inflight) < a.parallel:
-                unit = api(a.coordinator, "/claim", {"worker": worker_id})
+                try:
+                    unit = api(a.coordinator, "/claim", {"worker": worker_id})
+                except RuntimeError as e:
+                    log(str(e))
+                    time.sleep(30)
+                    break
                 if unit is None:
                     break
                 inflight[units.submit(process_unit, unit, a, dl_pool)] = unit
@@ -215,10 +226,18 @@ def cmd_run(a):
             for fut in done:
                 unit = inflight.pop(fut)
                 try:
-                    api(a.coordinator, "/done", {"worker": worker_id, **fut.result()})
+                    result = fut.result()
                 except Exception as e:  # noqa: BLE001
                     log(f"FAIL #{unit['id']} {shard_key(unit)}: {e}")
-                    api(a.coordinator, "/fail", {"id": unit["id"], "worker": worker_id, "error": repr(e)})
+                    try:
+                        api(a.coordinator, "/fail", {"id": unit["id"], "worker": worker_id, "error": repr(e)})
+                    except RuntimeError as e2:
+                        log(str(e2))
+                    continue
+                try:
+                    api(a.coordinator, "/done", {"worker": worker_id, **result})
+                except RuntimeError as e:
+                    log(f"could not report #{unit['id']} done: {e} (lease will expire and it will be redone)")
 
 
 def cmd_upload_tree(a):
