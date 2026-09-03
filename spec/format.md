@@ -167,8 +167,8 @@ encoded size of any chunk is at most
 
 ## 9. Label chunks (`volcomp_label.h`)
 
-A label chunk stores up to 255 class PLANES (u8 value maps) for one 128³
-region. Only planes with a nonzero voxel are stored; a class that is not
+A label chunk stores up to 255 class PLANES (u8 probability maps) for one
+128³ region. Only planes with a nonzero voxel are stored; a class that is not
 stored decodes as all zeros. Class identity is an explicit tag, never coded
 lossily.
 
@@ -177,47 +177,17 @@ offset  size   field
 0       4      magic "VOLL"
 4       1      version = 1
 5       1      nplanes (0..255)
-6       1      tolerance t (0..7)
-7       1      reserved = 0
-8       2      q_raw  u16 as in §2 (256..65280), or 0 if no image plane
-10      2      reserved = 0
-12      8*n    directory: { u8 cls, u8 mode, u16 hdr_n, u32 payload_n } per plane,
+6       2      q_raw  u16 as in §2 (256..65280)
+8       4      reserved = 0
+12      8*n    directory: { u8 cls, u8 mode, u16 reserved = 0, u32 n } per plane,
                cls strictly ascending
-        var    per plane in directory order: hdr_n header bytes, payload_n payload bytes
+        var    plane bytes in directory order, n bytes each
 ```
 
-Exact accounting is normative: the header, directory, and every plane's
-header + payload must sum to the stream length. Modes:
+Exact accounting is normative: header, directory and every plane's bytes
+must sum to the stream length. Mode 0 (image): the plane is a §2 stream
+whose `q_raw` equals the header's, `n < 2 097 152`. Mode 1 (raw): the plane is
+stored verbatim, `n = 2 097 152` (the encoder uses it only when the §2 stream
+would not be smaller). Any other mode is rejected.
 
-| mode | hdr | payload | meaning |
-|---|---|---|---|
-| 0 const | `u8 value` | none | every voxel = value |
-| 1 palette | `u8 K (2..16), u8 v[K], u32 len[K-1]` | K−1 mask streams back to back | voxels are exactly one of `v[]` |
-| 2 image | none | a §2 stream at `q_raw` | probability-like plane, lossy in value |
-| 3 raw | none | 2 097 152 bytes | plane stored verbatim |
-
-Palette values `v[]` are distinct, ordered by descending frequency. Decoding
-fills the plane with `v[K-1]`, then for k = 0..K−2 decodes mask k over the
-voxels still holding `v[K-1]` in z-major order and sets them to `v[k]` where
-the mask bit is 1. Voxels already set by an earlier mask are skipped (not
-coded).
-
-A mask stream is an adaptive binary range coder (LZMA-style: 32-bit range,
-11-bit probabilities initialised to 1024, shift-5 adaptation, renormalise
-below 2²⁴, first byte 0, 5 flush bytes). It emits exactly 5 + (renormalisations)
-bytes and the decoder must consume its `len` exactly. The context of a voxel
-is a 10-bit pattern of causal neighbours, bit i set when the neighbour's
-current value equals `v[k]` (outside the chunk = 0):
-bit 0 (x−1), 1 (x−2), 2 (y−1), 3 (y−1,x−1), 4 (y−1,x+1), 5 (z−1),
-6 (z−1,x−1), 7 (z−1,x+1), 8 (z−1,y−1), 9 (z−1,y+1).
-
-**Tolerance (encoder-only, informative).** Before coding a palette plane the
-encoder may replace it by its plurality vote over the (2t+1)³ window clipped to
-the chunk, ties keeping the source value. A voxel farther than t from any
-source boundary has a uniform window and is unchanged, so every change lies
-within t voxels of a boundary and takes a value present in that window. The
-decoder reproduces the filtered plane exactly. t is recorded so a verifier can
-check the contract (`volcomp label-verify`).
-
-**Bound.** A plane costs at most `8 + 128 + 2 097 152` bytes (raw fallback),
-so `VOLCOMP_LABEL_ENCODE_BOUND(n) = 12 + n·(8 + 2 097 280)`.
+**Bound.** `VOLCOMP_LABEL_ENCODE_BOUND(n) = 12 + n·(8 + 2 097 152)`.
