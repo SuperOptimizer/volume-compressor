@@ -10,6 +10,9 @@
  *       occupancy of a raw volume (or, --chunks, a directory of 128^3 chunks cz_cy_cx.u8) on an F^3-cell grid (1 where any voxel within the cell,
  *       dilated by D voxels, is nonzero); --shards emits 64-byte per-shard chunk bitmasks.
  *       Used on a downsampled level to know which chunks of finer levels hold data.
+ *   volcomp label-encode DIR out.voll [--t=T] [--q=Q]   (DIR/<cls>.u8 class planes -> label chunk)
+ *   volcomp label-decode in.voll DIR                    (writes DIR/<cls>.u8 for every stored class)
+ *   volcomp label-verify in.voll DIR                    (decode + tolerance contract check per class)
  * Input chunks are raw 128^3 u8 files (2097152 bytes), z-major. */
 #include "../../volcomp.h"
 #include "metrics.h"
@@ -260,9 +263,12 @@ static int usage(void) {
   fprintf(stderr, "usage:\n  volcomp encode in.u8 out.volc --q=Q\n  volcomp decode in.volc out.u8\n"
                   "  volcomp verify in.volc ref.u8\n  volcomp shard-pack DIR out.shard --q=Q\n"
                   "  volcomp shard-verify in.shard DIR [--samples=N]\n"
-                  "  volcomp occupancy in.u8|DIR out.bin [--shape=Z,Y,X] [--factor=F] [--dilate=D] [--grid=GZ,GY,GX] [--shards] [--chunks]\n");
+                  "  volcomp occupancy in.u8|DIR out.bin [--shape=Z,Y,X] [--factor=F] [--dilate=D] [--grid=GZ,GY,GX] [--shards] [--chunks]\n"
+                  "  volcomp label-encode DIR out.voll [--t=T] [--q=Q]\n  volcomp label-decode in.voll DIR\n"
+                  "  volcomp label-verify in.voll DIR\n");
   return 1;
 }
+#include "label_cli.h"
 
 int main(int argc, char **argv) {
   if (argc < 4) return usage();
@@ -327,5 +333,8 @@ int main(int argc, char **argv) {
   }
   if (!strcmp(cmd, "shard-verify")) return shard_verify(argv[2], argv[3], parse_opt(argc, argv, "--samples=", 8));
   if (!strcmp(cmd, "occupancy")) return occupancy(argc, argv);
+  if (!strcmp(cmd, "label-encode")) return label_encode(argc, argv);
+  if (!strcmp(cmd, "label-decode")) return label_decode(argc, argv);
+  if (!strcmp(cmd, "label-verify")) return label_verify(argc, argv);
   return usage();
 }

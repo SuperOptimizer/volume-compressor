@@ -32,6 +32,39 @@ host; the CMake target adds them) and refuses to compile without them. `q` is th
 percentiles scale with q (P99 ≈ 2.5q on scroll data). Define `VOLCOMP_MALLOC`
 / `VOLCOMP_FREE` to override the one scratch allocation in `volcomp_encode`.
 
+## Label volumes (`volcomp_label.h`)
+
+Companion header for multi-class label arrays: a 128³ label chunk holds up to
+255 class planes (u8 value maps: masks, id maps, probability maps), stored as
+one zarr array of shape `(255, Z, Y, X)` with only the present classes taking
+space. Class identity is an explicit tag per plane and is never lossy; a
+decoded chunk cannot carry a class absent from the source, and two classes
+cannot be confused. Per plane the encoder picks a mode: constant; palette
+(≤ 16 distinct values, one context-coded binary mask per value, values exact);
+image (> 16 values, a `volcomp.h` stream at `q`); raw fallback.
+
+```c
+#include "volcomp_label.h"
+volcomp_label_plane pl[] = {{1, ink}, {2, surface}, {7, segment_ids}};   /* class id, 128^3 plane */
+volcomp_label_encode(pl, 3, /*tolerance*/ 1, /*q*/ 8.0f, enc, VOLCOMP_LABEL_ENCODE_BOUND(3), &n);
+volcomp_label_classes(enc, n, cls, &count);          /* which classes are stored */
+volcomp_label_decode(enc, n, 2, dst, VOLCOMP_CHUNK_VOXELS);   /* absent class -> zeros */
+```
+
+`tolerance` (0..7 voxels) is the spatial knob: palette planes are replaced by
+their plurality vote over the (2t+1)³ window before coding, which smooths
+specks and jagged edges. Every change is within t voxels of a source boundary
+and takes a value that was present there; voxels farther away are untouched.
+t = 0 is lossless. `q` shapes image planes only. CLI: `label-encode DIR
+out.voll --t=T --q=Q` (DIR holds `<cls>.u8` planes), `label-decode`,
+`label-verify` (checks the tolerance contract and reports error stats for
+image planes).
+
+Measured on PHercParis4 predictions (24 planes of 128³ each): surface masks
+12.7 KB per plane lossless (0.05 bits/voxel, 4.2× smaller than the blosc-zstd
+chunks they ship in), 10.7 KB at t = 1; ink probability maps 9.5 KB at q = 8
+(MAE 0.5, P99 6, PSNR 43.7 dB). Decode ≈ 15 ms per mask plane.
+
 ## Build the tools and tests
 
 ```sh
@@ -39,6 +72,7 @@ cmake --preset release && cmake --build --preset release && ctest --preset relea
 ./build/release/volcomp encode chunk.u8 chunk.volc --q=8
 ./build/release/volcomp verify chunk.volc chunk.u8
 ./build/release/volcomp shard-pack chunks/ shard.bin --q=8     # chunks/z_y_x.u8
+./build/release/volcomp label-encode labels/ chunk.voll --t=1 --q=8   # labels/<cls>.u8
 tools/fetch_corpus.sh fetch tune && ./build/release/volcomp-bench --corpus=corpus/tune
 ```
 
