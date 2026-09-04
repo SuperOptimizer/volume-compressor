@@ -127,7 +127,8 @@ orthonormal scale — 1/4 per zero index, √2/4 otherwise, per axis — into th
 quantiser tables; the result is the same transform.)
 
 Arithmetic is IEEE single precision; two conforming decoders built with
-different compilers or vector widths may differ by at most ±1 in any voxel.
+different compilers or vector widths (the reference has AVX2 and plain C
+kernel sets, selected at runtime) may differ by at most ±1 in any voxel.
 The same build must be deterministic.
 
 ## 6. No post-filter

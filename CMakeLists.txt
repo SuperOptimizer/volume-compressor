@@ -16,6 +16,8 @@ endif()
 
 option(VOLCOMP_WERROR "Treat warnings as errors" ON)
 option(VOLCOMP_NATIVE "Tune for the host CPU (-march=native)" OFF)
+option(VOLCOMP_STATIC_AVX2 "Compile with -mavx2 -mfma so the AVX2 kernels are called directly (no runtime dispatch; binary needs AVX2)" OFF)
+option(VOLCOMP_NO_AVX2 "Build the C kernels only (define VOLCOMP_NO_AVX2); for testing the portable path" OFF)
 option(VOLCOMP_BENCH "Build volcomp-bench" OFF)
 option(VOLCOMP_FUZZ "Build libFuzzer targets" OFF)
 set(VOLCOMP_SANITIZE "" CACHE STRING "Sanitizer set: '' | asan-ubsan")
@@ -27,8 +29,12 @@ target_link_libraries(volcomp INTERFACE m)
 target_compile_options(volcomp INTERFACE
   -Wall -Wextra -Wconversion -Wshadow -Wimplicit-fallthrough -Wformat=2 -Wvla -Wdouble-promotion
   $<$<BOOL:${VOLCOMP_WERROR}>:-Werror>
-  -mavx2 -mfma # required by volcomp.h (explicit AVX2 kernels)
+  # volcomp.h needs no arch flags: on x86-64 it compiles its AVX2 kernels with a
+  # target attribute and picks them at runtime when the CPU has AVX2+FMA.
+  $<$<BOOL:${VOLCOMP_STATIC_AVX2}>:-mavx2>
+  $<$<BOOL:${VOLCOMP_STATIC_AVX2}>:-mfma>
   $<$<BOOL:${VOLCOMP_NATIVE}>:-march=native>)
+target_compile_definitions(volcomp INTERFACE $<$<BOOL:${VOLCOMP_NO_AVX2}>:VOLCOMP_NO_AVX2>)
 if(VOLCOMP_SANITIZE STREQUAL "asan-ubsan")
   target_compile_options(volcomp INTERFACE -fsanitize=address,undefined -fno-omit-frame-pointer)
   target_link_options(volcomp INTERFACE -fsanitize=address,undefined)
@@ -67,6 +73,17 @@ foreach(src ${VOLCOMP_TESTS})
   target_link_libraries(${name} PRIVATE volcomp)
   add_test(NAME ${name} COMMAND ${name} WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   set_tests_properties(${name} PROPERTIES TIMEOUT 300)
+endforeach()
+
+# C-kernel variants of the golden and codec tests (VOLCOMP_NO_AVX2), so a
+# normal x86-64 build also exercises the portable path.
+foreach(name test_golden test_codec)
+  add_executable(${name}_c tests/${name}.c tools/bench/metrics.c)
+  target_include_directories(${name}_c PRIVATE tools/bench tools/cli)
+  target_link_libraries(${name}_c PRIVATE volcomp)
+  target_compile_definitions(${name}_c PRIVATE VOLCOMP_NO_AVX2)
+  add_test(NAME ${name}_c COMMAND ${name}_c WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  set_tests_properties(${name}_c PROPERTIES TIMEOUT 300)
 endforeach()
 
 # ---- fuzz ----

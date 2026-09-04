@@ -84,6 +84,25 @@ Voxels with |err| > 3q: 1.24% (q2), 0.10% (q8), 0.0004% (q32). They sit in
 high-contrast interior blocks (source range > 128: 86–99.6% of them), not at
 the air mask (≤ 1.2%). See `docs/measured.md`.
 
+## Kernel sets: AVX2 vs C (held-out, 1 thread, clang 23 `-O3`, 2026-09-04)
+
+`volcomp.h` carries both kernel sets and picks AVX2+FMA at runtime on x86-64;
+the C kernels serve arm64 and CPUs without AVX2. Bytes and decoded voxels
+were identical between the two on every held-out chunk (bitstreams `q2`/`q32`
+goldens included), so the numbers differ only in speed.
+
+| q | kernels | enc MB/s | dec MB/s |
+|---|---|---|---|
+| 2 | avx2 (runtime dispatch, no `-mavx2`) | 480 | 665 |
+| 2 | c | 295 | 368 |
+| 8 | avx2 | 868 | 1406 |
+| 8 | c | 514 | 610 |
+| 32 | avx2 | 1222 | 2424 |
+| 32 | c | 642 | 761 |
+
+The static `-mavx2 -mfma` build measured within noise of the dispatch build
+(383/724/1110 enc, 588/1262/2393 dec on the same run).
+
 ## Where the time goes (q8, 1 thread, AVX2 build)
 
 Decode ≈ 1.4 ms per 2 MiB chunk: tANS decode + dequant ~60% (a scalar

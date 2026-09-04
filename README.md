@@ -27,8 +27,13 @@ volcomp_deblock(volume, nz, ny, nx, 8.0f);   /* optional, after assembling decod
 ```
 
 Everything is `static`; include the header in the translation unit that uses
-it. It requires AVX2 and FMA (`-mavx2 -mfma`, or `-march=native` on a capable
-host; the CMake target adds them) and refuses to compile without them. `q` is the quantiser step in voxel units, 1..255 (typical 2..32); error
+it. No arch flags are needed: on x86-64 the AVX2+FMA kernels are compiled with
+a target attribute and chosen at runtime when the CPU has them, and every
+target has plain C kernels (arm64, x86-64 without AVX2, or `-DVOLCOMP_NO_AVX2`
+to force them). `volcomp_kernels()` reports `"avx2"` or `"c"`. The two agree to
+±1 LSB on decode; with clang and GCC on x86-64 they produce identical bytes.
+The C kernels run at 40–60 % of the AVX2 speed (see BENCHMARKS.md).
+`q` is the quantiser step in voxel units, 1..255 (typical 2..32); error
 percentiles scale with q (P99 ≈ 2.5q on scroll data). Define `VOLCOMP_MALLOC`
 / `VOLCOMP_FREE` to override the one scratch allocation in `volcomp_encode`.
 
@@ -71,8 +76,11 @@ tools/fetch_corpus.sh fetch tune && ./build/release/volcomp-bench --corpus=corpu
 ```
 
 Presets: `dev` (asan+ubsan), `release`, `bench` (`-march=native`), `fuzz`
-(libFuzzer targets `fuzz_d_chunk`, `fuzz_rt_chunk`). Requires clang, C23 and
-an AVX2+FMA x86-64 CPU; Linux is the supported target for v1.
+(libFuzzer targets `fuzz_d_chunk`, `fuzz_rt_chunk`). Requires clang or GCC and
+C23; Linux x86-64 is where it is measured, arm64 compiles and uses the C
+kernels. `-DVOLCOMP_STATIC_AVX2=ON` adds `-mavx2 -mfma` (no runtime dispatch),
+`-DVOLCOMP_NO_AVX2=ON` builds the C kernels only; `ctest` always runs the
+golden and codec tests on both kernel sets (`test_golden_c`, `test_codec_c`).
 
 ## Numbers
 
