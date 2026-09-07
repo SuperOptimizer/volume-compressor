@@ -220,7 +220,7 @@ substream and is byte-identical to the same region of the full decode.
 ```
 offset  size   field
 0       8      header, mode = 1, q_raw = 0
-8       T      frequency tables (§4.3), 6 models
+8       T      frequency tables (§4.3), 8 models
 8+T     D      directory: 32 × { LEB128 tok_n, LEB128 bypass_n }
 8+T+D   P      payload: for s = 0..31: tok_n[s] token bytes then bypass_n[s] bypass bytes
 ```
@@ -228,8 +228,8 @@ offset  size   field
 Exact accounting is normative, as in §2. Per substream `tok_n >= 3`,
 `tok_n <= 131 112`, `bypass_n <= 73 736`.
 
-**Models.** 0 block mode, 1 SPARSE runs and EOB, 2 SPARSE levels, 3..5 DENSE
-levels by context. Frequency tables are encoded exactly as in §4.3.
+**Models.** 0 block mode, 1..2 SPARSE runs and EOB, 3..4 SPARSE levels, 5..7
+DENSE levels. Frequency tables are encoded exactly as in §4.3.
 
 **Tokens.** Values use a HybridUint with 16 literals rather than §4.1's 4:
 `u < 16` is token `u` with no bypass bits; otherwise `tok = 12 + msb(u)` and
@@ -245,12 +245,13 @@ zigzagged into 0..255. Prediction never crosses a block boundary.
 
 - `0 CONST` — 4096 equal voxels; 8 bypass bits hold the value. No further
   tokens; an all-flat chunk is mode 3 and costs 9 bytes in total.
-- `1 SPARSE` — `(run, level)*` then `EOB`, all runs and `EOB` from model 1 and
-  all levels from model 2. `run` is the number of zero residuals skipped;
-  `level` is `u - 1` for the nonzero residual `u` that follows, so
-  `level <= 254`. `pos + run <= 4095` is normative.
+- `1 SPARSE` — `(run, level)*` then `EOB`. `run` is the number of zero
+  residuals skipped, coded with model `1 + (prev_run != 0)` (`prev_run = 1`
+  at the start of the block); `level` is `u - 1` for the nonzero residual `u`
+  that follows (`level <= 254`), coded with model `3 + (run != 0)`. `EOB` uses
+  the run model. `pos + run <= 4095` is normative.
 - `2 DENSE` — exactly 4096 level tokens, one residual each (`u <= 255`). The
-  model is `3 + c` where `c = 0` if the residual one z-plane back is 0, `1` if
+  model is `5 + c` where `c = 0` if the residual one z-plane back is 0, `1` if
   it is 1 or 2, else `2` (`c = 0` in the first z-plane). The context looks a
   whole plane back so that it is never on the entropy decoder's critical path.
 - `3 RAW` — 4096 bypass bytes, the block verbatim.

@@ -1904,11 +1904,11 @@ static bool vf_tokenize_block(vf_enc *e, uint16_t **tp, vf_bitw *bw, const int32
  * a chunk whose coded form would not fit in 2 MiB is stored as mode 2, so the
  * output is never larger than the raw chunk plus the 8-byte header. */
 
-#define VLL_NMODELS 6u
-#define VLL_M_MODE 0u  /* block mode token                                  */
-#define VLL_M_RUN 1u   /* SPARSE zero-run tokens and EOB                    */
-#define VLL_M_LVLS 2u  /* SPARSE level tokens (residual magnitude - 1)      */
-#define VLL_M_LVLD 3u  /* DENSE level tokens, +0..2 by previous-residual ctx */
+#define VLL_NMODELS 8u
+#define VLL_M_MODE 0u  /* block mode token                                    */
+#define VLL_M_RUN 1u   /* SPARSE zero-run tokens and EOB, +0..1 by prev run   */
+#define VLL_M_LVLS 3u  /* SPARSE levels (magnitude - 1), +0..1 by this run    */
+#define VLL_M_LVLD 5u  /* DENSE level tokens, +0..2 by previous-plane ctx     */
 
 #define VLL_BM_CONST 0u
 #define VLL_BM_SPARSE 1u
@@ -2001,6 +2001,11 @@ static inline uint32_t vll_bits(uint32_t u) { return u < VLL_NLIT ? 4u : vf_high
  * plane). Deliberately not the immediately preceding residual -- that would put
  * a table selection on the entropy decoder's critical path; this value is known
  * 256 symbols ahead and predicts just as well. */
+/* SPARSE contexts: a run following a run of zero (adjacent nonzero residuals,
+ * i.e. inside a busy region) has a very different distribution from one that
+ * follows a gap, and so does the level that goes with it. */
+static inline uint32_t vll_run_ctx(uint32_t prev_run) { return VLL_M_RUN + (prev_run == 0u ? 0u : 1u); }
+static inline uint32_t vll_lvls_ctx(uint32_t run) { return VLL_M_LVLS + (run == 0u ? 0u : 1u); }
 static inline uint32_t vll_dense_ctx(const uint8_t *u, uint32_t i) {
   uint32_t a = i < 256u ? 0u : u[i - 256u];
   return VLL_M_LVLD + (a == 0u ? 0u : (a <= 2u ? 1u : 2u));
@@ -2062,9 +2067,9 @@ static volcomp_status vll_decode_sub(const vll_parsed *restrict p, uint32_t s, u
       }
       case VLL_BM_SPARSE: {
         memset(u, 0, VF_BLKV);
-        uint32_t pos = 0;
+        uint32_t pos = 0, prev_run = 1;
         for (;;) {
-          int rt = vf_rdec_get(&rd, &p->models[VLL_M_RUN]);
+          int rt = vf_rdec_get(&rd, &p->models[vll_run_ctx(prev_run)]);
           if (rt < 0) return VOLCOMP_ERR_CORRUPT;
           if ((uint32_t)rt == VF_TOK_EOB) break;
           if ((uint32_t)rt > VLL_TOKMAX_RUN) return VOLCOMP_ERR_CORRUPT;
@@ -2072,7 +2077,8 @@ static volcomp_status vll_decode_sub(const vll_parsed *restrict p, uint32_t s, u
           if (!vll_hyb_read(&br, (uint32_t)rt, &run)) return VOLCOMP_ERR_CORRUPT;
           if (pos >= VF_BLKV || run > VF_BLKV - 1u - pos) return VOLCOMP_ERR_CORRUPT;
           pos += run;
-          int lt = vf_rdec_get(&rd, &p->models[VLL_M_LVLS]);
+          prev_run = run;
+          int lt = vf_rdec_get(&rd, &p->models[vll_lvls_ctx(run)]);
           if (lt < 0 || (uint32_t)lt > VLL_TOKMAX_LVL) return VOLCOMP_ERR_CORRUPT;
           uint32_t uu;
           if (!vll_hyb_read(&br, (uint32_t)lt, &uu)) return VOLCOMP_ERR_CORRUPT;
@@ -2151,17 +2157,18 @@ static bool vll_encode_block(vll_enc *restrict e, uint16_t **tp, vf_bitw *bw, co
     for (i = 0; i < VF_BLKV; i++)
       if (!vf_bw_put(bw, b[i], 8)) return false;
   } else if (mode == VLL_BM_SPARSE) {
-    uint32_t pos = 0;
+    uint32_t pos = 0, prev_run = 1;
     for (i = 0; i < VF_BLKV; i++) {
       if (!u[i]) continue;
-      uint32_t t;
-      if (!vll_hyb_emit(bw, i - pos, &t)) return false;
-      VLL_PUT(VLL_M_RUN, t);
+      uint32_t t, run = i - pos;
+      if (!vll_hyb_emit(bw, run, &t)) return false;
+      VLL_PUT(vll_run_ctx(prev_run), t);
       if (!vll_hyb_emit(bw, (uint32_t)u[i] - 1u, &t)) return false;
-      VLL_PUT(VLL_M_LVLS, t);
+      VLL_PUT(vll_lvls_ctx(run), t);
+      prev_run = run;
       pos = i + 1u;
     }
-    VLL_PUT(VLL_M_RUN, VF_TOK_EOB);
+    VLL_PUT(vll_run_ctx(prev_run), VF_TOK_EOB);
   } else {
     for (i = 0; i < VF_BLKV; i++) {
       uint32_t t;
