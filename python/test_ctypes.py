@@ -45,6 +45,18 @@ def main():
         assert blk == ref, "decode_block != full decode"
         print(f"q={q:4.0f}: {len(enc):7d} bytes ({vc.CHUNK_VOXELS / len(enc):6.1f}x)  psnr {p:6.2f} dB")
         assert p > 25, "implausible quality"
+    # lossless: q = 0 reconstructs exactly, and the stream says so
+    for name, buf in (("synthetic", src), ("all-zero", bytearray(vc.CHUNK_VOXELS)),
+                      ("8-class", bytearray(b >> 5 for b in src))):
+        enc = vc.encode(buf, vc.Q_LOSSLESS)
+        assert vc.decode(enc) == buf, f"lossless round trip failed on {name}"
+        assert vc.is_lossless(enc) and vc.stream_q(enc) == vc.Q_LOSSLESS
+        assert len(enc) <= vc.CHUNK_VOXELS + 8
+        assert vc.decode_block(enc, 1, 2, 3) == vc.decode_block(enc, 1, 2, 3)
+        print(f"q=   0 [{name:>9}]: {len(enc):7d} bytes "
+              f"({vc.CHUNK_VOXELS / len(enc):8.1f}x)  exact")
+    assert vc.stream_q(vc.encode(src, 8.0)) == 8.0
+
     # error paths
     try:
         vc.decode(b"VOLC\x02\x00\x00\x08")

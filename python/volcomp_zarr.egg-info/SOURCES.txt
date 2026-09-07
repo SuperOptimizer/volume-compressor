@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+volcomp_zarr/__init__.py
+volcomp_zarr/_lib.py
+volcomp_zarr/libvolcomp.so
+volcomp_zarr.egg-info/PKG-INFO
+volcomp_zarr.egg-info/SOURCES.txt
+volcomp_zarr.egg-info/dependency_links.txt
+volcomp_zarr.egg-info/entry_points.txt
+volcomp_zarr.egg-info/requires.txt
+volcomp_zarr.egg-info/top_level.txt

@@ -7,11 +7,12 @@ The low-level binding (encode/decode/decode_block/deblock over bytes) lives in
 volcomp_zarr._lib and needs only the standard library; the codec class below
 needs zarr >= 3 and numpy and is skipped if they are not installed.
 """
-from ._lib import (BLOCK_VOXELS, CHUNK_DIM, CHUNK_VOXELS, ENCODE_BOUND, VERSION, VolcompError, deblock,
-                   decode, decode_block, encode)
+from ._lib import (BLOCK_VOXELS, CHUNK_DIM, CHUNK_VOXELS, ENCODE_BOUND, Q_LOSSLESS, VERSION, VolcompError,
+                   deblock, decode, decode_block, encode, is_lossless, stream_q)
 
-__all__ = ["encode", "decode", "decode_block", "deblock", "VolcompError", "VERSION", "ENCODE_BOUND",
-           "CHUNK_DIM", "CHUNK_VOXELS", "BLOCK_VOXELS", "VolcompCodec"]
+__all__ = ["encode", "decode", "decode_block", "deblock", "stream_q", "is_lossless", "VolcompError",
+           "VERSION", "ENCODE_BOUND", "Q_LOSSLESS", "CHUNK_DIM", "CHUNK_VOXELS", "BLOCK_VOXELS",
+           "VolcompCodec"]
 
 try:  # zarr v3 codec registration (optional dependency)
     from dataclasses import dataclass, replace
@@ -25,7 +26,10 @@ try:  # zarr v3 codec registration (optional dependency)
 
     @dataclass(frozen=True)
     class VolcompCodec(ArrayBytesCodec):
-        """{"name": "volcomp", "configuration": {"q": 8}} — lossy, uint8, 128^3 chunks only."""
+        """{"name": "volcomp", "configuration": {"q": 8}} — uint8, 128^3 chunks only.
+
+        q = 0 (Q_LOSSLESS) is the exact codec; q in 1..255 is the lossy DCT codec.
+        """
 
         q: float = 8.0
         is_fixed_size = False
@@ -38,6 +42,10 @@ try:  # zarr v3 codec registration (optional dependency)
 
         def to_dict(self) -> dict[str, JSON]:
             return {"name": "volcomp", "configuration": {"q": self.q}}
+
+        def __post_init__(self) -> None:
+            if not (self.q == 0.0 or 1.0 <= self.q <= 255.0):
+                raise ValueError(f"volcomp: q must be 0 (lossless) or 1..255, got {self.q}")
 
         def validate(self, *, shape, dtype, chunk_grid) -> None:  # noqa: D401
             if str(np.dtype(dtype.to_native_dtype() if hasattr(dtype, "to_native_dtype") else dtype)) != "uint8":
@@ -56,8 +64,8 @@ try:  # zarr v3 codec registration (optional dependency)
             arr = np.ascontiguousarray(chunk_array.as_numpy_array(), dtype=np.uint8)
             if arr.shape != (CHUNK_DIM,) * 3:
                 raise ValueError(f"volcomp: chunk must be 128^3, got {arr.shape}")
-            if not arr.any():
-                return None  # all-zero chunk -> stored as missing (fill value 0)
+            if not arr.any() and not chunk_spec.fill_value:
+                return None  # all-zero chunk -> stored as missing (fill value is 0 too)
             return chunk_spec.prototype.buffer.from_bytes(encode(arr.tobytes(), self.q))
 
         async def _decode_single(self, chunk_bytes: Buffer, chunk_spec: ArraySpec) -> NDBuffer:

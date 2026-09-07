@@ -1,0 +1,2 @@
+[zarr.codecs]
+volcomp = volcomp_zarr:VolcompCodec
