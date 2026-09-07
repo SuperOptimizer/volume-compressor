@@ -49,10 +49,14 @@ static int write_file(const char *path, const void *buf, size_t n) {
   ok &= fclose(f) == 0;
   return ok ? 0 : -1;
 }
+/* --q=Q: 0 (lossless) or 1..255. Returns -1 if absent or out of range. */
 static float parse_q(int argc, char **argv) {
   for (int i = 1; i < argc; i++)
-    if (!strncmp(argv[i], "--q=", 4)) return (float)atof(argv[i] + 4);
-  return 0;
+    if (!strncmp(argv[i], "--q=", 4)) {
+      float q = (float)atof(argv[i] + 4);
+      return (q == VOLCOMP_Q_LOSSLESS || (q >= VOLCOMP_Q_MIN && q <= VOLCOMP_Q_MAX)) ? q : -1.0f;
+    }
+  return -1.0f;
 }
 static long parse_opt(int argc, char **argv, const char *name, long dflt) {
   size_t ln = strlen(name);
@@ -264,8 +268,9 @@ static int usage(void) {
                   "  volcomp verify in.volc ref.u8\n  volcomp shard-pack DIR out.shard --q=Q\n"
                   "  volcomp shard-verify in.shard DIR [--samples=N]\n"
                   "  volcomp occupancy in.u8|DIR out.bin [--shape=Z,Y,X] [--factor=F] [--dilate=D] [--grid=GZ,GY,GX] [--shards] [--chunks]\n"
-                  "  volcomp label-encode DIR out.voll --q=Q\n  volcomp label-decode in.voll DIR\n"
-                  "  volcomp label-verify in.voll DIR\n");
+                  "  volcomp label-encode DIR out.voll --q=Q [--q-plane=CLS=Q ...]\n"
+                  "  volcomp label-decode in.voll DIR\n  volcomp label-verify in.voll DIR\n"
+                  "\nQ is 0 for the lossless mode (exact) or 1..255 for the lossy DCT codec.\n");
   return 1;
 }
 #include "label_cli.h"
@@ -275,7 +280,7 @@ int main(int argc, char **argv) {
   const char *cmd = argv[1];
   if (!strcmp(cmd, "encode")) {
     float q = parse_q(argc, argv);
-    if (q <= 0) return usage();
+    if (q < 0) return usage();
     size_t n;
     uint8_t *src = read_file(argv[2], &n);
     if (!src || n != VOLCOMP_CHUNK_VOXELS) {
@@ -320,7 +325,7 @@ int main(int argc, char **argv) {
   }
   if (!strcmp(cmd, "shard-pack")) {
     float q = parse_q(argc, argv);
-    if (q <= 0) return usage();
+    if (q < 0) return usage();
     unsigned present = 0;
     uint64_t bytes = 0;
     int rc = shard_pack(argv[2], argv[3], q, &present, &bytes);
