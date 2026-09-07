@@ -19,7 +19,7 @@ static void roundtrip(uint32_t seed, size_t n, uint32_t skew) {
   uint8_t *out = malloc(cap);
   static vf_etab es[VF_NMODELS];
   static uint32_t fields[3 * 131072];
-  vf_etabs_init(m, es);
+  vf_etabs_init(m, es, VF_NMODELS);
   size_t rn = vf_tans_encode2(es, syms, n, fields, out, cap);
   CHECK(rn > 0 && rn <= cap);
   vf_rdec d;
