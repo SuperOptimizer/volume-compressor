@@ -24,7 +24,7 @@ stated otherwise.
 offset  size   field
 0       4      magic  "VOLC"
 4       1      version = 1
-5       1      reserved = 0
+5       1      mode   0 = lossy DCT (this section), 1..3 = lossless (§10)
 6       2      q_raw  u16, quantiser step q = q_raw / 256, 256 <= q_raw <= 65280
 8       T      frequency tables (§4.3), 10 models
 8+T     256    directory: 32 × { u32 tok_n, u32 bypass_n }
@@ -34,6 +34,10 @@ offset  size   field
 Exact accounting is normative: `8 + T + 256 + Σ(tok_n[s] + bypass_n[s])` must
 equal the stream length. Per substream: `tok_n >= 3`, `tok_n <= 262152`,
 `bypass_n <= 196616`.
+
+Byte 5 was `reserved = 0` in volcomp 1.0 and every 1.0 decoder rejects a
+nonzero value, so the lossless modes of §10 cannot be misread by an old
+decoder; a mode-0 stream is byte for byte what volcomp 1.0 produced.
 
 ## 3. Encoding pipeline (informative summary; §4–§6 are normative)
 
@@ -176,19 +180,81 @@ lossily.
 ```
 offset  size   field
 0       4      magic "VOLL"
-4       1      version = 1
+4       1      version = 2
 5       1      nplanes (0..255)
-6       2      q_raw  u16 as in §2 (256..65280)
+6       2      q_raw  u16, the chunk's DEFAULT q; 0 (lossless) or 256..65280
 8       4      reserved = 0
-12      8*n    directory: { u8 cls, u8 mode, u16 reserved = 0, u32 n } per plane,
-               cls strictly ascending
+12      8*n    directory: { u8 cls, u8 mode, u16 q_raw, u32 n } per plane,
+               cls strictly ascending; the entry's q_raw is the q that plane
+               was encoded with, 0 (lossless) or 256..65280
         var    plane bytes in directory order, n bytes each
 ```
 
 Exact accounting is normative: header, directory and every plane's bytes
-must sum to the stream length. Mode 0 (image): the plane is a §2 stream
-whose `q_raw` equals the header's, `n < 2 097 152`. Mode 1 (raw): the plane is
+must sum to the stream length. Mode 0 (image): the plane is a §2 or §10
+stream whose q equals the directory entry's `q_raw`, `n < 2 097 152`. Mode 1 (raw): the plane is
 stored verbatim, `n = 2 097 152` (the encoder uses it only when the §2 stream
 would not be smaller). Any other mode is rejected.
 
 **Bound.** `VOLCOMP_LABEL_ENCODE_BOUND(n) = 12 + n·(8 + 2 097 152)`.
+
+Version 1 (one `q_raw` for the whole chunk, `reserved = 0` where the entry's
+`q_raw` now sits) is not read; `volcomp_label_decode` returns
+`VOLCOMP_ERR_VERSION` for it.
+
+## 10. Lossless chunks (`q = 0`)
+
+`q = VOLCOMP_Q_LOSSLESS` (0) selects an exact codec. Header byte 5 says which
+of three forms the chunk takes; all three set `q_raw = 0`.
+
+```
+mode 1  CODED   tables + directory + 32 substreams (below)
+mode 2  RAW     8-byte header + 2 097 152 voxels, z-major
+mode 3  CONST   8-byte header + 1 byte, the value of every voxel
+```
+
+Mode 1 keeps §1's geometry: 512 blocks of 16³ in z-major block order, 32
+substreams of 16 consecutive blocks, so a single block decodes from one
+substream and is byte-identical to the same region of the full decode.
+
+```
+offset  size   field
+0       8      header, mode = 1, q_raw = 0
+8       T      frequency tables (§4.3), 6 models
+8+T     D      directory: 32 × { LEB128 tok_n, LEB128 bypass_n }
+8+T+D   P      payload: for s = 0..31: tok_n[s] token bytes then bypass_n[s] bypass bytes
+```
+
+Exact accounting is normative, as in §2. Per substream `tok_n >= 3`,
+`tok_n <= 131 112`, `bypass_n <= 73 736`.
+
+**Models.** 0 block mode, 1 SPARSE runs and EOB, 2 SPARSE levels, 3..5 DENSE
+levels by context. Frequency tables are encoded exactly as in §4.3.
+
+**Tokens.** Values use a HybridUint with 16 literals rather than §4.1's 4:
+`u < 16` is token `u` with no bypass bits; otherwise `tok = 12 + msb(u)` and
+the low `msb(u)` bits go to the bypass stream. A level token is at most 19
+(`u <= 255`), a run token at most 23 (`u <= 4095`); `VF_TOK_EOB = 31`.
+
+**Prediction.** For voxel `i = (z·16 + y)·16 + x` of a block, `pred` is the
+voxel at `z-1` (same y, x), or at `y-1` when `z = 0`, or at `x-1` when
+`z = y = 0`, or 128 at `i = 0`. The residual is `(v - pred) mod 256`
+zigzagged into 0..255. Prediction never crosses a block boundary.
+
+**Block sequence.** Each block starts with a mode token from model 0:
+
+- `0 CONST` — 4096 equal voxels; 8 bypass bits hold the value. No further
+  tokens; an all-flat chunk is mode 3 and costs 9 bytes in total.
+- `1 SPARSE` — `(run, level)*` then `EOB`, all runs and `EOB` from model 1 and
+  all levels from model 2. `run` is the number of zero residuals skipped;
+  `level` is `u - 1` for the nonzero residual `u` that follows, so
+  `level <= 254`. `pos + run <= 4095` is normative.
+- `2 DENSE` — exactly 4096 level tokens, one residual each (`u <= 255`). The
+  model is `3 + c` where `c = 0` if the residual one z-plane back is 0, `1` if
+  it is 1 or 2, else `2` (`c = 0` in the first z-plane). The context looks a
+  whole plane back so that it is never on the entropy decoder's critical path.
+- `3 RAW` — 4096 bypass bytes, the block verbatim.
+
+**Bound.** The encoder emits mode 2 whenever the coded form would reach
+2 097 160 bytes, so a lossless stream is never larger than the raw chunk plus
+the 8-byte header. `VOLCOMP_ENCODE_BOUND` is unchanged.
