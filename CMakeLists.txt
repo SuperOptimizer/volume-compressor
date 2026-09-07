@@ -72,7 +72,8 @@ foreach(src ${VOLCOMP_TESTS})
   target_include_directories(${name} PRIVATE tools/bench tools/cli)
   target_link_libraries(${name} PRIVATE volcomp)
   add_test(NAME ${name} COMMAND ${name} WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
-  set_tests_properties(${name} PROPERTIES TIMEOUT 300)
+  # test_lossless encodes and decodes 1000 chunks; that is slow under sanitizers
+  set_tests_properties(${name} PROPERTIES TIMEOUT 1200)
 endforeach()
 
 # C-kernel variants of the golden and codec tests (VOLCOMP_NO_AVX2), so a

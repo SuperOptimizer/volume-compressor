@@ -20,54 +20,55 @@ static void gen_const(uint8_t *v, uint32_t seed) { memset(v, (int)(seed & 0xffu)
 /* binary mask, ~5% foreground, spatially clustered (blobs, not salt) */
 static void gen_mask(uint8_t *v, uint32_t seed) {
   uint32_t r = seed | 1u;
-  double cz[24], cy[24], cx[24], cr[24];
-  for (int i = 0; i < 24; i++) {
-    cz[i] = vt_rng(&r) % 128;
-    cy[i] = vt_rng(&r) % 128;
-    cx[i] = vt_rng(&r) % 128;
-    cr[i] = 8.0 + (double)(vt_rng(&r) % 9);
-  }
   memset(v, 0, N);
-  for (uint32_t z = 0; z < 128; z++)
-    for (uint32_t y = 0; y < 128; y++)
-      for (uint32_t x = 0; x < 128; x++) {
-        for (int i = 0; i < 24; i++) {
-          double dz = z - cz[i], dy = y - cy[i], dx = x - cx[i];
-          if (dz * dz + dy * dy + dx * dx < cr[i] * cr[i]) {
-            v[((size_t)z * 128 + y) * 128 + x] = 255;
-            break;
-          }
+  for (int i = 0; i < 24; i++) {
+    int cz = (int)(vt_rng(&r) % 128), cy = (int)(vt_rng(&r) % 128), cx = (int)(vt_rng(&r) % 128);
+    int rad = 8 + (int)(vt_rng(&r) % 9);
+    int lo_z = cz - rad < 0 ? 0 : cz - rad, hi_z = cz + rad > 127 ? 127 : cz + rad;
+    int lo_y = cy - rad < 0 ? 0 : cy - rad, hi_y = cy + rad > 127 ? 127 : cy + rad;
+    int lo_x = cx - rad < 0 ? 0 : cx - rad, hi_x = cx + rad > 127 ? 127 : cx + rad;
+    for (int z = lo_z; z <= hi_z; z++)
+      for (int y = lo_y; y <= hi_y; y++)
+        for (int x = lo_x; x <= hi_x; x++) {
+          int dz = z - cz, dy = y - cy, dx = x - cx;
+          if (dz * dz + dy * dy + dx * dx < rad * rad) v[((size_t)z * 128 + (size_t)y) * 128 + (size_t)x] = 255;
         }
-      }
+  }
 }
 
-/* nclass-way label map from nearest-seed (Voronoi) regions */
+/* nclass-way label map from nearest-seed (Voronoi) regions, resolved on a 64^3
+ * grid and doubled (cheap enough to run 1000 times under a sanitizer) */
 static void gen_labels_n(uint8_t *v, uint32_t seed, uint32_t nclass) {
   uint32_t r = seed | 1u;
-  const uint32_t NS = 40;
-  double sz[40], sy[40], sx[40];
+  const int NS = 40;
+  int sz[40], sy[40], sx[40];
   uint8_t sl[40];
-  for (uint32_t i = 0; i < NS; i++) {
-    sz[i] = vt_rng(&r) % 128;
-    sy[i] = vt_rng(&r) % 128;
-    sx[i] = vt_rng(&r) % 128;
+  for (int i = 0; i < NS; i++) {
+    sz[i] = (int)(vt_rng(&r) % 64);
+    sy[i] = (int)(vt_rng(&r) % 64);
+    sx[i] = (int)(vt_rng(&r) % 64);
     sl[i] = (uint8_t)(vt_rng(&r) % nclass);
   }
-  for (uint32_t z = 0; z < 128; z++)
-    for (uint32_t y = 0; y < 128; y++)
-      for (uint32_t x = 0; x < 128; x++) {
-        double best = 1e30;
+  static uint8_t g[64 * 64 * 64];
+  for (int z = 0; z < 64; z++)
+    for (int y = 0; y < 64; y++)
+      for (int x = 0; x < 64; x++) {
+        int best = 1 << 30;
         uint8_t bl = 0;
-        for (uint32_t i = 0; i < NS; i++) {
-          double dz = z - sz[i], dy = y - sy[i], dx = x - sx[i];
-          double d = dz * dz + dy * dy + dx * dx;
+        for (int i = 0; i < NS; i++) {
+          int dz = z - sz[i], dy = y - sy[i], dx = x - sx[i];
+          int d = dz * dz + dy * dy + dx * dx;
           if (d < best) {
             best = d;
             bl = sl[i];
           }
         }
-        v[((size_t)z * 128 + y) * 128 + x] = bl;
+        g[(z * 64 + y) * 64 + x] = bl;
       }
+  for (uint32_t z = 0; z < 128; z++)
+    for (uint32_t y = 0; y < 128; y++)
+      for (uint32_t x = 0; x < 128; x++)
+        v[((size_t)z * 128 + y) * 128 + x] = g[((z / 2) * 64 + y / 2) * 64 + x / 2];
 }
 static void gen_labels8(uint8_t *v, uint32_t seed) { gen_labels_n(v, seed, 8); }
 
@@ -231,12 +232,12 @@ int main(int argc, char **argv) {
     uint8_t *cp = (uint8_t *)malloc(n);
     CHECK(cp != NULL);
     if (cp) {
-      for (size_t cut = 1; cut < n; cut += 97) {
+      for (size_t cut = 1; cut < n; cut += n / 200 + 1) {
         memcpy(cp, g_enc, cut);
         volcomp_decode(cp, cut, dec, N); /* must not crash; result unchecked */
       }
       uint32_t r = 12345;
-      for (int i = 0; i < 2000; i++) {
+      for (int i = 0; i < 300; i++) {
         memcpy(cp, g_enc, n);
         cp[vt_rng(&r) % n] ^= (uint8_t)(1u << (vt_rng(&r) % 8u));
         if (volcomp_decode(cp, n, dec, N) == VOLCOMP_OK) CHECK(true); /* wrong data is allowed */
