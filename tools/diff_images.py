@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Magnified error overlays for the comparison set: for every volume and its three centre planes (zmid, ymid,
 xmid), the raw slice in grey with a red overlay whose opacity is the absolute decode error of that pixel at each
-q, unstretched (|raw - decoded| / 255, so an error of 128 is a 50 % red overlay), upscaled 2x by pixel
-replication to 1024^2 and written as lossless RGB PNG: `diff_<view>_q<N>.png` (plain decode).
+q with a fixed 4x gain (min(1, 4 * |raw - decoded| / 255): an error of 32 is a 50 % red overlay, 64 or more is
+solid red), upscaled 2x by pixel replication to 1024^2 and written as lossless RGB PNG: `diff_<view>_q<N>.png`
+(plain decode).
 
     VOLCOMP_LIB=build/release/libvolcomp.so python3 tools/diff_images.py docs/comparison
 """
@@ -15,11 +16,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from compare_images import N, QS, VOLUMES, fetch_cube, pick_cube, roundtrip, views  # noqa: E402
 
 PLANES = ["zmid", "ymid", "xmid"]
+GAIN = 4.0  # overlay opacity = min(1, GAIN * error / 255)
 
 
 def overlay(raw, dec):
-    """Grey base + red at opacity |raw - dec| / 255, 2x nearest upscale, uint8 RGB."""
-    a = np.abs(raw.astype(np.float32) - dec.astype(np.float32)) / 255.0
+    """Grey base + red at opacity min(1, GAIN * |raw - dec| / 255), 2x nearest upscale, uint8 RGB."""
+    a = np.minimum(GAIN * np.abs(raw.astype(np.float32) - dec.astype(np.float32)) / 255.0, 1.0)
     g = raw.astype(np.float32)
     rgb = np.stack([g * (1 - a) + 255.0 * a, g * (1 - a), g * (1 - a)], -1)
     rgb = np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
@@ -50,8 +52,9 @@ def main(out_root):
     if "## Error overlays" not in s:
         L = ["", "## Error overlays", "",
              "For the three centre planes of every cube: the raw slice in grey with a red overlay whose opacity is "
-             "the absolute error of the plain decode at that pixel, unstretched (|raw - decoded| / 255), magnified "
-             "2x by pixel replication to 1024^2. `tools/diff_images.py`.", ""]
+             "the absolute error of the plain decode at that pixel with a fixed 4x gain (min(1, 4 |raw - decoded| / 255): "
+             "an error of 32 shows as 50 % red, 64 or more as solid red), magnified 2x by pixel replication to 1024^2. "
+             "`tools/diff_images.py`.", ""]
         for name in [f"{s_}_{r}" for s_, _, r in VOLUMES]:
             L.append(f"- {name}: " + "  ·  ".join(
                 f"{p} " + " ".join(f"[q{q}]({name}/diff_{p}_q{q}.png)" for q in QS) for p in PLANES))
