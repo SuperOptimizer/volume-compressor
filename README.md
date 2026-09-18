@@ -84,5 +84,7 @@ golden and codec tests on both kernel sets (`test_golden_c`, `test_codec_c`).
 
 ## Numbers
 
-See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). Design decisions and the
+See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). Side-by-side images of raw CT
+against q = 1..32 on 512³ cubes from four ESRF scans (0.55 / 1.13 / 2.40 / 9.36 µm):
+[`docs/comparison/`](docs/comparison/README.md). Design decisions and the
 measured graveyard of rejected ideas: [`docs/measured.md`](docs/measured.md).
