@@ -2,11 +2,12 @@
 """Visual comparison of volcomp quality levels on raw scroll CT.
 
 For each volume a 512^3 cube of the ORIGINAL uint8 data (the open-data bucket stores the level-0 chunks
-uncompressed) is fetched, encoded chunk by chunk (128^3) at q = 1, 2, 4, 8, 16, 32 and decoded again (plain
-decode, no deblocking: what a zarr reader gets). Nine 512^2 views of every version are written as lossless
-greyscale PNGs -- the six faces of the cube and the three planes through its exact centre -- plus, per view, one
-strip that concatenates raw and the six q levels side by side. A README with size ratio, PSNR, MAE and error
-percentiles per cube and q is written next to the images.
+uncompressed) is fetched, encoded chunk by chunk (128^3) at q = 1, 2, 4, 8, 16, 32 and decoded again, once as
+a plain decode (what a zarr reader gets) and once followed by the optional `volcomp_deblock()` post-filter
+(`q<N>` / `q<N>_db`). Nine 512^2 views of every version are written as lossless greyscale PNGs -- the six faces of
+the cube and the three planes through its exact centre -- plus, per view, two strips that concatenate raw and the
+six q levels side by side: `<view>_all.png` (no deblocking) and `<view>_all_db.png` (deblocked). A README with size
+ratio, PSNR, MAE and error percentiles per cube, q and filter is written next to the images.
 
 The cube is chosen automatically: the densest 512^3 window (mean intensity) of the middle 512 slices, found on
 the 16x downsampled level and snapped to the 128-voxel chunk grid, so every cube is papyrus rather than air.
@@ -79,6 +80,13 @@ def roundtrip(cube, q):
     return out, nbytes
 
 
+def deblocked(dec, q):
+    from volcomp_zarr import _lib
+    buf = bytearray(dec.tobytes())
+    _lib.deblock(buf, N, N, N, float(q))
+    return np.frombuffer(bytes(buf), np.uint8).reshape(N, N, N)
+
+
 def views(v):
     h = N // 2
     return {"z0": v[0], "z511": v[-1], "y0": v[:, 0], "y511": v[:, -1], "x0": v[:, :, 0], "x511": v[:, :, -1],
@@ -127,19 +135,25 @@ def main(out_root):
         for q in QS:
             dec, nb = roundtrip(cube, q)
             vers[f"q{q}"] = (dec, nb, stats(cube, dec))
-            s = vers[f"q{q}"][2]
-            print(f"  q={q:<3d} {cube.nbytes / nb:7.1f}x  PSNR {s['psnr']:.1f} dB  MAE {s['mae']:.2f}  P99 {s['p99']:.0f}  max {s['max']:.0f}", flush=True)
+            db = deblocked(dec, q)
+            vers[f"q{q}_db"] = (db, nb, stats(cube, db))
+            s, t = vers[f"q{q}"][2], vers[f"q{q}_db"][2]
+            print(f"  q={q:<3d} {cube.nbytes / nb:7.1f}x  PSNR {s['psnr']:.1f} dB  MAE {s['mae']:.2f}  P99 {s['p99']:.0f}  max {s['max']:.0f}"
+                  f"   | deblocked: PSNR {t['psnr']:.1f} dB  MAE {t['mae']:.2f}  P99 {t['p99']:.0f}  max {t['max']:.0f}", flush=True)
         allviews = {k: views(v[0]) for k, v in vers.items()}
         for k in vers:
             for vn, img in allviews[k].items():
                 save_png(os.path.join(d, f"{vn}_{k}.png"), img)
         for vn in VIEWS:
-            labels = [f"{name} {vn}  raw ({cube.nbytes / 2 ** 20:.0f} MiB)"]
-            labels += [f"q={q}  {cube.nbytes / vers[f'q{q}'][1]:.0f}x  PSNR {vers[f'q{q}'][2]['psnr']:.1f} dB  MAE {vers[f'q{q}'][2]['mae']:.2f}" for q in QS]
-            strip([allviews[k][vn] for k in vers], labels, os.path.join(d, f"{vn}_all.png"))
+            for suf, tag in (("", ""), ("_db", " deblocked")):
+                keys = ["raw"] + [f"q{q}{suf}" for q in QS]
+                labels = [f"{name} {vn}  raw ({cube.nbytes / 2 ** 20:.0f} MiB)"]
+                labels += [f"q={q}{tag}  {cube.nbytes / vers[k][1]:.0f}x  PSNR {vers[k][2]['psnr']:.1f} dB  MAE {vers[k][2]['mae']:.2f}" for q, k in zip(QS, keys[1:])]
+                strip([allviews[k][vn] for k in keys], labels, os.path.join(d, f"{vn}_all{suf}.png"))
         report[name] = {"sample": sample, "volume": volume, "voxel": res, "shape": list(shape), "origin_zyx": org,
                         "raw_bytes": int(cube.nbytes),
-                        "q": {str(q): {"bytes": int(vers[f"q{q}"][1]), "ratio": cube.nbytes / vers[f"q{q}"][1], **vers[f"q{q}"][2]} for q in QS}}
+                        "q": {str(q): {"bytes": int(vers[f"q{q}"][1]), "ratio": cube.nbytes / vers[f"q{q}"][1], **vers[f"q{q}"][2],
+                                       "deblocked": vers[f"q{q}_db"][2]} for q in QS}}
         print(f"  done in {time.time() - t0:.0f} s", flush=True)
     with open(os.path.join(out_root, "report.json"), "w") as f:
         json.dump(report, f, indent=1)
@@ -149,17 +163,20 @@ def main(out_root):
 def write_readme(out_root, report):
     L = ["# volcomp quality comparison on raw scroll CT", "",
          "512^3 cubes of ORIGINAL uint8 CT (the open-data bucket's uncompressed level-0 chunks) from four ESRF scans "
-         "at four voxel sizes, encoded at q = 1 .. 32 (128^3 chunks) and decoded without deblocking. Every version "
-         "has nine 512^2 lossless PNG views: the six cube faces (`z0 z511 y0 y511 x0 x511`) and the three centre "
-         "planes (`zmid ymid xmid`); `<view>_all.png` puts raw and the six q levels side by side. Generated by "
-         "`tools/compare_images.py`; numbers in `report.json`.", ""]
+         "at four voxel sizes, encoded at q = 1 .. 32 (128^3 chunks) and decoded twice: plain (`q<N>`, what a zarr "
+         "reader gets) and with the optional `volcomp_deblock()` post-filter (`q<N>_db`). Every version has nine "
+         "512^2 lossless PNG views: the six cube faces (`z0 z511 y0 y511 x0 x511`) and the three centre planes "
+         "(`zmid ymid xmid`); `<view>_all.png` puts raw and the six q levels side by side without deblocking, "
+         "`<view>_all_db.png` with it. Generated by `tools/compare_images.py`; numbers in `report.json`.", ""]
     for name, r in report.items():
         L += [f"## {name}", "", f"`{r['sample']}/volumes/{r['volume']}`, volume shape {r['shape']}, cube origin zyx {r['origin_zyx']}, raw {r['raw_bytes'] / 2 ** 20:.0f} MiB.", "",
-              "| q | size | ratio | PSNR dB | MAE | P99 | max |", "|---|---|---|---|---|---|---|"]
+              "| q | size | ratio | PSNR dB | MAE | P99 | max | deblocked PSNR | MAE | P99 | max |", "|---|---|---|---|---|---|---|---|---|---|---|"]
         for q, s in r["q"].items():
-            L.append(f"| {q} | {s['bytes'] / 2 ** 20:.2f} MiB | {s['ratio']:.1f}x | {s['psnr']:.1f} | {s['mae']:.2f} | {s['p99']:.0f} | {s['max']:.0f} |")
-        L += [""] + [f"- {v}: [{v}_all.png]({name}/{v}_all.png)  ·  raw [{name}/{v}_raw.png]({name}/{v}_raw.png)" for v in VIEWS] + [""]
-        L += [f"![{name} zmid]({name}/zmid_all.png)", ""]
+            t = s["deblocked"]
+            L.append(f"| {q} | {s['bytes'] / 2 ** 20:.2f} MiB | {s['ratio']:.1f}x | {s['psnr']:.1f} | {s['mae']:.2f} | {s['p99']:.0f} | {s['max']:.0f}"
+                     f" | {t['psnr']:.1f} | {t['mae']:.2f} | {t['p99']:.0f} | {t['max']:.0f} |")
+        L += [""] + [f"- {v}: [{v}_all.png]({name}/{v}_all.png)  ·  deblocked [{v}_all_db.png]({name}/{v}_all_db.png)  ·  raw [{name}/{v}_raw.png]({name}/{v}_raw.png)" for v in VIEWS] + [""]
+        L += [f"![{name} zmid]({name}/zmid_all.png)", "", f"![{name} zmid deblocked]({name}/zmid_all_db.png)", ""]
     with open(os.path.join(out_root, "README.md"), "w") as f:
         f.write("\n".join(L))
 
