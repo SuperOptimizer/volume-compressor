@@ -78,10 +78,11 @@ Q_NATIVE = 8.0
 #
 #   rung k    0      1      2      3      4      5      6 ...
 #   um        0.6    1.2    2.4    4.8    9.6    19.2   38.4 ...
-#   q         32     16     8      4      2      1      1
+#   q         32     16     8      4      2      1      0 (lossless)
 #
-# so a 2.4 um array is q 8 and each 2x downscale halves q down to 1 (downscaling
-# averages noise away, so coarser levels keep more per voxel). The CT export
+# so a 2.4 um array is q 8 and each 2x downscale halves q down to 1 at 19.2 um; every
+# coarser rung is stored lossless (on ramp data q 1 saves only ~20 % over lossless, and
+# the dead zone would erase the small pooled values at the top of the ladder). The CT export
 # still uses level_q() below; it is the same rule for a 2.4 um scan and can move
 # over to rung_q() at its next re-export.
 RUNG0_UM = 0.6
@@ -104,9 +105,12 @@ def rung_of(um):
     return min(range(LADDER_TOP + 1), key=lambda k: abs(math.log2(um / rung_um(k))))
 
 
+LOSSLESS_FROM = 6  # 38.4 um and coarser: q 0
+
+
 def rung_q(k):
-    """Quantiser for an array whose voxels are rung k."""
-    return max(1.0, Q_RUNG0 / 2 ** k)
+    """Quantiser for an array whose voxels are rung k: 32 / 2^k down to 1 at 19.2 um, 0 (lossless) above."""
+    return 0.0 if k >= LOSSLESS_FROM else max(1.0, Q_RUNG0 / 2 ** k)
 
 
 def level_q(level, q0=Q_NATIVE):

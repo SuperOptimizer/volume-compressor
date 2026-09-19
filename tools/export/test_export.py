@@ -290,7 +290,7 @@ def test_tree_and_metadata(export):
     assert ex["resample_scale"] == 1.0
     assert ex["shape"] == list(SHAPE)
     qs = {lv["path"]: lv["q"] for lv in ex["levels"]}
-    assert qs["2.4"] == 8 and qs["4.8"] == 4 and qs["9.6"] == 2 and qs["19.2"] == 1
+    assert qs["2.4"] == 8 and qs["4.8"] == 4 and qs["9.6"] == 2 and qs["19.2"] == 1 and qs["38.4"] == 0
     assert qs["1228.8"] == 0  # the top of the ladder fits one chunk and is stored losslessly
     # every level has an array metadata document with the right shard shape
     for lv in ex["levels"]:

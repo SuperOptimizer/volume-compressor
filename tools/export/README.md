@@ -82,12 +82,13 @@ They are exported as a second kind of unit, in their own shape:
 - **q per level is a function of the voxel size**, not of the level index
   (`rung_q()` in `coordinator.py`, the one table for the whole export):
 
-  | um | 0.6 | 1.2 | 2.4 | 4.8 | 9.6 | 19.2 and coarser |
-  |---|---|---|---|---|---|---|
-  | q | 32 | 16 | 8 | 4 | 2 | 1 |
+  | um | 0.6 | 1.2 | 2.4 | 4.8 | 9.6 | 19.2 | 38.4 and coarser |
+  |---|---|---|---|---|---|---|---|
+  | q | 32 | 16 | 8 | 4 | 2 | 1 | 0 (lossless) |
 
-  So the PHercParis4 2.4 um recto prediction is q 8 / 4 / 2 / 1, and every m7
-  prediction on a 2.4 um scan (`-L2-`, i.e. 9.6 um natively) is q 2 then 1. The
+  So the PHercParis4 2.4 um recto prediction is q 8 / 4 / 2 / 1 and lossless above,
+  and every m7 prediction on a 2.4 um scan (`-L2-`, i.e. 9.6 um natively) is q 2, then
+  1 at 19.2 um, then lossless. The
   top rungs of a prediction fit in a single 128³ chunk and hold a handful of small
   values that a dead-zone quantiser would wipe out, so they are stored losslessly
   (`q = 0`); it costs a few hundred bytes.
