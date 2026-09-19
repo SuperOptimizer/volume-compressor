@@ -7,6 +7,39 @@
 static uint8_t g_p1[N], g_p2[N], g_dec[N], g_ref[N], g_blk[VOLCOMP_BLOCK_VOXELS];
 static uint8_t g_enc[VOLCOMP_LABEL_ENCODE_BOUND(4)];
 
+/* per-plane q: a lossless class map beside lossy probability planes */
+static void perplane_q(void) {
+  vt_synth_chunk(g_p1, 21);
+  for (size_t i = 0; i < N; i++) g_p2[i] = (uint8_t)(g_p1[i] >> 5); /* 8-class map */
+  volcomp_label_plane pl[2] = {{3, g_p2}, {9, g_p1}};
+  const float qp[2] = {VOLCOMP_Q_LOSSLESS, -1.0f}; /* class 3 lossless, class 9 default */
+  size_t n;
+  CHECK_EQ(volcomp_label_encode_q(pl, 2, 8.0f, qp, g_enc, sizeof g_enc, &n), VOLCOMP_OK);
+  float q = -1;
+  CHECK_EQ(volcomp_label_q(g_enc, n, &q), VOLCOMP_OK);
+  CHECK(q == 8.0f);
+  CHECK_EQ(volcomp_label_plane_q(g_enc, n, 3, &q), VOLCOMP_OK);
+  CHECK(q == VOLCOMP_Q_LOSSLESS);
+  CHECK_EQ(volcomp_label_plane_q(g_enc, n, 9, &q), VOLCOMP_OK);
+  CHECK(q == 8.0f);
+  CHECK_EQ(volcomp_label_decode(g_enc, n, 3, g_dec, sizeof g_dec), VOLCOMP_OK);
+  CHECK(memcmp(g_dec, g_p2, N) == 0); /* exact */
+  CHECK_EQ(volcomp_label_decode_block(g_enc, n, 3, 2, 4, 6, g_blk, sizeof g_blk), VOLCOMP_OK);
+  for (uint32_t z = 0; z < 16; z++)
+    for (uint32_t y = 0; y < 16; y++)
+      CHECK(memcmp(g_blk + (z * 16 + y) * 16,
+                   g_p2 + (((size_t)2 * 16 + z) * 128 + 4 * 16 + y) * 128 + 6 * 16, 16) == 0);
+  CHECK_EQ(volcomp_label_decode(g_enc, n, 9, g_dec, sizeof g_dec), VOLCOMP_OK);
+  CHECK(memcmp(g_dec, g_p1, N) != 0); /* lossy */
+  /* every plane lossless */
+  CHECK_EQ(volcomp_label_encode(pl, 2, VOLCOMP_Q_LOSSLESS, g_enc, sizeof g_enc, &n), VOLCOMP_OK);
+  CHECK_EQ(volcomp_label_decode(g_enc, n, 9, g_dec, sizeof g_dec), VOLCOMP_OK);
+  CHECK(memcmp(g_dec, g_p1, N) == 0);
+  CHECK_EQ(volcomp_label_plane_q(g_enc, n, 9, &q), VOLCOMP_OK);
+  CHECK(q == VOLCOMP_Q_LOSSLESS);
+  printf("per-plane q: %zu bytes (lossless 8-class + lossless synthetic CT)\n", n);
+}
+
 static void roundtrip(void) {
   vt_synth_chunk(g_p1, 3);
   vt_synth_chunk(g_p2, 11);
@@ -14,7 +47,7 @@ static void roundtrip(void) {
   size_t n;
   CHECK_EQ(volcomp_label_encode(pl, 4, 8.0f, g_enc, sizeof g_enc, &n), VOLCOMP_OK);
   CHECK(memcmp(g_enc, "VOLL", 4) == 0);
-  CHECK_EQ(g_enc[4], 1);
+  CHECK_EQ(g_enc[4], 2); /* format version */
   CHECK_EQ(g_enc[5], 2); /* classes 2 and 200 absent */
   CHECK_EQ(vf_rd_u16(g_enc + 6), 8 * 256);
   uint8_t cls[255];
@@ -59,7 +92,8 @@ static void roundtrip(void) {
   size_t n2;
   CHECK_EQ(volcomp_label_encode(pl, 4, 8.0f, g_enc, n - 1, &n2), VOLCOMP_ERR_SHORT_BUF);
   CHECK_EQ(volcomp_label_encode(pl, 4, 8.0f, g_enc, 10, &n2), VOLCOMP_ERR_SHORT_BUF);
-  CHECK_EQ(volcomp_label_encode(pl, 4, 0.0f, g_enc, sizeof g_enc, &n2), VOLCOMP_ERR_ARG);
+  CHECK_EQ(volcomp_label_encode(pl, 4, 0.5f, g_enc, sizeof g_enc, &n2), VOLCOMP_ERR_ARG);
+  CHECK_EQ(volcomp_label_encode(pl, 4, -1.0f, g_enc, sizeof g_enc, &n2), VOLCOMP_ERR_ARG);
   volcomp_label_plane bad[2] = {{5, g_p1}, {5, g_p2}};
   CHECK_EQ(volcomp_label_encode(bad, 2, 8.0f, g_enc, sizeof g_enc, &n2), VOLCOMP_ERR_ARG);
   CHECK_EQ(volcomp_label_decode(g_enc, n, 1, g_dec, N - 1), VOLCOMP_ERR_SHORT_BUF);
@@ -100,13 +134,19 @@ static void hostile(void) {
   m[0] = 'X';
   CHECK_EQ(volcomp_label_decode(m, n, 1, g_dec, sizeof g_dec), VOLCOMP_ERR_CORRUPT);
   memcpy(m, g_enc, n);
-  m[4] = 2;
+  m[4] = 3;
+  CHECK_EQ(volcomp_label_decode(m, n, 1, g_dec, sizeof g_dec), VOLCOMP_ERR_VERSION);
+  memcpy(m, g_enc, n);
+  m[4] = 1; /* the v1 chunk-wide-q layout is not read */
   CHECK_EQ(volcomp_label_decode(m, n, 1, g_dec, sizeof g_dec), VOLCOMP_ERR_VERSION);
   memcpy(m, g_enc, n);
   m[8] = 1;
   CHECK_EQ(volcomp_label_decode(m, n, 1, g_dec, sizeof g_dec), VOLCOMP_ERR_CORRUPT);
   memcpy(m, g_enc, n);
-  vf_wr_u16(m + 6, 0);
+  vf_wr_u16(m + 6, 1); /* q_raw must be 0 (lossless) or 256..65280 */
+  CHECK_EQ(volcomp_label_decode(m, n, 1, g_dec, sizeof g_dec), VOLCOMP_ERR_CORRUPT);
+  memcpy(m, g_enc, n);
+  vf_wr_u16(m + VOLCOMP_LABEL_HDR_BYTES + 2, 255); /* same for a plane's q_raw */
   CHECK_EQ(volcomp_label_decode(m, n, 1, g_dec, sizeof g_dec), VOLCOMP_ERR_CORRUPT);
   memcpy(m, g_enc, n);
   vf_wr_u32(m + VOLCOMP_LABEL_HDR_BYTES + 4, vf_rd_u32(m + VOLCOMP_LABEL_HDR_BYTES + 4) + 1);
@@ -130,6 +170,7 @@ static void hostile(void) {
 
 int main(void) {
   roundtrip();
+  perplane_q();
   bound_and_raw();
   hostile();
   TEST_END();

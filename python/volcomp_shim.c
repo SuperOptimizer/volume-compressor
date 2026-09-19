@@ -18,6 +18,9 @@ VOLCOMP_EXPORT int volcomp_shim_decode_block(const void *enc, size_t n, unsigned
                                              uint8_t *dst, size_t cap) {
   return (int)volcomp_decode_block(enc, n, bz, by, bx, dst, cap);
 }
+VOLCOMP_EXPORT int volcomp_shim_stream_q(const void *enc, size_t n, float *q) {
+  return (int)volcomp_stream_q(enc, n, q);
+}
 VOLCOMP_EXPORT void volcomp_shim_deblock(uint8_t *vol, size_t nz, size_t ny, size_t nx, float q) {
   volcomp_deblock(vol, nz, ny, nx, q);
 }

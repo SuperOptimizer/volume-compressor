@@ -14,10 +14,10 @@ static void roundtrip_models(uint32_t seed, uint32_t density) {
     CHECK_EQ(sum, VF_PROB_SCALE);
   }
   uint8_t buf[VF_TABLES_MAX_BYTES];
-  size_t n = vf_tables_write(m, buf);
+  size_t n = vf_tables_write(m, buf, VF_NMODELS);
   CHECK(n <= VF_TABLES_MAX_BYTES);
   vf_cur c = {buf, buf + n};
-  CHECK(vf_tables_read(&c, back));
+  CHECK(vf_tables_read(&c, back, VF_NMODELS));
   CHECK(c.p == c.end);
   for (uint32_t i = 0; i < VF_NMODELS; i++) {
     CHECK(memcmp(m[i].freq, back[i].freq, sizeof m[i].freq) == 0);
@@ -27,7 +27,7 @@ static void roundtrip_models(uint32_t seed, uint32_t density) {
   /* truncation at every byte is rejected */
   for (size_t cut = 0; cut < n; cut++) {
     vf_cur t = {buf, buf + cut};
-    CHECK(!vf_tables_read(&t, back));
+    CHECK(!vf_tables_read(&t, back, VF_NMODELS));
   }
 }
 
@@ -51,11 +51,11 @@ static void rejections(void) {
   n += vf_leb_put(buf + n, 500);
   vf_cur c = {buf, buf + n};
   vf_model mm[VF_NMODELS];
-  CHECK(!vf_tables_read(&c, mm));
+  CHECK(!vf_tables_read(&c, mm, VF_NMODELS));
   /* empty bitmap rejected */
   vf_wr_u32(buf, 0);
   c = (vf_cur){buf, buf + 4};
-  CHECK(!vf_tables_read(&c, mm));
+  CHECK(!vf_tables_read(&c, mm, VF_NMODELS));
   /* zero frequency with bit set rejected */
   n = 0;
   vf_wr_u32(buf + n, 3u);
@@ -63,7 +63,7 @@ static void rejections(void) {
   n += vf_leb_put(buf + n, 0);
   n += vf_leb_put(buf + n, VF_PROB_SCALE);
   c = (vf_cur){buf, buf + n};
-  CHECK(!vf_tables_read(&c, mm));
+  CHECK(!vf_tables_read(&c, mm, VF_NMODELS));
 }
 
 int main(void) {

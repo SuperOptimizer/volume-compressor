@@ -180,7 +180,8 @@ def cmd_bootstrap(a):
         role = role_of(i)
         env = {"ROLE": role, "COMMIT": a.commit, "REPO": REPO, "COORDINATOR": f"http://{coord_ip}:{a.port}",
                "SFTP": a.sftp or "", "NETRC_CONTENT": netrc, "Q": str(a.q), "PARALLEL": str(a.parallel),
-               "SAMPLES": str(a.samples), "PORT": str(a.port), "DELETE_PATHS": a.delete_paths or ""}
+               "SAMPLES": str(a.samples), "PORT": str(a.port), "DELETE_PATHS": a.delete_paths or "",
+               "KIND": a.kind}
         exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items())
         try:
             r = subprocess.run(ssh_cmd(i["ip_address"], a.user, "sudo -E bash -s"), input=exports + script, text=True,
@@ -247,6 +248,8 @@ def main():
     p.add_argument("--q", type=float, default=8.0)
     p.add_argument("--parallel", type=int, default=4)
     p.add_argument("--samples", type=int, default=8)
+    p.add_argument("--kind", default="ct", choices=["ct", "surface"],
+                   help="what these workers will process: CT volumes, or surface predictions (one unit in flight, all cores in volcomp surface-pack)")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--public-coordinator", action="store_true", help="workers reach the coordinator by public IP")
     p.add_argument("--delete-paths", help="deleter role: space-separated remote dirs to remove recursively")

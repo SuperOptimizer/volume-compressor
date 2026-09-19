@@ -10,6 +10,13 @@
  *       occupancy of a raw volume (or, --chunks, a directory of 128^3 chunks cz_cy_cx.u8) on an F^3-cell grid (1 where any voxel within the cell,
  *       dilated by D voxels, is nonzero); --shards emits 64-byte per-shard chunk bitmasks.
  *       Used on a downsampled level to know which chunks of finer levels hold data.
+ *   volcomp surface-pack SRCDIR OUTDIR --csize=C --src-shape=Z,Y,X --out-shape=Z,Y,X --shard=SZ,SY,SX
+ *       [--scale=S] [--q=Q0,Q1,Q2,Q3] [--threads=N] [--samples=N] [--dmax=3]
+ *       one export unit of a surface-prediction volume: blosc/zstd source chunks ->
+ *       signed-distance ramp -> exact-ladder resample -> levels 0..3 shard files
+ *   volcomp shard-pool out.shard --q=Q --shape=Z,Y,X --pos=SZ,SY,SX in0 .. in7
+ *       one coarser 128^3 shard from the 8 that cover it (2x mean pooling); the
+ *       offline part of the prediction pyramid, driven by coordinator.py pool-levels
  *   volcomp label-encode DIR out.voll --q=Q   (DIR/<cls>.u8 class probability planes -> label chunk)
  *   volcomp label-decode in.voll DIR          (writes DIR/<cls>.u8 for every stored class)
  *   volcomp label-verify in.voll DIR          (decode + error stats per class)
@@ -17,11 +24,13 @@
 #include "../../volcomp.h"
 #include "metrics.h"
 #include "shard_pack.h"
+#include "surface_pack.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static uint8_t *read_file(const char *path, size_t *n) {
   FILE *f = fopen(path, "rb");
@@ -49,10 +58,14 @@ static int write_file(const char *path, const void *buf, size_t n) {
   ok &= fclose(f) == 0;
   return ok ? 0 : -1;
 }
+/* --q=Q: 0 (lossless) or 1..255. Returns -1 if absent or out of range. */
 static float parse_q(int argc, char **argv) {
   for (int i = 1; i < argc; i++)
-    if (!strncmp(argv[i], "--q=", 4)) return (float)atof(argv[i] + 4);
-  return 0;
+    if (!strncmp(argv[i], "--q=", 4)) {
+      float q = (float)atof(argv[i] + 4);
+      return (q == VOLCOMP_Q_LOSSLESS || (q >= VOLCOMP_Q_MIN && q <= VOLCOMP_Q_MAX)) ? q : -1.0f;
+    }
+  return -1.0f;
 }
 static long parse_opt(int argc, char **argv, const char *name, long dflt) {
   size_t ln = strlen(name);
@@ -259,13 +272,110 @@ static int occupancy(int argc, char **argv) {
   free(o.cell);
   return rc ? 2 : 0;
 }
+/* --name=A,B,C into an int64 triple; returns false if the option is absent or malformed */
+static bool parse_i64_3(int argc, char **argv, const char *name, int64_t v[3]) {
+  size_t ln = strlen(name);
+  for (int i = 2; i < argc; i++)
+    if (!strncmp(argv[i], name, ln)) {
+      long long a, b, c;
+      if (sscanf(argv[i] + ln, "%lld,%lld,%lld", &a, &b, &c) != 3) return false;
+      v[0] = a, v[1] = b, v[2] = c;
+      return true;
+    }
+  return false;
+}
+static double parse_double(int argc, char **argv, const char *name, double dflt) {
+  size_t ln = strlen(name);
+  for (int i = 2; i < argc; i++)
+    if (!strncmp(argv[i], name, ln)) return atof(argv[i] + ln);
+  return dflt;
+}
+static int surface_cli(int argc, char **argv) {
+  surf_cfg cfg = {.srcdir = argv[2], .outdir = argv[3], .scale = 1.0, .dmax = SURF_DMAX};
+  cfg.csize = parse_opt(argc, argv, "--csize=", 0);
+  cfg.threads = (int)parse_opt(argc, argv, "--threads=", 0);
+  cfg.samples = (int)parse_opt(argc, argv, "--samples=", 8);
+  cfg.dmax = (int)parse_opt(argc, argv, "--dmax=", SURF_DMAX);
+  cfg.scale = parse_double(argc, argv, "--scale=", 1.0);
+  if (cfg.threads <= 0) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    cfg.threads = n > 0 ? (int)n : 1;
+  }
+  for (int L = 0; L < SURF_LEVELS; L++) cfg.q[L] = -1.0f;
+  for (int i = 2; i < argc; i++)
+    if (!strncmp(argv[i], "--q=", 4)) {
+      const char *p = argv[i] + 4;
+      for (int L = 0; L < SURF_LEVELS && *p; L++) {
+        cfg.q[L] = (float)atof(p);
+        const char *c = strchr(p, ',');
+        p = c ? c + 1 : p + strlen(p);
+      }
+    }
+  for (int L = 0; L < SURF_LEVELS; L++)
+    if (cfg.q[L] < 0) cfg.q[L] = L == 0 ? 8.0f : (float)(8 >> L < 1 ? 1 : 8 >> L);
+  if (!parse_i64_3(argc, argv, "--src-shape=", cfg.src_shape) ||
+      !parse_i64_3(argc, argv, "--shard=", cfg.shard)) {
+    fprintf(stderr, "surface-pack needs --src-shape=Z,Y,X and --shard=SZ,SY,SX\n");
+    return 1;
+  }
+  if (!parse_i64_3(argc, argv, "--out-shape=", cfg.out_shape))
+    for (int d = 0; d < 3; d++) cfg.out_shape[d] = (int64_t)floor((double)cfg.src_shape[d] / cfg.scale + 0.5);
+  if (cfg.csize <= 0 || cfg.dmax < 1 || cfg.dmax > 3 || cfg.scale <= 0) {
+    fprintf(stderr, "surface-pack: bad --csize / --dmax / --scale\n");
+    return 1;
+  }
+  surf_result r;
+  int rc = surface_pack(&cfg, &r);
+  if (rc) return rc;
+  double vox = (double)r.out_voxels, secs = r.t_ramp > 0 ? r.t_ramp : 1e-9;
+  printf("ok src_chunks=%llu src_nonzero=%d out_voxels=%llu compared=%u psnr_min=%.2f max_err=%u "
+         "t_decode=%.2f t_ramp=%.2f t_encode=%.2f vox_per_s=%.3g vox_per_s_core=%.3g",
+         (unsigned long long)r.src_chunks, (int)r.src_nonzero, (unsigned long long)r.out_voxels, r.compared,
+         r.compared ? r.psnr_min : 0.0, r.max_err, r.t_decode, r.t_ramp, r.t_encode, vox / secs,
+         vox / secs / cfg.threads);
+  uint64_t total = 0;
+  for (int L = 0; L < SURF_LEVELS; L++) {
+    printf(" present%d=%u bytes%d=%llu", L, r.present[L], L, (unsigned long long)r.bytes[L]);
+    total += r.bytes[L];
+  }
+  printf(" bytes=%llu\n", (unsigned long long)total);
+  return 0;
+}
+static int surface_pool_cli(int argc, char **argv) {
+  /* volcomp shard-pool out.shard --q=Q --shape=Z,Y,X --pos=SZ,SY,SX in0 .. in7 ("-" = absent) */
+  float q = parse_q(argc, argv);
+  int64_t shape[3], pos[3];
+  if (q < 0 || !parse_i64_3(argc, argv, "--shape=", shape) || !parse_i64_3(argc, argv, "--pos=", pos)) {
+    fprintf(stderr, "shard-pool needs --q=Q --shape=Z,Y,X --pos=SZ,SY,SX and 8 input shards\n");
+    return 1;
+  }
+  const char *in[8] = {0};
+  int n = 0;
+  for (int i = 3; i < argc && n < 8; i++) {
+    if (argv[i][0] == '-' && argv[i][1] == '-') continue;
+    in[n++] = strcmp(argv[i], "-") ? argv[i] : NULL;
+  }
+  if (n != 8) {
+    fprintf(stderr, "shard-pool needs exactly 8 input shards (got %d)\n", n);
+    return 1;
+  }
+  unsigned present = 0;
+  uint64_t bytes = 0;
+  int rc = surface_pool_shard(in, argv[2], q, shape, pos, &present, &bytes);
+  if (rc) return rc;
+  printf("ok present=%u bytes=%llu\n", present, (unsigned long long)bytes);
+  return 0;
+}
 static int usage(void) {
   fprintf(stderr, "usage:\n  volcomp encode in.u8 out.volc --q=Q\n  volcomp decode in.volc out.u8\n"
                   "  volcomp verify in.volc ref.u8\n  volcomp shard-pack DIR out.shard --q=Q\n"
                   "  volcomp shard-verify in.shard DIR [--samples=N]\n"
                   "  volcomp occupancy in.u8|DIR out.bin [--shape=Z,Y,X] [--factor=F] [--dilate=D] [--grid=GZ,GY,GX] [--shards] [--chunks]\n"
-                  "  volcomp label-encode DIR out.voll --q=Q\n  volcomp label-decode in.voll DIR\n"
-                  "  volcomp label-verify in.voll DIR\n");
+                  "  volcomp surface-pack SRCDIR OUTDIR --csize=C --src-shape=Z,Y,X --out-shape=Z,Y,X --shard=SZ,SY,SX [--scale=S] [--q=Q0,Q1,Q2,Q3] [--threads=N] [--samples=N]\n"
+                  "  volcomp shard-pool out.shard --q=Q --shape=Z,Y,X --pos=SZ,SY,SX in0 .. in7\n"
+                  "  volcomp label-encode DIR out.voll --q=Q [--q-plane=CLS=Q ...]\n"
+                  "  volcomp label-decode in.voll DIR\n  volcomp label-verify in.voll DIR\n"
+                  "\nQ is 0 for the lossless mode (exact) or 1..255 for the lossy DCT codec.\n");
   return 1;
 }
 #include "label_cli.h"
@@ -275,7 +385,7 @@ int main(int argc, char **argv) {
   const char *cmd = argv[1];
   if (!strcmp(cmd, "encode")) {
     float q = parse_q(argc, argv);
-    if (q <= 0) return usage();
+    if (q < 0) return usage();
     size_t n;
     uint8_t *src = read_file(argv[2], &n);
     if (!src || n != VOLCOMP_CHUNK_VOXELS) {
@@ -320,7 +430,7 @@ int main(int argc, char **argv) {
   }
   if (!strcmp(cmd, "shard-pack")) {
     float q = parse_q(argc, argv);
-    if (q <= 0) return usage();
+    if (q < 0) return usage();
     unsigned present = 0;
     uint64_t bytes = 0;
     int rc = shard_pack(argv[2], argv[3], q, &present, &bytes);
@@ -333,6 +443,8 @@ int main(int argc, char **argv) {
   }
   if (!strcmp(cmd, "shard-verify")) return shard_verify(argv[2], argv[3], parse_opt(argc, argv, "--samples=", 8));
   if (!strcmp(cmd, "occupancy")) return occupancy(argc, argv);
+  if (!strcmp(cmd, "surface-pack")) return surface_cli(argc, argv);
+  if (!strcmp(cmd, "shard-pool")) return surface_pool_cli(argc, argv);
   if (!strcmp(cmd, "label-encode")) return label_encode(argc, argv);
   if (!strcmp(cmd, "label-decode")) return label_decode(argc, argv);
   if (!strcmp(cmd, "label-verify")) return label_verify(argc, argv);

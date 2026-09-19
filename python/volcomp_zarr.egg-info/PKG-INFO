@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: volcomp-zarr
+Version: 1.0.0
+Summary: zarr v3 codec and ctypes binding for the volcomp uint8 volume compressor
+Requires-Python: >=3.10
+Provides-Extra: zarr
+Requires-Dist: zarr>=3.0; extra == "zarr"
+Requires-Dist: numpy; extra == "zarr"

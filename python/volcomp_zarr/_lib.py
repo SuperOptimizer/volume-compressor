@@ -3,6 +3,7 @@ import ctypes
 import os
 import sys
 
+Q_LOSSLESS = 0.0  # volcomp_encode(..., q=0) is exact
 CHUNK_DIM = 128
 CHUNK_VOXELS = CHUNK_DIM ** 3
 BLOCK_VOXELS = 16 ** 3
@@ -43,6 +44,8 @@ _L.volcomp_shim_decode.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_vo
 _L.volcomp_shim_decode_block.restype = ctypes.c_int
 _L.volcomp_shim_decode_block.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint, ctypes.c_uint,
                                          ctypes.c_uint, ctypes.c_void_p, ctypes.c_size_t]
+_L.volcomp_shim_stream_q.restype = ctypes.c_int
+_L.volcomp_shim_stream_q.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_float)]
 _L.volcomp_shim_deblock.restype = None
 _L.volcomp_shim_deblock.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_float]
 
@@ -73,7 +76,10 @@ def _buf(obj):
 
 
 def encode(src, q):
-    """src: 128^3 z-major uint8 bytes-like (2,097,152 bytes) -> bytes."""
+    """src: 128^3 z-major uint8 bytes-like (2,097,152 bytes) -> bytes.
+
+    q is Q_LOSSLESS (0) for the exact codec, or 1..255 for the lossy DCT codec.
+    """
     p, n, keep = _buf(src)
     if n != CHUNK_VOXELS:
         raise VolcompError(f"source must be {CHUNK_VOXELS} bytes, got {n}")
@@ -90,6 +96,19 @@ def decode(enc, out=None):
     dp, dn, dkeep = _buf(dst)
     _check(_L.volcomp_shim_decode(p, n, dp, dn))
     return dst
+
+
+def stream_q(enc):
+    """The q a stream was encoded with; 0.0 (Q_LOSSLESS) for a lossless stream."""
+    p, n, keep = _buf(enc)
+    q = ctypes.c_float()
+    _check(_L.volcomp_shim_stream_q(p, n, ctypes.byref(q)))
+    return q.value
+
+
+def is_lossless(enc):
+    """True if the stream decodes to its source exactly."""
+    return stream_q(enc) == Q_LOSSLESS
 
 
 def decode_block(enc, bz, by, bx):

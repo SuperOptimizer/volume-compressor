@@ -55,7 +55,7 @@ static inline uint8_t *shard_read_file(const char *path, size_t *n) {
 }
 
 /* Returns 0 on success; 2 = I/O error, 3 = encode error. */
-static int shard_pack(const char *dir, const char *out_path, float q, unsigned *present,
+static inline int shard_pack(const char *dir, const char *out_path, float q, unsigned *present,
                       uint64_t *payload_bytes) {
   FILE *out = fopen(out_path, "wb");
   if (!out) return 2;

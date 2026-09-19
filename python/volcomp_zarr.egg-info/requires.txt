@@ -1,0 +1,4 @@
+
+[zarr]
+zarr>=3.0
+numpy

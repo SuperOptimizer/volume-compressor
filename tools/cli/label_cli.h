@@ -60,18 +60,45 @@ static void label_dir_free(label_dir *d) {
   for (int c = 0; c < 256; c++) free(d->plane[c]);
 }
 
+/* --q-plane=CLS=Q, repeatable: override the default q for one class. Fills
+ * per_cls[256] with the override or -1. Returns 0, or -1 on a malformed flag. */
+static int label_parse_q_plane(int argc, char **argv, float *per_cls) {
+  for (int c = 0; c < 256; c++) per_cls[c] = -1.0f;
+  for (int i = 1; i < argc; i++) {
+    if (strncmp(argv[i], "--q-plane=", 10)) continue;
+    const char *a = argv[i] + 10, *eq = strchr(a, '=');
+    if (!eq || eq == a) return -1;
+    char *end;
+    long cls = strtol(a, &end, 10);
+    if (end != eq || cls < 0 || cls > 255) return -1;
+    float q = (float)atof(eq + 1);
+    if (!(q == VOLCOMP_Q_LOSSLESS || (q >= VOLCOMP_Q_MIN && q <= VOLCOMP_Q_MAX))) return -1;
+    per_cls[cls] = q;
+  }
+  return 0;
+}
+
 static int label_encode(int argc, char **argv) {
   float q = parse_q(argc, argv);
-  if (q <= 0) return usage();
+  if (q < 0) return usage();
+  float per_cls[256];
+  if (label_parse_q_plane(argc, argv, per_cls) < 0) {
+    fprintf(stderr, "label-encode: bad --q-plane (want --q-plane=CLS=Q, CLS 0..255, Q 0 or 1..255)\n");
+    return 2;
+  }
   label_dir d;
   if (label_dir_read(argv[2], &d) < 0) return 2;
   volcomp_label_plane pl[256];
+  float qp[256];
   uint32_t np = 0;
   for (int c = 0; c < 256; c++)
-    if (d.plane[c]) pl[np++] = (volcomp_label_plane){(uint8_t)c, d.plane[c]};
+    if (d.plane[c]) {
+      qp[np] = per_cls[c];
+      pl[np++] = (volcomp_label_plane){(uint8_t)c, d.plane[c]};
+    }
   size_t cap = VOLCOMP_LABEL_ENCODE_BOUND(np), n;
   uint8_t *enc = malloc(cap);
-  volcomp_status st = volcomp_label_encode(pl, np, q, enc, cap, &n);
+  volcomp_status st = volcomp_label_encode_q(pl, np, q, qp, enc, cap, &n);
   if (st) {
     fprintf(stderr, "label-encode: %s\n", volcomp_status_string(st));
     return 3;
@@ -85,7 +112,9 @@ static int label_encode(int argc, char **argv) {
   const uint8_t *dir = enc + VOLCOMP_LABEL_HDR_BYTES;
   for (uint32_t i = 0; i < nc; i++) {
     const uint8_t *e = dir + i * VOLCOMP_LABEL_DIR_ENTRY;
-    printf("  class %3u: %s %u bytes\n", e[0], e[1] == VL_MODE_RAW ? "raw  " : "image", vf_rd_u32(e + 4));
+    uint32_t qr = vf_rd_u16(e + 2);
+    printf("  class %3u: %s q %-6.2f %u bytes\n", e[0], e[1] == VL_MODE_RAW ? "raw  " : "image",
+           (double)qr / 256.0, vf_rd_u32(e + 4));
   }
   free(enc);
   label_dir_free(&d);
@@ -144,7 +173,7 @@ static int label_verify(int argc, char **argv) {
   int rc = 0;
   bool stored[256] = {0};
   const uint8_t *dir = enc + VOLCOMP_LABEL_HDR_BYTES;
-  printf("bytes %zu q %.2f planes %u\n", n, (double)q, nc);
+  printf("bytes %zu default q %.2f planes %u\n", n, (double)q, nc);
   for (uint32_t i = 0; i < nc; i++) {
     uint32_t c = cls[i];
     stored[c] = true;
@@ -164,8 +193,9 @@ static int label_verify(int argc, char **argv) {
     const uint8_t *src = d.plane[c];
     uint64_t h[256] = {0};
     metric_errhist_u8(src, dec, VOLCOMP_CHUNK_VOXELS, h);
-    printf("class %3u: %s %8u bytes (%.0fx) psnr %.2f mae %.3f p90 %u p95 %u p99 %u max %u\n", c,
-           e[1] == VL_MODE_RAW ? "raw  " : "image", bytes, (double)VOLCOMP_CHUNK_VOXELS / (double)bytes,
+    printf("class %3u: %s q %-6.2f %8u bytes (%.0fx) psnr %.2f mae %.3f p90 %u p95 %u p99 %u max %u\n", c,
+           e[1] == VL_MODE_RAW ? "raw  " : "image", (double)vf_rd_u16(e + 2) / 256.0, bytes,
+           (double)VOLCOMP_CHUNK_VOXELS / (double)bytes,
            metric_psnr_u8(src, dec, VOLCOMP_CHUNK_VOXELS), errhist_mae(h), errhist_percentile(h, 0.90),
            errhist_percentile(h, 0.95), errhist_percentile(h, 0.99), metric_maxerr_u8(src, dec, VOLCOMP_CHUNK_VOXELS));
   }

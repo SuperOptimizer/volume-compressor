@@ -12,7 +12,8 @@
  * (they are declared restrict).
  * Portable: AVX2+FMA kernels are used at runtime on x86-64 CPUs that have
  * them (no compiler flags needed), plain C kernels everywhere else.
- * The only configuration is the quantiser step q in [1,255] (1/256 precision).
+ * The only configuration is the quantiser step q: 0 for the lossless mode
+ * (exact), or [1,255] (1/256 precision) for the lossy DCT codec.
  * volcomp_encode performs one VOLCOMP_MALLOC/VOLCOMP_FREE of scratch;
  * decoding allocates nothing.
  *
@@ -63,6 +64,10 @@
 #define VOLCOMP_CHUNK_VOXELS 2097152u
 #define VOLCOMP_Q_MIN 1.0f
 #define VOLCOMP_Q_MAX 255.0f
+/* q == 0 selects the lossless mode (exact reconstruction; see "lossless mode"
+ * below and spec/format.md §10). Any q in [1,255] is the lossy DCT codec, whose
+ * bitstream is unchanged from volcomp 1.0. */
+#define VOLCOMP_Q_LOSSLESS 0.0f
 /* Provable upper bound on the encoded size of any chunk at any q (spec
  * "Bounds"): 8 header + 680 tables + 256 directory + tANS (<= 2 B/token, <= 8192
  * tokens/block, + 8 flush/substream) + bypass (<= 12288 B/block). Real CT
@@ -71,7 +76,7 @@
 
 typedef enum volcomp_status {
   VOLCOMP_OK = 0,
-  VOLCOMP_ERR_ARG,       /* null pointer, q outside [1,255], bad block coordinate */
+  VOLCOMP_ERR_ARG,       /* null pointer, q not 0 and outside [1,255], bad block coord */
   VOLCOMP_ERR_CORRUPT,   /* malformed, truncated, or non-canonical stream          */
   VOLCOMP_ERR_VERSION,   /* well-formed header with an unsupported version byte    */
   VOLCOMP_ERR_NOMEM,     /* allocation failed                                      */
@@ -79,7 +84,8 @@ typedef enum volcomp_status {
 } volcomp_status;
 
 static inline const char *volcomp_status_string(volcomp_status s);
-/* Encode one 128^3 u8 chunk; writes at most dst_cap bytes, *out_n = stream length. */
+/* Encode one 128^3 u8 chunk at quantiser step q (VOLCOMP_Q_LOSSLESS or
+ * [1,255]); writes at most dst_cap bytes, *out_n = stream length. */
 static inline volcomp_status volcomp_encode(const uint8_t *restrict src_zyx, float q,
                                             void *restrict dst, size_t dst_cap, size_t *out_n);
 /* Decode a whole chunk into dst_zyx (dst_cap >= VOLCOMP_CHUNK_VOXELS). Contents
@@ -102,6 +108,11 @@ static inline volcomp_status volcomp_decode_block(const void *restrict enc, size
  * whether to run it. Measured on scroll data: +0.15 dB (q8) to +0.4 dB (q32)
  * PSNR, blocking amplification 1.5x -> ~1.1x, ~5% of decode time. */
 static inline void volcomp_deblock(uint8_t *vol, size_t nz, size_t ny, size_t nx, float q);
+/* True if the stream decodes exactly (was encoded with VOLCOMP_Q_LOSSLESS).
+ * Also validates the magic/version/mode bytes. */
+static inline volcomp_status volcomp_is_lossless(const void *restrict enc, size_t enc_n, bool *out);
+/* The q the stream was encoded with; 0 for a lossless stream. */
+static inline volcomp_status volcomp_stream_q(const void *restrict enc, size_t enc_n, float *out);
 /* Which kernel set this process will use: "avx2" or "c". */
 static inline const char *volcomp_kernels(void);
 
@@ -117,6 +128,12 @@ static inline const char *volcomp_kernels(void);
 #define VF_BLOCKS_PER_SUB 16u
 #define VF_VERSION 1u
 #define VF_HDR_BYTES 8u
+/* header byte 5: which codec produced the chunk (see "lossless mode" below) */
+#define VLL_MODE_LOSSY 0u
+#define VLL_MODE_CODED 1u
+#define VLL_MODE_RAW 2u
+#define VLL_MODE_CONST 3u
+#define VLL_MODE_MAX 3u
 #define VF_DIR_BYTES (VF_NSUB * 8u)
 #define VF_Q_RAW_MIN 256u
 #define VF_Q_RAW_MAX 65280u
@@ -919,9 +936,9 @@ static bool vf_model_from_freqs(vf_model *m, const uint32_t freqs[VF_NTOK]) {
   return true;
 }
 /* compact tables: per model u32 LE presence bitmap + LEB128 freq per set bit, ascending */
-static size_t vf_tables_write(const vf_model m[VF_NMODELS], uint8_t *out) {
+static size_t vf_tables_write(const vf_model *m, uint8_t *out, uint32_t nm) {
   size_t n = 0;
-  for (uint32_t i = 0; i < VF_NMODELS; i++) {
+  for (uint32_t i = 0; i < nm; i++) {
     uint32_t bm = 0;
     for (uint32_t s = 0; s < VF_NTOK; s++)
       if (m[i].freq[s]) bm |= 1u << s;
@@ -932,8 +949,8 @@ static size_t vf_tables_write(const vf_model m[VF_NMODELS], uint8_t *out) {
   }
   return n;
 }
-static bool vf_tables_read(vf_cur *c, vf_model m[VF_NMODELS]) {
-  for (uint32_t i = 0; i < VF_NMODELS; i++) {
+static bool vf_tables_read(vf_cur *c, vf_model *m, uint32_t nm) {
+  for (uint32_t i = 0; i < nm; i++) {
     if (!vf_cur_has(c, 4)) return false;
     uint32_t bm = vf_rd_u32(c->p);
     c->p += 4;
@@ -963,9 +980,9 @@ typedef struct vf_etab {
   uint16_t state[VF_PROB_SCALE];
   vf_esym sym[VF_NTOK];
 } vf_etab;
-static void vf_etabs_init(const vf_model m[VF_NMODELS], vf_etab et[VF_NMODELS]) {
+static void vf_etabs_init(const vf_model *m, vf_etab *et, uint32_t nm) {
   const uint32_t size = VF_PROB_SCALE, mask = size - 1u, step = (size >> 1) + (size >> 3) + 3u;
-  for (uint32_t c = 0; c < VF_NMODELS; c++) {
+  for (uint32_t c = 0; c < nm; c++) {
     uint8_t tsym[VF_PROB_SCALE];
     uint32_t pos = 0;
     for (uint32_t s = 0; s < VF_NTOK; s++)
@@ -1602,13 +1619,13 @@ static volcomp_status vf_parse(const void *restrict enc, size_t enc_n, vf_parsed
   if (enc_n < VF_HDR_BYTES + VF_DIR_BYTES) return VOLCOMP_ERR_CORRUPT;
   if (in[0] != 'V' || in[1] != 'O' || in[2] != 'L' || in[3] != 'C') return VOLCOMP_ERR_CORRUPT;
   if (in[4] != VF_VERSION) return VOLCOMP_ERR_VERSION;
-  if (in[5] != 0) return VOLCOMP_ERR_CORRUPT;
+  if (in[5] != VLL_MODE_LOSSY) return VOLCOMP_ERR_CORRUPT; /* not a lossy chunk */
   uint32_t qraw = vf_rd_u16(in + 6);
   if (qraw < VF_Q_RAW_MIN || qraw > VF_Q_RAW_MAX) return VOLCOMP_ERR_CORRUPT;
   p->q = (float)qraw * (1.0f / 256.0f);
   vf_steps(p->q, p->step);
   vf_cur c = {in + VF_HDR_BYTES, in + enc_n};
-  if (!vf_tables_read(&c, p->models)) return VOLCOMP_ERR_CORRUPT;
+  if (!vf_tables_read(&c, p->models, VF_NMODELS)) return VOLCOMP_ERR_CORRUPT;
   if (!vf_cur_has(&c, VF_DIR_BYTES)) return VOLCOMP_ERR_CORRUPT;
   uint64_t sum = 0;
   for (uint32_t s = 0; s < VF_NSUB; s++) {
@@ -1850,12 +1867,441 @@ static bool vf_tokenize_block(vf_enc *e, uint16_t **tp, vf_bitw *bw, const int32
   return true;
 }
 
-static inline volcomp_status volcomp_encode(const uint8_t *restrict src_zyx, float q,
-                                            void *restrict dst_v, size_t dst_cap, size_t *out_n) {
-  if (!src_zyx || !dst_v || !out_n) return VOLCOMP_ERR_ARG;
-  if (!(q >= VOLCOMP_Q_MIN && q <= VOLCOMP_Q_MAX)) return VOLCOMP_ERR_ARG;
-  *out_n = 0;
-  uint8_t *dst = (uint8_t *)dst_v;
+/* ======================================================================== */
+/*                     lossless mode (q == 0, chunk mode 1..3)              */
+/* ======================================================================== */
+/* Header byte 5 selects the chunk mode; the lossy DCT format is mode 0 and is
+ * unchanged (byte for byte) from format version 1 as shipped. Lossless streams
+ * set qraw = 0, which the mode-0 parser rejects, and a v1.0 decoder rejects any
+ * nonzero byte 5 outright (VOLCOMP_ERR_CORRUPT), so old readers never
+ * misinterpret a lossless stream.
+ *
+ *   mode 1 VLL_MODE_CODED  tables + directory + 32 substreams (below)
+ *   mode 2 VLL_MODE_RAW    8-byte header + 2097152 raw voxels
+ *   mode 3 VLL_MODE_CONST  8-byte header + 1 byte (the chunk's value)
+ *
+ * mode 1 keeps volcomp's block/substream geometry: 512 blocks of 16^3 in
+ * z-major block order, 32 substreams of 16 consecutive blocks, so
+ * volcomp_decode_block() still touches one substream and reproduces exactly the
+ * bytes of the full decode. Layout:
+ *
+ *   tables      VLL_NMODELS tANS models, same encoding as the lossy tables
+ *   directory   32 x { LEB128 token bytes, LEB128 bypass bytes }
+ *   payload     per substream: token bytes then bypass bytes
+ *
+ * Each block starts with a mode token (model VLL_M_MODE):
+ *   0 CONST   4096 equal voxels; 8 bypass bits carry the value (~0 bytes)
+ *   1 SPARSE  (run, level)* EOB over the residual array, models VLL_M_RUN /
+ *             VLL_M_LVLS -- flat and label-like data
+ *   2 DENSE   one level token per voxel, model VLL_M_LVLD + context from the
+ *             previous residual -- smooth / continuous data
+ *   3 RAW     4096 bypass bytes -- incompressible data
+ *
+ * The residual of voxel i is v[i] - pred(i) taken mod 256 and zigzagged, with
+ * pred = the previous voxel along x, or along y at x == 0, or along z at
+ * x == y == 0, or 128 at the block origin. Prediction never crosses a block, so
+ * blocks stay independently decodable. Values are exact for every uint8 input:
+ * a chunk whose coded form would not fit in 2 MiB is stored as mode 2, so the
+ * output is never larger than the raw chunk plus the 8-byte header. */
+
+#define VLL_NMODELS 8u
+#define VLL_M_MODE 0u  /* block mode token                                    */
+#define VLL_M_RUN 1u   /* SPARSE zero-run tokens and EOB, +0..1 by prev run   */
+#define VLL_M_LVLS 3u  /* SPARSE levels (magnitude - 1), +0..1 by this run    */
+#define VLL_M_LVLD 5u  /* DENSE level tokens, +0..2 by previous-plane ctx     */
+
+#define VLL_BM_CONST 0u
+#define VLL_BM_SPARSE 1u
+#define VLL_BM_DENSE 2u
+#define VLL_BM_RAW 3u
+
+/* HybridUint variant for the lossless mode: values 0..15 are literal tokens, so
+ * every residual of magnitude <= 7 costs one token and no bypass bit; above that
+ * tok = 12 + msb(u) with the low msb(u) bits bypassed. Max token 19 for a level
+ * (u <= 255) and 23 for a run (u <= 4095), both below VF_TOK_EOB. */
+#define VLL_NLIT 16u
+__attribute__((always_inline)) static inline bool vll_hyb_emit(vf_bitw *w, uint32_t u, uint32_t *tok) {
+  if (u < VLL_NLIT) {
+    *tok = u;
+    return true;
+  }
+  uint32_t k = vf_highbit(u);
+  *tok = VLL_NLIT - 4u + k;
+  return vf_bw_put(w, u & ((1u << k) - 1u), k);
+}
+__attribute__((always_inline)) static inline bool vll_hyb_read(vf_bitr *r, uint32_t tok, uint32_t *u) {
+  if (tok < VLL_NLIT) {
+    *u = tok;
+    return true;
+  }
+  uint32_t k = tok - (VLL_NLIT - 4u), extra;
+  if (!vf_br_get(r, k, &extra)) return false;
+  *u = (1u << k) | extra;
+  return true;
+}
+#define VLL_TOKMAX_RUN 23u /* run <= 4095 */
+#define VLL_TOKMAX_LVL 19u /* level <= 255 */
+#define VLL_SPARSE_MAX_NNZ 2048u
+/* per block: SPARSE emits at most 2*nnz+1 tokens, DENSE 4096 */
+#define VLL_BLK_TOK_MAX (2u * VLL_SPARSE_MAX_NNZ + 1u)
+/* per block bypass: RAW 4096 B; DENSE 4096*7 bits; SPARSE nnz*(11+7) bits */
+#define VLL_BLK_BYP_MAX 4608u
+#define VLL_SUB_TOK_MAX (2u * VF_BLOCKS_PER_SUB * VLL_BLK_TOK_MAX + 8u)
+#define VLL_SUB_BYP_MAX (VF_BLOCKS_PER_SUB * VLL_BLK_BYP_MAX + 8u)
+
+/* ---- block gather / scatter (plain bytes) ---- */
+static inline void vll_gather(const uint8_t *restrict src, uint32_t bz, uint32_t by, uint32_t bx,
+                              uint8_t *restrict b) {
+  for (uint32_t z = 0; z < VOLCOMP_BLOCK_DIM; z++)
+    for (uint32_t y = 0; y < VOLCOMP_BLOCK_DIM; y++)
+      memcpy(b + (z * VOLCOMP_BLOCK_DIM + y) * VOLCOMP_BLOCK_DIM, src + vf_row_off(bz, by, bx, z, y),
+             VOLCOMP_BLOCK_DIM);
+}
+static inline void vll_scatter(uint8_t *restrict dst, uint32_t bz, uint32_t by, uint32_t bx,
+                               const uint8_t *restrict b) {
+  for (uint32_t z = 0; z < VOLCOMP_BLOCK_DIM; z++)
+    for (uint32_t y = 0; y < VOLCOMP_BLOCK_DIM; y++)
+      memcpy(dst + vf_row_off(bz, by, bx, z, y), b + (z * VOLCOMP_BLOCK_DIM + y) * VOLCOMP_BLOCK_DIM,
+             VOLCOMP_BLOCK_DIM);
+}
+
+/* Residual of a gathered 16^3 block: pred(i) is the voxel one step back along z,
+ * or along y inside the first z-plane, or along x inside the first row, or 128
+ * at the origin; the residual is (v - pred) mod 256 zigzagged into 0..255.
+ * Prediction never leaves the block, so blocks stay independently decodable, and
+ * every step is a plane-at-a-time (or row-at-a-time) byte operation the compiler
+ * vectorises: the reconstruction is 15 vector adds over 256 lanes, 15 over 16
+ * lanes and a 15-step scalar tail, not a 4096-long serial chain. */
+#define VLL_ZZ(d) ((uint8_t)((uint32_t)((d) << 1) ^ (uint32_t)(uint8_t)(0u - ((uint32_t)(d) >> 7))))
+#define VLL_UNZZ(u) ((uint8_t)((uint32_t)((u) >> 1) ^ (uint32_t)(uint8_t)(0u - ((u) & 1u))))
+
+static void vll_residual(const uint8_t *restrict b, uint8_t *restrict u) {
+  u[0] = VLL_ZZ((uint8_t)(b[0] - 128u));
+  for (uint32_t x = 1; x < 16; x++) u[x] = VLL_ZZ((uint8_t)(b[x] - b[x - 1]));
+  for (uint32_t y = 1; y < 16; y++)
+    for (uint32_t x = 0; x < 16; x++)
+      u[y * 16 + x] = VLL_ZZ((uint8_t)(b[y * 16 + x] - b[(y - 1) * 16 + x]));
+  for (uint32_t z = 1; z < 16; z++)
+    for (uint32_t j = 0; j < 256; j++)
+      u[z * 256 + j] = VLL_ZZ((uint8_t)(b[z * 256 + j] - b[(z - 1) * 256 + j]));
+}
+/* inverse; u is consumed (unzigzagged in place) */
+static void vll_rebuild(uint8_t *restrict b, uint8_t *restrict u) {
+  for (uint32_t i = 0; i < VF_BLKV; i++) u[i] = VLL_UNZZ(u[i]);
+  b[0] = (uint8_t)(128u + u[0]);
+  for (uint32_t x = 1; x < 16; x++) b[x] = (uint8_t)(b[x - 1] + u[x]);
+  for (uint32_t y = 1; y < 16; y++)
+    for (uint32_t x = 0; x < 16; x++) b[y * 16 + x] = (uint8_t)(b[(y - 1) * 16 + x] + u[y * 16 + x]);
+  for (uint32_t z = 1; z < 16; z++)
+    for (uint32_t j = 0; j < 256; j++) b[z * 256 + j] = (uint8_t)(b[(z - 1) * 256 + j] + u[z * 256 + j]);
+}
+/* rough cost in bits of coding value u as a HybridUint token plus its bypass bits */
+static inline uint32_t vll_bits(uint32_t u) { return u < VLL_NLIT ? 4u : vf_highbit(u) + 5u; }
+/* DENSE context: the activity of the residual one z-plane back (0 in the first
+ * plane). Deliberately not the immediately preceding residual -- that would put
+ * a table selection on the entropy decoder's critical path; this value is known
+ * 256 symbols ahead and predicts just as well. */
+/* SPARSE contexts: a run following a run of zero (adjacent nonzero residuals,
+ * i.e. inside a busy region) has a very different distribution from one that
+ * follows a gap, and so does the level that goes with it. */
+static inline uint32_t vll_run_ctx(uint32_t prev_run) { return VLL_M_RUN + (prev_run == 0u ? 0u : 1u); }
+static inline uint32_t vll_lvls_ctx(uint32_t run) { return VLL_M_LVLS + (run == 0u ? 0u : 1u); }
+static inline uint32_t vll_dense_ctx(const uint8_t *u, uint32_t i) {
+  uint32_t a = i < 256u ? 0u : u[i - 256u];
+  return VLL_M_LVLD + (a == 0u ? 0u : (a <= 2u ? 1u : 2u));
+}
+
+/* ---- decoder ---- */
+typedef struct vll_parsed {
+  vf_model models[VLL_NMODELS];
+  uint32_t tok_n[VF_NSUB], byp_n[VF_NSUB], off[VF_NSUB + 1];
+  const uint8_t *payload;
+} vll_parsed;
+
+static volcomp_status vll_parse(const uint8_t *in, size_t n, vll_parsed *restrict p) {
+  vf_cur c = {in + VF_HDR_BYTES, in + n};
+  if (!vf_tables_read(&c, p->models, VLL_NMODELS)) return VOLCOMP_ERR_CORRUPT;
+  uint64_t sum = 0;
+  for (uint32_t s = 0; s < VF_NSUB; s++) {
+    uint32_t rn, bn;
+    if (!vf_leb_get(&c, &rn) || !vf_leb_get(&c, &bn)) return VOLCOMP_ERR_CORRUPT;
+    if (rn < 3u || rn > VLL_SUB_TOK_MAX || bn > VLL_SUB_BYP_MAX) return VOLCOMP_ERR_CORRUPT;
+    p->tok_n[s] = rn;
+    p->byp_n[s] = bn;
+    p->off[s] = (uint32_t)sum;
+    sum += (uint64_t)rn + bn;
+  }
+  p->off[VF_NSUB] = (uint32_t)sum;
+  if ((uint64_t)(c.end - c.p) != sum) return VOLCOMP_ERR_CORRUPT; /* exact accounting */
+  p->payload = c.p;
+  return VOLCOMP_OK;
+}
+
+/* Decode substream s. only_block < 0: scatter its 16 blocks into dst; else stop
+ * after absolute block only_block and write it into dst_block[4096]. */
+static volcomp_status vll_decode_sub(const vll_parsed *restrict p, uint32_t s, uint8_t *restrict dst,
+                                     int32_t only_block, uint8_t *restrict dst_block) {
+  const uint8_t *rb = p->payload + p->off[s];
+  vf_rdec rd;
+  if (!vf_rdec_init(&rd, rb, p->tok_n[s])) return VOLCOMP_ERR_CORRUPT;
+  vf_bitr br;
+  vf_br_init(&br, rb + p->tok_n[s], p->byp_n[s]);
+  uint8_t b[VF_BLKV], u[VF_BLKV];
+  for (uint32_t bi = s * VF_BLOCKS_PER_SUB; bi < (s + 1u) * VF_BLOCKS_PER_SUB; bi++) {
+    int t = vf_rdec_get(&rd, &p->models[VLL_M_MODE]);
+    if (t < 0 || (uint32_t)t > VLL_BM_RAW) return VOLCOMP_ERR_CORRUPT;
+    switch ((uint32_t)t) {
+      case VLL_BM_CONST: {
+        uint32_t v;
+        if (!vf_br_get(&br, 8, &v)) return VOLCOMP_ERR_CORRUPT;
+        memset(b, (int)v, VF_BLKV);
+        break;
+      }
+      case VLL_BM_RAW: {
+        for (uint32_t i = 0; i < VF_BLKV; i++) {
+          uint32_t v;
+          if (!vf_br_get(&br, 8, &v)) return VOLCOMP_ERR_CORRUPT;
+          b[i] = (uint8_t)v;
+        }
+        break;
+      }
+      case VLL_BM_SPARSE: {
+        memset(u, 0, VF_BLKV);
+        uint32_t pos = 0, prev_run = 1;
+        for (;;) {
+          int rt = vf_rdec_get(&rd, &p->models[vll_run_ctx(prev_run)]);
+          if (rt < 0) return VOLCOMP_ERR_CORRUPT;
+          if ((uint32_t)rt == VF_TOK_EOB) break;
+          if ((uint32_t)rt > VLL_TOKMAX_RUN) return VOLCOMP_ERR_CORRUPT;
+          uint32_t run;
+          if (!vll_hyb_read(&br, (uint32_t)rt, &run)) return VOLCOMP_ERR_CORRUPT;
+          if (pos >= VF_BLKV || run > VF_BLKV - 1u - pos) return VOLCOMP_ERR_CORRUPT;
+          pos += run;
+          prev_run = run;
+          int lt = vf_rdec_get(&rd, &p->models[vll_lvls_ctx(run)]);
+          if (lt < 0 || (uint32_t)lt > VLL_TOKMAX_LVL) return VOLCOMP_ERR_CORRUPT;
+          uint32_t uu;
+          if (!vll_hyb_read(&br, (uint32_t)lt, &uu)) return VOLCOMP_ERR_CORRUPT;
+          if (uu > 254u) return VOLCOMP_ERR_CORRUPT;
+          u[pos++] = (uint8_t)(uu + 1u);
+        }
+        vll_rebuild(b, u);
+        break;
+      }
+      default: { /* VLL_BM_DENSE */
+        for (uint32_t i = 0; i < VF_BLKV; i++) {
+          int lt = vf_rdec_get(&rd, &p->models[vll_dense_ctx(u, i)]);
+          if (lt < 0 || (uint32_t)lt > VLL_TOKMAX_LVL) return VOLCOMP_ERR_CORRUPT;
+          uint32_t uu;
+          if (!vll_hyb_read(&br, (uint32_t)lt, &uu)) return VOLCOMP_ERR_CORRUPT;
+          u[i] = (uint8_t)uu;
+        }
+        vll_rebuild(b, u);
+        break;
+      }
+    }
+    if (only_block >= 0) {
+      if ((uint32_t)only_block != bi) continue;
+      memcpy(dst_block, b, VF_BLKV);
+      return VOLCOMP_OK;
+    }
+    vll_scatter(dst, bi >> 6, (bi >> 3) & 7u, bi & 7u, b);
+  }
+  if (only_block >= 0) return VOLCOMP_ERR_ARG;
+  if (!vf_rdec_finished(&rd) || !vf_br_finished(&br)) return VOLCOMP_ERR_CORRUPT;
+  return VOLCOMP_OK;
+}
+
+/* ---- encoder ---- */
+typedef struct vll_enc {
+  uint16_t *toks;
+  uint8_t *byp;
+  size_t tok_off[VF_NSUB + 1], byp_off[VF_NSUB + 1];
+  uint32_t counts[VLL_NMODELS][VF_NTOK];
+} vll_enc;
+
+#define VLL_PUT(m, tk)                             \
+  do {                                             \
+    uint32_t m_ = (m), t_ = (tk);                  \
+    *tok++ = (uint16_t)(t_ | m_ << 8);             \
+    e->counts[m_][t_]++;                           \
+  } while (0)
+
+static bool vll_encode_block(vll_enc *restrict e, uint16_t **tp, vf_bitw *bw, const uint8_t *b) {
+  uint16_t *tok = *tp;
+  uint32_t v0 = b[0], i;
+  for (i = 1; i < VF_BLKV; i++)
+    if (b[i] != v0) break;
+  if (i == VF_BLKV) {
+    VLL_PUT(VLL_M_MODE, VLL_BM_CONST);
+    if (!vf_bw_put(bw, v0, 8)) return false;
+    *tp = tok;
+    return true;
+  }
+  uint8_t u[VF_BLKV];
+  vll_residual(b, u);
+  uint64_t cd = 0, cs = 8;
+  uint32_t nnz = 0;
+  for (i = 0; i < VF_BLKV; i++) {
+    uint32_t uu = u[i];
+    cd += vll_bits(uu);
+    if (uu) {
+      nnz++;
+      cs += vll_bits(uu - 1u) + 5u;
+    }
+  }
+  uint32_t mode = (nnz <= VLL_SPARSE_MAX_NNZ && cs < cd) ? VLL_BM_SPARSE : VLL_BM_DENSE;
+  if ((mode == VLL_BM_SPARSE ? cs : cd) >= (uint64_t)VF_BLKV * 8u) mode = VLL_BM_RAW;
+  VLL_PUT(VLL_M_MODE, mode);
+  if (mode == VLL_BM_RAW) {
+    for (i = 0; i < VF_BLKV; i++)
+      if (!vf_bw_put(bw, b[i], 8)) return false;
+  } else if (mode == VLL_BM_SPARSE) {
+    uint32_t pos = 0, prev_run = 1;
+    for (i = 0; i < VF_BLKV; i++) {
+      if (!u[i]) continue;
+      uint32_t t, run = i - pos;
+      if (!vll_hyb_emit(bw, run, &t)) return false;
+      VLL_PUT(vll_run_ctx(prev_run), t);
+      if (!vll_hyb_emit(bw, (uint32_t)u[i] - 1u, &t)) return false;
+      VLL_PUT(vll_lvls_ctx(run), t);
+      prev_run = run;
+      pos = i + 1u;
+    }
+    VLL_PUT(vll_run_ctx(prev_run), VF_TOK_EOB);
+  } else {
+    for (i = 0; i < VF_BLKV; i++) {
+      uint32_t t;
+      if (!vll_hyb_emit(bw, u[i], &t)) return false;
+      VLL_PUT(vll_dense_ctx(u, i), t);
+    }
+  }
+  *tp = tok;
+  return true;
+}
+#undef VLL_PUT
+
+static inline void vll_hdr(uint8_t *dst, uint32_t mode) {
+  dst[0] = 'V';
+  dst[1] = 'O';
+  dst[2] = 'L';
+  dst[3] = 'C';
+  dst[4] = VF_VERSION;
+  dst[5] = (uint8_t)mode;
+  vf_wr_u16(dst + 6, 0);
+}
+
+static volcomp_status vll_encode(const uint8_t *restrict src, uint8_t *restrict dst, size_t dst_cap,
+                                 size_t *out_n) {
+  { /* whole-chunk constant: 9 bytes */
+    size_t i = 1;
+    while (i < VOLCOMP_CHUNK_VOXELS && src[i] == src[0]) i++;
+    if (i == VOLCOMP_CHUNK_VOXELS) {
+      if (dst_cap < VF_HDR_BYTES + 1u) return VOLCOMP_ERR_SHORT_BUF;
+      vll_hdr(dst, VLL_MODE_CONST);
+      dst[VF_HDR_BYTES] = src[0];
+      *out_n = VF_HDR_BYTES + 1u;
+      return VOLCOMP_OK;
+    }
+  }
+  const size_t sz_toks = (size_t)VF_BLOCKS * VLL_BLK_TOK_MAX * sizeof(uint16_t);
+  const size_t sz_byp = (size_t)VLL_SUB_BYP_MAX * VF_NSUB;
+  const size_t sz_code = (size_t)VLL_SUB_TOK_MAX * VF_NSUB;
+  const size_t sz_es = sizeof(vf_etab) * VLL_NMODELS;
+  const size_t sz_fields = ((size_t)VF_BLOCKS_PER_SUB * VLL_BLK_TOK_MAX + 2u) * sizeof(uint32_t);
+  uint8_t *mem = (uint8_t *)VOLCOMP_MALLOC(sz_toks + sz_byp + sz_code + sz_es + sz_fields);
+  if (!mem) return VOLCOMP_ERR_NOMEM;
+  vll_enc e;
+  memset(e.counts, 0, sizeof e.counts);
+  e.toks = (uint16_t *)(void *)mem;
+  e.byp = mem + sz_toks;
+  uint8_t *code = e.byp + sz_byp;
+  vf_etab *es = (vf_etab *)(void *)(code + sz_code);
+  uint32_t *fields = (uint32_t *)(void *)(code + sz_code + sz_es);
+  volcomp_status st = VOLCOMP_ERR_CORRUPT; /* internal invariant failure */
+
+  /* phase A: residuals and tokens, substream by substream */
+  uint16_t *tp = e.toks;
+  size_t byp_pos = 0;
+  for (uint32_t s = 0; s < VF_NSUB; s++) {
+    e.tok_off[s] = (size_t)(tp - e.toks);
+    e.byp_off[s] = byp_pos;
+    vf_bitw bw;
+    vf_bw_init(&bw, e.byp + byp_pos, VLL_SUB_BYP_MAX);
+    for (uint32_t bi = s * VF_BLOCKS_PER_SUB; bi < (s + 1u) * VF_BLOCKS_PER_SUB; bi++) {
+      uint8_t b[VF_BLKV];
+      vll_gather(src, bi >> 6, (bi >> 3) & 7u, bi & 7u, b);
+      if (!vll_encode_block(&e, &tp, &bw, b)) goto out;
+    }
+    size_t bn;
+    if (!vf_bw_flush(&bw, &bn)) goto out;
+    byp_pos += bn;
+  }
+  e.tok_off[VF_NSUB] = (size_t)(tp - e.toks);
+  e.byp_off[VF_NSUB] = byp_pos;
+
+  /* phase B: models and tANS into the staging buffer; phase C: assemble */
+  {
+    vf_model models[VLL_NMODELS];
+    for (uint32_t m = 0; m < VLL_NMODELS; m++) {
+      bool any = false;
+      for (uint32_t t = 0; t < VF_NTOK; t++) any |= e.counts[m][t] != 0;
+      if (!any) e.counts[m][0] = 1; /* unused model: minimal valid table */
+      if (!vf_model_build(&models[m], e.counts[m])) goto out;
+    }
+    vf_etabs_init(models, es, VLL_NMODELS);
+    uint8_t tables[VF_TABLES_MAX_BYTES];
+    size_t tn = vf_tables_write(models, tables, VLL_NMODELS);
+    uint8_t dir[VF_NSUB * 10u];
+    size_t rn[VF_NSUB], dn = 0, body = 0;
+    for (uint32_t s = 0; s < VF_NSUB; s++) {
+      size_t ntok = e.tok_off[s + 1] - e.tok_off[s];
+      rn[s] = vf_tans_encode2(es, e.toks + e.tok_off[s], ntok, fields,
+                              code + (size_t)s * VLL_SUB_TOK_MAX, VLL_SUB_TOK_MAX);
+      if (rn[s] == 0) goto out;
+      size_t bn = e.byp_off[s + 1] - e.byp_off[s];
+      dn += vf_leb_put(dir + dn, (uint32_t)rn[s]);
+      dn += vf_leb_put(dir + dn, (uint32_t)bn);
+      body += rn[s] + bn;
+    }
+    size_t total = VF_HDR_BYTES + tn + dn + body;
+    if (total >= VOLCOMP_CHUNK_VOXELS + VF_HDR_BYTES) { /* incompressible: store raw */
+      if (dst_cap < VOLCOMP_CHUNK_VOXELS + VF_HDR_BYTES) {
+        st = VOLCOMP_ERR_SHORT_BUF;
+        goto out;
+      }
+      vll_hdr(dst, VLL_MODE_RAW);
+      memcpy(dst + VF_HDR_BYTES, src, VOLCOMP_CHUNK_VOXELS);
+      *out_n = VOLCOMP_CHUNK_VOXELS + VF_HDR_BYTES;
+      st = VOLCOMP_OK;
+      goto out;
+    }
+    if (dst_cap < total) {
+      st = VOLCOMP_ERR_SHORT_BUF;
+      goto out;
+    }
+    vll_hdr(dst, VLL_MODE_CODED);
+    memcpy(dst + VF_HDR_BYTES, tables, tn);
+    memcpy(dst + VF_HDR_BYTES + tn, dir, dn);
+    size_t pos = VF_HDR_BYTES + tn + dn;
+    for (uint32_t s = 0; s < VF_NSUB; s++) {
+      size_t bn = e.byp_off[s + 1] - e.byp_off[s];
+      memcpy(dst + pos, code + (size_t)s * VLL_SUB_TOK_MAX, rn[s]);
+      pos += rn[s];
+      memcpy(dst + pos, e.byp + e.byp_off[s], bn);
+      pos += bn;
+    }
+    if (pos != total) goto out;
+    *out_n = pos;
+    st = VOLCOMP_OK;
+  }
+out:
+  VOLCOMP_FREE(mem);
+  return st;
+}
+
+static volcomp_status vf_encode_lossy(const uint8_t *restrict src_zyx, float q, uint8_t *restrict dst,
+                                      size_t dst_cap, size_t *out_n) {
   const uint32_t qraw = vf_q_raw(q);
   const float qe = (float)qraw * (1.0f / 256.0f); /* exactly what the decoder sees */
 
@@ -1914,9 +2360,9 @@ static inline volcomp_status volcomp_encode(const uint8_t *restrict src_zyx, flo
       if (!any) e.counts[m][0] = 1; /* unused model: minimal valid table */
       if (!vf_model_build(&models[m], e.counts[m])) goto out;
     }
-    vf_etabs_init(models, es);
+    vf_etabs_init(models, es, VF_NMODELS);
     uint8_t tables[VF_TABLES_MAX_BYTES];
-    size_t tn = vf_tables_write(models, tables);
+    size_t tn = vf_tables_write(models, tables, VF_NMODELS);
     size_t pos = VF_HDR_BYTES + tn + VF_DIR_BYTES;
     if (dst_cap < pos) {
       st = VOLCOMP_ERR_SHORT_BUF;
@@ -1927,7 +2373,7 @@ static inline volcomp_status volcomp_encode(const uint8_t *restrict src_zyx, flo
     dst[2] = 'L';
     dst[3] = 'C';
     dst[4] = VF_VERSION;
-    dst[5] = 0;
+    dst[5] = (uint8_t)VLL_MODE_LOSSY;
     vf_wr_u16(dst + 6, qraw);
     memcpy(dst + VF_HDR_BYTES, tables, tn);
     uint8_t *dir = dst + VF_HDR_BYTES + tn;
@@ -1955,12 +2401,82 @@ out:
   return st;
 }
 
+static inline volcomp_status volcomp_encode(const uint8_t *restrict src_zyx, float q,
+                                            void *restrict dst_v, size_t dst_cap, size_t *out_n) {
+  if (!src_zyx || !dst_v || !out_n) return VOLCOMP_ERR_ARG;
+  if (!(q == VOLCOMP_Q_LOSSLESS || (q >= VOLCOMP_Q_MIN && q <= VOLCOMP_Q_MAX))) return VOLCOMP_ERR_ARG;
+  *out_n = 0;
+  if (q == VOLCOMP_Q_LOSSLESS) return vll_encode(src_zyx, (uint8_t *)dst_v, dst_cap, out_n);
+  return vf_encode_lossy(src_zyx, q, (uint8_t *)dst_v, dst_cap, out_n);
+}
+
+/* Common header check: magic, version, chunk mode, and (for the lossless modes)
+ * that qraw is 0. */
+static volcomp_status vll_chunk_mode(const void *restrict enc, size_t enc_n, uint32_t *mode) {
+  const uint8_t *in = (const uint8_t *)enc;
+  if (enc_n < VF_HDR_BYTES) return VOLCOMP_ERR_CORRUPT;
+  if (in[0] != 'V' || in[1] != 'O' || in[2] != 'L' || in[3] != 'C') return VOLCOMP_ERR_CORRUPT;
+  if (in[4] != VF_VERSION) return VOLCOMP_ERR_VERSION;
+  if (in[5] > VLL_MODE_MAX) return VOLCOMP_ERR_CORRUPT;
+  if (in[5] != VLL_MODE_LOSSY && vf_rd_u16(in + 6) != 0) return VOLCOMP_ERR_CORRUPT;
+  *mode = in[5];
+  return VOLCOMP_OK;
+}
+
+static inline volcomp_status volcomp_is_lossless(const void *restrict enc, size_t enc_n, bool *out) {
+  if (!enc || !out) return VOLCOMP_ERR_ARG;
+  uint32_t mode;
+  volcomp_status st = vll_chunk_mode(enc, enc_n, &mode);
+  if (st != VOLCOMP_OK) return st;
+  *out = mode != VLL_MODE_LOSSY;
+  return VOLCOMP_OK;
+}
+
+static inline volcomp_status volcomp_stream_q(const void *restrict enc, size_t enc_n, float *out) {
+  if (!enc || !out) return VOLCOMP_ERR_ARG;
+  uint32_t mode;
+  volcomp_status st = vll_chunk_mode(enc, enc_n, &mode);
+  if (st != VOLCOMP_OK) return st;
+  if (mode != VLL_MODE_LOSSY) {
+    *out = VOLCOMP_Q_LOSSLESS;
+    return VOLCOMP_OK;
+  }
+  uint32_t qraw = vf_rd_u16((const uint8_t *)enc + 6);
+  if (qraw < VF_Q_RAW_MIN || qraw > VF_Q_RAW_MAX) return VOLCOMP_ERR_CORRUPT;
+  *out = (float)qraw * (1.0f / 256.0f);
+  return VOLCOMP_OK;
+}
+
 static inline volcomp_status volcomp_decode(const void *restrict enc, size_t enc_n,
                                             uint8_t *restrict dst_zyx, size_t dst_cap) {
   if (!enc || !dst_zyx) return VOLCOMP_ERR_ARG;
   if (dst_cap < VOLCOMP_CHUNK_VOXELS) return VOLCOMP_ERR_SHORT_BUF;
+  const uint8_t *in = (const uint8_t *)enc;
+  uint32_t mode;
+  volcomp_status st = vll_chunk_mode(enc, enc_n, &mode);
+  if (st != VOLCOMP_OK) return st;
+  if (mode == VLL_MODE_CONST) {
+    if (enc_n != VF_HDR_BYTES + 1u) return VOLCOMP_ERR_CORRUPT;
+    memset(dst_zyx, in[VF_HDR_BYTES], VOLCOMP_CHUNK_VOXELS);
+    return VOLCOMP_OK;
+  }
+  if (mode == VLL_MODE_RAW) {
+    if (enc_n != VF_HDR_BYTES + (size_t)VOLCOMP_CHUNK_VOXELS) return VOLCOMP_ERR_CORRUPT;
+    memcpy(dst_zyx, in + VF_HDR_BYTES, VOLCOMP_CHUNK_VOXELS);
+    return VOLCOMP_OK;
+  }
+  if (mode == VLL_MODE_CODED) {
+    vll_parsed lp;
+    st = vll_parse(in, enc_n, &lp);
+    if (st != VOLCOMP_OK) return st;
+    for (uint32_t s = 0; s < VF_NSUB; s++) {
+      st = vll_decode_sub(&lp, s, dst_zyx, -1, NULL);
+      if (st != VOLCOMP_OK) return st;
+    }
+    return VOLCOMP_OK;
+  }
   vf_parsed p;
-  volcomp_status st = vf_parse(enc, enc_n, &p);
+  st = vf_parse(enc, enc_n, &p);
   if (st != VOLCOMP_OK) return st;
   for (uint32_t s = 0; s < VF_NSUB; s++) {
     st = vf_decode_sub(&p, s, dst_zyx, -1, NULL);
@@ -1975,10 +2491,32 @@ static inline volcomp_status volcomp_decode_block(const void *restrict enc, size
   if (!enc || !dst_block) return VOLCOMP_ERR_ARG;
   if (bz >= VF_BLOCKS_AXIS || by >= VF_BLOCKS_AXIS || bx >= VF_BLOCKS_AXIS) return VOLCOMP_ERR_ARG;
   if (dst_cap < VOLCOMP_BLOCK_VOXELS) return VOLCOMP_ERR_SHORT_BUF;
-  vf_parsed p;
-  volcomp_status st = vf_parse(enc, enc_n, &p);
+  const uint8_t *in = (const uint8_t *)enc;
+  uint32_t mode, bi = bz * 64u + by * 8u + bx;
+  volcomp_status st = vll_chunk_mode(enc, enc_n, &mode);
   if (st != VOLCOMP_OK) return st;
-  uint32_t bi = bz * 64u + by * 8u + bx;
+  if (mode == VLL_MODE_CONST) {
+    if (enc_n != VF_HDR_BYTES + 1u) return VOLCOMP_ERR_CORRUPT;
+    memset(dst_block, in[VF_HDR_BYTES], VOLCOMP_BLOCK_VOXELS);
+    return VOLCOMP_OK;
+  }
+  if (mode == VLL_MODE_RAW) {
+    if (enc_n != VF_HDR_BYTES + (size_t)VOLCOMP_CHUNK_VOXELS) return VOLCOMP_ERR_CORRUPT;
+    for (uint32_t z = 0; z < VOLCOMP_BLOCK_DIM; z++)
+      for (uint32_t y = 0; y < VOLCOMP_BLOCK_DIM; y++)
+        memcpy(dst_block + (z * VOLCOMP_BLOCK_DIM + y) * VOLCOMP_BLOCK_DIM,
+               in + VF_HDR_BYTES + vf_row_off(bz, by, bx, z, y), VOLCOMP_BLOCK_DIM);
+    return VOLCOMP_OK;
+  }
+  if (mode == VLL_MODE_CODED) {
+    vll_parsed lp;
+    st = vll_parse(in, enc_n, &lp);
+    if (st != VOLCOMP_OK) return st;
+    return vll_decode_sub(&lp, bi / VF_BLOCKS_PER_SUB, NULL, (int32_t)bi, dst_block);
+  }
+  vf_parsed p;
+  st = vf_parse(enc, enc_n, &p);
+  if (st != VOLCOMP_OK) return st;
   return vf_decode_sub(&p, bi / VF_BLOCKS_PER_SUB, NULL, (int32_t)bi, dst_block);
 }
 

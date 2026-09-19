@@ -27,7 +27,7 @@ int main(int argc, char **argv) {
   bool regen = argc > 1 && !strcmp(argv[1], "--regen");
   const char *tol_env = getenv("VOLCOMP_GOLDEN_TOLERANCE");
   int tol = tol_env ? atoi(tol_env) : 0;
-  static uint8_t src[VOLCOMP_CHUNK_VOXELS], dec[VOLCOMP_CHUNK_VOXELS];
+  static uint8_t src[VOLCOMP_CHUNK_VOXELS], srcl[VOLCOMP_CHUNK_VOXELS], dec[VOLCOMP_CHUNK_VOXELS];
   static uint8_t enc[VOLCOMP_ENCODE_BOUND];
   vt_synth_chunk(src, 2026);
   memset(src, 0, 40000); /* include flat blocks */
@@ -35,26 +35,36 @@ int main(int argc, char **argv) {
   size_t sn;
   uint8_t *gs = readf("tests/golden/src128.u8", &sn);
   CHECK(gs && sn == sizeof src && memcmp(gs, src, sn) == 0);
-  const float qs[] = {2.0f, 32.0f};
-  const char *names[] = {"q2", "q32"};
-  for (int k = 0; k < 2; k++) {
+  /* the lossless golden runs on a label-like reduction of the same chunk (8
+   * classes): it exercises the CONST / SPARSE / DENSE block modes and keeps the
+   * checked-in stream small. RAW blocks are covered by test_lossless. */
+  for (size_t i = 0; i < sizeof src; i++) srcl[i] = (uint8_t)(src[i] >> 5);
+  const uint8_t *srcs[] = {src, src, srcl};
+  const float qs[] = {2.0f, 32.0f, VOLCOMP_Q_LOSSLESS};
+  const char *names[] = {"q2", "q32", "q0"};
+  for (int k = 0; k < 3; k++) {
     size_t n;
-    CHECK_EQ(volcomp_encode(src, qs[k], enc, sizeof enc, &n), VOLCOMP_OK);
+    CHECK_EQ(volcomp_encode(srcs[k], qs[k], enc, sizeof enc, &n), VOLCOMP_OK);
     CHECK_EQ(volcomp_decode(enc, n, dec, sizeof dec), VOLCOMP_OK);
     char pe[64], po[64];
     snprintf(pe, sizeof pe, "tests/golden/%s.volc", names[k]);
     snprintf(po, sizeof po, "tests/golden/%s.out.u8", names[k]);
+    /* The lossless stream reconstructs src128.u8 exactly, so it has no separate
+     * decoded golden: the source file is its expected output, and the bitstream
+     * is frozen on every kernel set (the lossless path has no float math). */
+    const bool lossless = qs[k] == VOLCOMP_Q_LOSSLESS;
+    if (lossless) CHECK(memcmp(dec, srcl, sizeof dec) == 0);
     if (regen) {
       writef(pe, enc, n);
-      writef(po, dec, sizeof dec);
+      if (!lossless) writef(po, dec, sizeof dec);
       printf("wrote %s (%zu bytes)\n", pe, n);
       continue;
     }
-    size_t gn, on;
-    uint8_t *ge = readf(pe, &gn), *go = readf(po, &on);
+    size_t gn, on = sizeof dec;
+    uint8_t *ge = readf(pe, &gn), *go = lossless ? srcl : readf(po, &on);
     CHECK(ge && go);
     if (!ge || !go) continue;
-    const bool avx2 = !strcmp(volcomp_kernels(), "avx2");
+    const bool avx2 = lossless || !strcmp(volcomp_kernels(), "avx2");
     const bool same_bytes = gn == n && memcmp(ge, enc, n) == 0;
     /* The goldens were produced by the AVX2 kernels: that path is frozen byte
      * for byte. The C kernels are held to the spec's cross-build contract
@@ -64,6 +74,7 @@ int main(int argc, char **argv) {
       CHECK(same_bytes); /* bitstream frozen */
     }
     if (!avx2 && tol < 1) tol = 1;
+    if (lossless) tol = 0;
     CHECK_EQ(on, sizeof dec);
     int mx = 0;
     for (size_t i = 0; i < sizeof dec; i++) {
@@ -83,7 +94,7 @@ int main(int argc, char **argv) {
     }
     CHECK(mx <= tol);
     free(ge);
-    free(go);
+    if (!lossless) free(go);
   }
   free(gs);
   TEST_END();

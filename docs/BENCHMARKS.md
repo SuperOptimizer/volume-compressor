@@ -1,4 +1,4 @@
-# volcomp v1.0 — benchmarks (2026-09-01)
+# volcomp — benchmarks (lossy 2026-09-01, lossless 2026-09-07)
 
 Data: real PHercParis4 micro-CT (masked volume, 2.4 µm), 128³ u8 chunks
 fetched with `tools/fetch_corpus.sh`: **tune** (54 chunks, levels 0–2,
@@ -113,10 +113,71 @@ Encode ≈ 2.4 ms: gather + forward DCT ~35%, quantise + nonzero extraction +
 sort + tokenise ~40%, tANS + bit writer ~25%. `volcomp_decode_block` re-parses the header and
 tables (~20 µs) then decodes one 16-block substream.
 
+## Lossless mode (`q = 0`, 2026-09-07)
+
+Same host, `release` preset (`-O3`, no `-march=native`), one thread pinned to
+one core, medians of 5 reps of 5 encodes / 5 decodes. The lossless path has no
+SIMD kernels and no float math: these are the plain-C numbers on every target,
+and the bytes are identical on every build.
+
+Synthetic classes (`tests/test_lossless.c`, one 128³ chunk each; all decode
+byte-identical to the source):
+
+| class | bytes | ratio | enc MB/s | dec MB/s |
+|---|--:|--:|--:|--:|
+| constant (whole chunk one value) | 9 | 233017× | 50168 | 72328 |
+| 2-class mask, 5 % foreground (blobs) | 12 395 | 169× | 1276 | 4356 |
+| 8-class label map (Voronoi regions) | 39 244 | 53× | 546 | 2721 |
+| smooth SDF-like u8 field | 550 152 | 3.8× | 122 | 290 |
+| random noise (worst case) | 2 097 160 | 1.00× | 452 | 20550 |
+| synthetic CT (`vt_synth_chunk`) | 1 139 759 | 1.8× | 131 | 224 |
+
+Noise lands on `raw + 8` exactly: the encoder falls back to the raw chunk mode
+whenever the coded form would reach 2 097 160 bytes, so a lossless stream is
+never larger than the source plus the header. A chunk of 511 flat blocks and
+one noise block is 4 826 bytes — the flat blocks cost a token and a byte each.
+
+Real 128³ chunks from a TSM label store (`slab_faces_rv/labels/fine.zarr`,
+z 0:128, y 2560:2688, x 4096:4224), for scale against `zstd`
+(whole chunk, no dictionary):
+
+| channel | distinct values | volcomp q=0 | ratio | dec MB/s | zstd -3 | zstd -19 |
+|---|--:|--:|--:|--:|--:|--:|
+| `faces_valid` (3-valued mask) | 3 | **8 346** | 251× | 8700 | 20 774 | 10 692 |
+| `rv_class` (4-class map) | 4 | 31 069 | 67× | 4691 | 55 877 | **20 482** |
+| `sdf_in` (smooth u8 field) | 234 | 663 690 | 3.2× | 336 | 699 969 | **510 196** |
+
+volcomp is 22 % smaller than `zstd -19` on the mask, 44 % smaller than
+`zstd -3` on the class map, and loses to `zstd -19` on the two busier channels
+(by 34 % and 23 %) — zstd matches across the whole 2 MiB chunk, while volcomp
+codes 16³ blocks that stay independently decodable and reuses one set of
+per-chunk tables. What volcomp buys for that is `volcomp_decode_block()` (one
+16³ block from one substream, no full-chunk decode), 4–9 GB/s decode on the
+label channels, and one format and one API for both modes. Per-block choice of
+the prediction axis is the obvious next thing to try on `rv_class`/`sdf_in`.
+
+For reference, the same `rv_class` chunk through the **lossy** codec at q = 8
+is 1 696 bytes (1237×) at PSNR 53.9 / max error 3 — which is worthless for a
+class map, where an error of 1 is a different class. That is the whole reason
+`q = 0` exists.
+
+Fuzzing: 1000 chunks over constant, 5 %-mask, 2..40-class label, smooth-SDF,
+noise, synthetic-CT, sparse-label and half-smooth/half-noise generators all
+round-trip byte-identically (3.1× overall), and every block of a mixed chunk
+decodes through `volcomp_decode_block()` to exactly the bytes of the full
+decode. Truncations and single-bit flips are checked not to crash (the
+`fuzz` preset covers this exhaustively) and the whole suite passes under
+asan+ubsan (`dev` preset).
+
 ## Reproduce
 
 ```sh
 tools/fetch_corpus.sh fetch tune && tools/fetch_corpus.sh fetch heldout
 cmake --preset bench && cmake --build --preset bench
 taskset -c 5 ./build/bench/volcomp-bench --corpus=corpus/heldout --q=2,4,8,16,32 --reps=3
+
+cmake --preset release && cmake --build --preset release
+taskset -c 5 ./build/release/test_lossless --bench       # lossless table above
+# the "real" rows need tests/data/{faces_valid,rv_class,sdf_in}.u8 (2 MiB each,
+# not in the repo); test_lossless skips them when they are absent
 ```

@@ -1,7 +1,12 @@
 #!/bin/bash
 # VM bootstrap for the volcomp export fleet. Run as root with the environment
 # exported by fleet.py bootstrap: ROLE, COMMIT, REPO, COORDINATOR, SFTP,
-# NETRC_CONTENT, Q, PARALLEL, SAMPLES, PORT. Idempotent.
+# NETRC_CONTENT, Q, PARALLEL, SAMPLES, PORT, KIND. Idempotent.
+#
+# KIND=surface configures a worker for the surface-prediction units: one unit in
+# flight (a unit holds its source region, ~1.3 GB) and all cores inside
+# `volcomp surface-pack`. The workers stay standard-library only either way —
+# everything numeric is in the C tool, which needs libzstd for the blosc chunks.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 # fresh images run unattended-upgrades at boot; wait for the package locks
@@ -13,7 +18,7 @@ done
 # latest stable clang from apt.llvm.org (the distro clang is too old for C23)
 if ! ls /usr/bin/clang-[0-9]* >/dev/null 2>&1 || [ "$(ls /usr/bin/clang-[0-9]* | sed 's/.*clang-//' | sort -n | tail -1)" -lt 18 ]; then
   apt-get update -qq
-  apt-get install -y -qq git curl python3 wget lsb-release software-properties-common gnupg sshpass openssh-client >/dev/null
+  apt-get install -y -qq git curl python3 wget lsb-release software-properties-common gnupg sshpass openssh-client libzstd-dev >/dev/null
   curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
   bash /tmp/llvm.sh >/dev/null 2>&1 || bash /tmp/llvm.sh   # no version argument = current stable
 fi
@@ -29,6 +34,8 @@ if ! [ -x /opt/cmake/bin/cmake ]; then
 fi
 ln -sf /opt/cmake/bin/cmake /usr/local/bin/cmake
 command -v sshpass >/dev/null || apt-get install -y -qq sshpass >/dev/null
+# libzstd: `volcomp surface-pack` decodes the predictions' blosc/zstd source chunks
+dpkg -s libzstd-dev >/dev/null 2>&1 || { apt-get update -qq; apt-get install -y -qq libzstd-dev >/dev/null; }
 echo "using $($CLANG --version | head -1), $(cmake --version | head -1)"
 grep -q -w avx2 /proc/cpuinfo && grep -q -w fma /proc/cpuinfo || { echo "CPU lacks AVX2/FMA"; exit 1; }
 
@@ -86,6 +93,10 @@ if [ "$ROLE" = "worker" ]; then
   umask 077
   # scratch: tmpfs when there is RAM for it (1 GiB per shard in flight), else disk; small VMs run 2 shards
   MEM_GB=$(awk '/MemTotal/{print int($2/1048576)}' /proc/meminfo)
+  THREADS=0   # 0 = every core, inside `volcomp surface-pack`
+  if [ "${KIND:-ct}" = "surface" ]; then
+    PARALLEL=1   # one surface unit at a time: it holds its ~1.3 GB source region
+  fi
   if [ "$MEM_GB" -ge 6 ]; then
     TMP=/dev/shm/volcomp
   else
@@ -101,6 +112,7 @@ Q=$Q
 PARALLEL=$PARALLEL
 SAMPLES=$SAMPLES
 TMP=$TMP
+THREADS=$THREADS
 EOF
   cat > /etc/systemd/system/volcomp-worker.service <<'EOF'
 [Unit]
@@ -111,7 +123,8 @@ Wants=network-online.target
 [Service]
 EnvironmentFile=/etc/volcomp-worker.env
 ExecStart=/usr/bin/python3 /usr/local/bin/volcomp-worker run --coordinator ${COORDINATOR} --volcomp /usr/local/bin/volcomp \
-  --tmp ${TMP} --sftp ${SFTP} --netrc /etc/volcomp-netrc --q ${Q} --parallel ${PARALLEL} --samples ${SAMPLES}
+  --tmp ${TMP} --sftp ${SFTP} --netrc /etc/volcomp-netrc --q ${Q} --parallel ${PARALLEL} --samples ${SAMPLES} \
+  --threads ${THREADS}
 Restart=always
 RestartSec=10
 Nice=5

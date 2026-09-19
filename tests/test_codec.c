@@ -192,11 +192,11 @@ static void hostile(void) {
     uint8_t rans[512];
     static vf_etab es[VF_NMODELS];
     static uint32_t fields[4096];
-    vf_etabs_init(models, es);
+    vf_etabs_init(models, es, VF_NMODELS);
     size_t rn = vf_tans_encode2(es, syms, k, fields, rans, sizeof rans);
     CHECK(rn > 0);
     uint8_t tab[VF_TABLES_MAX_BYTES];
-    size_t tn = vf_tables_write(models, tab);
+    size_t tn = vf_tables_write(models, tab, VF_NMODELS);
     size_t pos = 0;
     memcpy(m, "VOLC", 4);
     m[4] = 1;
