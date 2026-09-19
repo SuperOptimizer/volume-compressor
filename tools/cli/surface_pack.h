@@ -60,6 +60,8 @@ typedef struct {
   int64_t shard[3];           /* shard index (same for every level) */
   double scale;               /* source voxels per output voxel = rung_um / native_um */
   float q[SURF_LEVELS];
+  const uint8_t *mask;  /* optional 64-byte occupancy mask of the 8^3 level-0 chunks (see
+                         * coordinator.py surface-occupancy); NULL = every chunk is occupied */
   int dmax, threads, samples;
 } surf_cfg;
 
@@ -69,7 +71,10 @@ typedef struct {
   double psnr_min;
   unsigned max_err, compared;
   double t_decode, t_ramp, t_encode;
+  double cpu_transform, cpu_encode0;  /* CPU seconds inside the level-0 loop: the ramp +
+                                       * resample + pooling, and the encode + verify */
   uint64_t out_voxels, src_chunks;
+  unsigned skip_mask, skip_zero, skip_full;  /* level-0 chunks skipped: masked out, all air, all mask */
   bool src_nonzero;
 } surf_result;
 
@@ -100,9 +105,156 @@ static void surf_ramp_tables(int dmax, uint8_t in[SURF_INF + 1], uint8_t out[SUR
  * from seed[i] = 0 at seeds and SURF_INF elsewhere, the result is the exact
  * squared Euclidean distance to the nearest seed whenever that distance is
  * <= dmax^2, and >= SURF_INF otherwise. Separable and exact because every
- * candidate seed within the clip has all three offsets within +-dmax. */
+ * candidate seed within the clip has all three offsets within +-dmax.
+ *
+ * Every pass is a sequence of two row kernels over CONTIGUOUS uint8 rows -
+ * "d = min(d, s + kk)" and "d = min(d, SURF_INF)" - so the y and z passes walk
+ * shifted rows (and whole shifted planes) instead of strided columns, and both
+ * kernels are 32 lanes per instruction under AVX2. Inputs are always <= SURF_INF
+ * and kk <= dmax^2, so the saturating add never saturates and the AVX2 and scalar
+ * kernels produce identical bytes. */
 
-static void surf_pass_x(uint8_t *dst, const uint8_t *src, int64_t mz, int64_t my, int64_t mx, int R) {
+#if VF_HAVE_AVX2
+__attribute__((always_inline)) VF_TARGET_AVX2 static inline void surf_ma_avx2(uint8_t *d, const uint8_t *s,
+                                                                              int64_t n, unsigned kk) {
+  const __m256i v = _mm256_set1_epi8((char)(unsigned char)kk);
+  int64_t i = 0;
+  for (; i + 32 <= n; i += 32) {
+    __m256i a = _mm256_adds_epu8(_mm256_loadu_si256((const __m256i *)(s + i)), v);
+    __m256i b = _mm256_loadu_si256((const __m256i *)(d + i));
+    _mm256_storeu_si256((__m256i *)(d + i), _mm256_min_epu8(a, b));
+  }
+  for (; i < n; i++) {
+    unsigned t = s[i] + kk;
+    if (t < d[i]) d[i] = (uint8_t)t;
+  }
+}
+VF_TARGET_AVX2 static void surf_min_add_avx2(uint8_t *d, const uint8_t *s, int64_t n, unsigned kk) {
+  const __m256i v = _mm256_set1_epi8((char)(unsigned char)kk);
+  int64_t i = 0;
+  for (; i + 32 <= n; i += 32) {
+    __m256i a = _mm256_adds_epu8(_mm256_loadu_si256((const __m256i *)(s + i)), v);
+    __m256i b = _mm256_loadu_si256((const __m256i *)(d + i));
+    _mm256_storeu_si256((__m256i *)(d + i), _mm256_min_epu8(a, b));
+  }
+  for (; i < n; i++) {
+    unsigned t = s[i] + kk;
+    if (t < d[i]) d[i] = (uint8_t)t;
+  }
+}
+VF_TARGET_AVX2 static void surf_clamp_avx2(uint8_t *d, int64_t n, unsigned cap) {
+  const __m256i v = _mm256_set1_epi8((char)(unsigned char)cap);
+  int64_t i = 0;
+  for (; i + 32 <= n; i += 32)
+    _mm256_storeu_si256((__m256i *)(d + i), _mm256_min_epu8(_mm256_loadu_si256((const __m256i *)(d + i)), v));
+  for (; i < n; i++)
+    if (d[i] > cap) d[i] = (uint8_t)cap;
+}
+#endif
+
+static inline void surf_min_add(uint8_t *d, const uint8_t *s, int64_t n, unsigned kk) {
+#if VF_HAVE_AVX2
+  if (vf_use_avx2()) {
+    surf_min_add_avx2(d, s, n, kk);
+    return;
+  }
+#endif
+  for (int64_t i = 0; i < n; i++) {
+    unsigned t = s[i] + kk;
+    if (t < d[i]) d[i] = (uint8_t)t;
+  }
+}
+static inline void surf_clamp(uint8_t *d, int64_t n, unsigned cap) {
+#if VF_HAVE_AVX2
+  if (vf_use_avx2()) {
+    surf_clamp_avx2(d, n, cap);
+    return;
+  }
+#endif
+  for (int64_t i = 0; i < n; i++)
+    if (d[i] > cap) d[i] = (uint8_t)cap;
+}
+
+/* The two in-plane passes of the fused pipeline, one kernel dispatch per PLANE
+ * (a box row is ~140 bytes: dispatching per row cost more than the work).
+ *
+ * The x pass treats the whole plane as one row. A shift of k then reaches across
+ * a row boundary, but only into the first and last dmax columns - which are the
+ * box's x halo, are never sampled by the resample, and never leak back: the x
+ * pass reads the seed plane (not its own output), and the y and z passes stay
+ * within one column. */
+#define SURF_PASS_X_BODY(MA)                                                                       \
+  memcpy(dst, src, (size_t)n);                                                                     \
+  for (int k = 1; k <= R && k < n; k++) {                                                          \
+    unsigned kk = (unsigned)(k * k);                                                               \
+    MA(dst + k, src, n - k, kk);                                                                   \
+    MA(dst, src + k, n - k, kk);                                                                   \
+  }
+#define SURF_PASS_Y_BODY(MA)                                                                       \
+  for (int64_t y = 0; y < my; y++) {                                                               \
+    uint8_t *d = dst + y * mx;                                                                     \
+    memcpy(d, src + y * mx, (size_t)mx);                                                           \
+    for (int k = 1; k <= R; k++) {                                                                 \
+      unsigned kk = (unsigned)(k * k);                                                             \
+      if (y >= k) MA(d, src + (y - k) * mx, mx, kk);                                               \
+      if (y + k < my) MA(d, src + (y + k) * mx, mx, kk);                                           \
+    }                                                                                              \
+  }
+/* seed planes of both fields out of one strided read of the assembled region */
+#define SURF_SEED2_BODY(SEED)                                                                      \
+  for (int64_t y = 0; y < my; y++) SEED(a + y * mx, b + y * mx, src + y * rstride_y, mx);
+
+__attribute__((always_inline)) static inline void surf_ma_c(uint8_t *d, const uint8_t *s, int64_t n,
+                                                            unsigned kk) {
+  for (int64_t i = 0; i < n; i++) {
+    unsigned t = s[i] + kk;
+    if (t < d[i]) d[i] = (uint8_t)t;
+  }
+}
+__attribute__((always_inline)) static inline void surf_seed_row_c(uint8_t *a, uint8_t *b, const uint8_t *s,
+                                                                  int64_t n) {
+  for (int64_t x = 0; x < n; x++) {
+    a[x] = (uint8_t)(s[x] ? SURF_INF : 0u);
+    b[x] = (uint8_t)(s[x] ? 0u : SURF_INF);
+  }
+}
+static void surf_pass_x_c(uint8_t *dst, const uint8_t *src, int64_t n, int R) { SURF_PASS_X_BODY(surf_ma_c) }
+static void surf_pass_y_c(uint8_t *dst, const uint8_t *src, int64_t my, int64_t mx, int R) {
+  SURF_PASS_Y_BODY(surf_ma_c)
+}
+static void surf_seed2_c(uint8_t *a, uint8_t *b, const uint8_t *src, int64_t my, int64_t mx,
+                         int64_t rstride_y) {
+  SURF_SEED2_BODY(surf_seed_row_c)
+}
+#if VF_HAVE_AVX2
+__attribute__((always_inline)) VF_TARGET_AVX2 static inline void surf_seed_row_avx2(uint8_t *a, uint8_t *b,
+                                                                                    const uint8_t *s, int64_t n) {
+  const __m256i zero = _mm256_setzero_si256(), inf = _mm256_set1_epi8((char)(unsigned char)SURF_INF);
+  int64_t x = 0;
+  for (; x + 32 <= n; x += 32) {
+    __m256i is0 = _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(s + x)), zero);
+    _mm256_storeu_si256((__m256i *)(a + x), _mm256_andnot_si256(is0, inf));
+    _mm256_storeu_si256((__m256i *)(b + x), _mm256_and_si256(is0, inf));
+  }
+  for (; x < n; x++) {
+    a[x] = (uint8_t)(s[x] ? SURF_INF : 0u);
+    b[x] = (uint8_t)(s[x] ? 0u : SURF_INF);
+  }
+}
+VF_TARGET_AVX2 static void surf_pass_x_kavx2(uint8_t *dst, const uint8_t *src, int64_t n, int R) {
+  SURF_PASS_X_BODY(surf_ma_avx2)
+}
+VF_TARGET_AVX2 static void surf_pass_y_kavx2(uint8_t *dst, const uint8_t *src, int64_t my, int64_t mx, int R) {
+  SURF_PASS_Y_BODY(surf_ma_avx2)
+}
+VF_TARGET_AVX2 static void surf_seed2_avx2(uint8_t *a, uint8_t *b, const uint8_t *src, int64_t my, int64_t mx,
+                                           int64_t rstride_y) {
+  SURF_SEED2_BODY(surf_seed_row_avx2)
+}
+#endif
+
+/* pass along x: the window shifts within each contiguous row */
+static inline void surf_pass_x(uint8_t *dst, const uint8_t *src, int64_t mz, int64_t my, int64_t mx, int R) {
   for (int64_t line = 0; line < mz * my; line++) {
     const uint8_t *s = src + line * mx;
     uint8_t *d = dst + line * mx;
@@ -110,23 +262,17 @@ static void surf_pass_x(uint8_t *dst, const uint8_t *src, int64_t mz, int64_t my
     for (int k = 1; k <= R; k++) {
       unsigned kk = (unsigned)(k * k);
       if (kk >= SURF_INF) break;
-      for (int64_t x = k; x < mx; x++) {
-        unsigned v = s[x - k] + kk;
-        if (v < d[x]) d[x] = (uint8_t)v;
-      }
-      for (int64_t x = 0; x + k < mx; x++) {
-        unsigned v = s[x + k] + kk;
-        if (v < d[x]) d[x] = (uint8_t)v;
-      }
+      if (k >= mx) break;
+      surf_min_add(d + k, s, mx - k, kk);
+      surf_min_add(d, s + k, mx - k, kk);
     }
-    for (int64_t x = 0; x < mx; x++)
-      if (d[x] > SURF_INF) d[x] = (uint8_t)SURF_INF;
+    surf_clamp(d, mx, SURF_INF);
   }
 }
-/* one pass along an axis whose lines are `span` contiguous elements apart */
-static void surf_pass_strided(uint8_t *dst, const uint8_t *src, int64_t nlines, int64_t span,
+/* pass along an axis whose neighbours are whole contiguous blocks of `span`
+ * elements `span` apart: y (rows within a plane) and z (planes) */
+static inline void surf_pass_strided(uint8_t *dst, const uint8_t *src, int64_t nlines, int64_t span,
                               int64_t group, int R) {
-  /* the volume is `group` blocks of `nlines` lines of `span` contiguous elements */
   for (int64_t g = 0; g < group; g++)
     for (int64_t l = 0; l < nlines; l++) {
       int64_t base = (g * nlines + l) * span;
@@ -138,37 +284,251 @@ static void surf_pass_strided(uint8_t *dst, const uint8_t *src, int64_t nlines, 
         for (int sgn = -1; sgn <= 1; sgn += 2) {
           int64_t ll = l + sgn * k;
           if (ll < 0 || ll >= nlines) continue;
-          const uint8_t *s = src + (g * nlines + ll) * span;
-          for (int64_t i = 0; i < span; i++) {
-            unsigned v = s[i] + kk;
-            if (v < d[i]) d[i] = (uint8_t)v;
-          }
+          surf_min_add(d, src + (g * nlines + ll) * span, span, kk);
         }
       }
-      for (int64_t i = 0; i < span; i++)
-        if (d[i] > SURF_INF) d[i] = (uint8_t)SURF_INF;
+      surf_clamp(d, span, SURF_INF);
     }
 }
 /* squared distance field of `seed` (0 at seeds, SURF_INF elsewhere) into A; B is scratch */
-static void surf_edt(uint8_t *A, uint8_t *B, const uint8_t *seed, int64_t mz, int64_t my, int64_t mx, int R) {
+static inline void surf_edt(uint8_t *A, uint8_t *B, const uint8_t *seed, int64_t mz, int64_t my, int64_t mx, int R) {
   surf_pass_x(A, seed, mz, my, mx, R);              /* x */
   surf_pass_strided(B, A, my, mx, mz, R);           /* y: my lines of mx, mz groups */
   surf_pass_strided(A, B, mz, my * mx, 1, R);       /* z: mz planes of my*mx */
 }
 
-/* Ramp over a sub-box of the 0/1 mask `loc` (dims m, which must include a dmax
+/* ramp[i] = a[i] ? in_tab[a[i]] : out_tab[b[i]], with a, b <= SURF_INF < 16 (one
+ * byte shuffle per 32 voxels under AVX2). */
+#if VF_HAVE_AVX2
+VF_TARGET_AVX2 static void surf_apply_tables_avx2(uint8_t *ramp, const uint8_t *a, const uint8_t *b,
+                                                  size_t n, const uint8_t *in_tab, const uint8_t *out_tab) {
+  uint8_t ti[32], to[32];
+  for (int i = 0; i < 16; i++) {
+    ti[i] = ti[i + 16] = i <= (int)SURF_INF ? in_tab[i] : 0;
+    to[i] = to[i + 16] = i <= (int)SURF_INF ? out_tab[i] : 0;
+  }
+  const __m256i vi = _mm256_loadu_si256((const __m256i *)ti), vo = _mm256_loadu_si256((const __m256i *)to);
+  const __m256i zero = _mm256_setzero_si256(), cap = _mm256_set1_epi8((char)(unsigned char)SURF_INF);
+  size_t i = 0;
+  for (; i + 32 <= n; i += 32) {
+    __m256i va = _mm256_min_epu8(_mm256_loadu_si256((const __m256i *)(a + i)), cap);
+    __m256i vb = _mm256_min_epu8(_mm256_loadu_si256((const __m256i *)(b + i)), cap);
+    __m256i in = _mm256_shuffle_epi8(vi, va), out = _mm256_shuffle_epi8(vo, vb);
+    __m256i is0 = _mm256_cmpeq_epi8(va, zero);
+    _mm256_storeu_si256((__m256i *)(ramp + i), _mm256_blendv_epi8(in, out, is0));
+  }
+  for (; i < n; i++)
+    ramp[i] = a[i] ? in_tab[a[i] < SURF_INF ? a[i] : SURF_INF] : out_tab[b[i] < SURF_INF ? b[i] : SURF_INF];
+}
+#endif
+static inline void surf_apply_tables(uint8_t *ramp, const uint8_t *a, const uint8_t *b, size_t n,
+                                     const uint8_t *in_tab, const uint8_t *out_tab) {
+#if VF_HAVE_AVX2
+  if (vf_use_avx2()) {
+    surf_apply_tables_avx2(ramp, a, b, n, in_tab, out_tab);
+    return;
+  }
+#endif
+  for (size_t i = 0; i < n; i++)
+    ramp[i] = a[i] ? in_tab[a[i] < SURF_INF ? a[i] : SURF_INF] : out_tab[b[i] < SURF_INF ? b[i] : SURF_INF];
+}
+
+/* Reference form of the ramp over a sub-box of the 0/1 mask `loc` (the fused
+ * pipeline below is what runs; tests check the two agree).
+ * Ramp over a sub-box of the 0/1 mask `loc` (dims m, which must include a dmax
  * halo on every side): writes `ramp` for the whole box, but only the voxels at
  * least dmax from the box edge are meaningful - those are exact and independent
  * of how the volume was tiled. `a`, `b`, `s` are scratch of the box size; `loc`
  * is destroyed. */
-static void surf_ramp_region(uint8_t *ramp, uint8_t *loc, int64_t mz, int64_t my, int64_t mx, int dmax,
+static inline void surf_ramp_region(uint8_t *ramp, uint8_t *loc, int64_t mz, int64_t my, int64_t mx, int dmax,
                              const uint8_t *in_tab, const uint8_t *out_tab, uint8_t *a, uint8_t *b, uint8_t *s) {
   size_t mn = (size_t)(mz * my * mx);
-  for (size_t k = 0; k < mn; k++) s[k] = loc[k] ? (uint8_t)SURF_INF : 0;   /* seeds: background */
+  for (size_t k = 0; k < mn; k++) s[k] = (uint8_t)(loc[k] ? SURF_INF : 0u);  /* seeds: background */
   surf_edt(a, b, s, mz, my, mx, dmax);                                     /* a = d^2 to background */
   for (size_t k = 0; k < mn; k++) loc[k] = loc[k] ? 0 : (uint8_t)SURF_INF; /* seeds: foreground */
   surf_edt(b, s, loc, mz, my, mx, dmax);                                   /* b = d^2 to foreground */
-  for (size_t k = 0; k < mn; k++) ramp[k] = a[k] ? in_tab[a[k]] : out_tab[b[k]];
+  surf_apply_tables(ramp, a, b, mn, in_tab, out_tab);
+}
+
+/* ------------------------------------------------------------ 2x mean pooling ---
+ * (sum of the 8 voxels + 4) / 8, which is what the scalar form computes for a full
+ * block. maddubs gives the pairwise sums along x for free. */
+#if VF_HAVE_AVX2
+VF_TARGET_AVX2 static unsigned surf_pool_rows_avx2(uint8_t *d, const uint8_t *r0, const uint8_t *r1,
+                                                   const uint8_t *r2, const uint8_t *r3, int64_t nout) {
+  const __m256i one = _mm256_set1_epi8(1), four = _mm256_set1_epi16(4);
+  __m256i any = _mm256_setzero_si256();
+  int64_t i = 0;
+  for (; i + 16 <= nout; i += 16) {
+    __m256i s = _mm256_maddubs_epi16(_mm256_loadu_si256((const __m256i *)(r0 + 2 * i)), one);
+    s = _mm256_add_epi16(s, _mm256_maddubs_epi16(_mm256_loadu_si256((const __m256i *)(r1 + 2 * i)), one));
+    s = _mm256_add_epi16(s, _mm256_maddubs_epi16(_mm256_loadu_si256((const __m256i *)(r2 + 2 * i)), one));
+    s = _mm256_add_epi16(s, _mm256_maddubs_epi16(_mm256_loadu_si256((const __m256i *)(r3 + 2 * i)), one));
+    any = _mm256_or_si256(any, s);
+    s = _mm256_srli_epi16(_mm256_add_epi16(s, four), 3);
+    __m256i p = _mm256_permute4x64_epi64(_mm256_packus_epi16(s, s), 0xD8);
+    _mm_storeu_si128((__m128i *)(d + i), _mm256_castsi256_si128(p));
+  }
+  unsigned nz = !_mm256_testz_si256(any, any);
+  for (; i < nout; i++) {
+    unsigned sum = (unsigned)r0[2 * i] + r0[2 * i + 1] + r1[2 * i] + r1[2 * i + 1] + r2[2 * i] +
+                   r2[2 * i + 1] + r3[2 * i] + r3[2 * i + 1];
+    nz |= sum != 0;
+    d[i] = (uint8_t)((sum + 4) / 8);
+  }
+  return nz;
+}
+#endif
+
+/* ------------------------------------------------------------- the resample ---
+ * One output row of the trilinear resample. The arithmetic is written out in the
+ * order the scalar form uses and FMA contraction is switched off, so the AVX2 and
+ * scalar kernels return the same doubles bit for bit; `(int)(v + 0.5)` is floor
+ * for v >= 0, which every ramp value is.
+ *
+ * The AVX2 kernel does four output voxels at a time and needs the eight corner
+ * bytes of each; when the four source indices are consecutive (they are, except
+ * at the 1-in-1/(scale-1) voxels where the sample point steps over one) both
+ * corner vectors come out of a single 8-byte load. */
+#if defined(__clang__)
+#define SURF_NO_FMA _Pragma("clang fp contract(off)")
+#else
+#define SURF_NO_FMA
+#endif
+
+#define SURF_LERP_ROW_BODY()                                                                       \
+  for (; x < n; x++) {                                                                             \
+    int64_t ax = idx[x];                                                                           \
+    double fx = fr[x], gx = cf[x];                                                                 \
+    double v = gz * (gy * (gx * p000[ax] + fx * p000[ax + 1]) + fy * (gx * p001[ax] + fx * p001[ax + 1])) + \
+               fz * (gy * (gx * p100[ax] + fx * p100[ax + 1]) + fy * (gx * p101[ax] + fx * p101[ax + 1]));  \
+    int iv = (int)(v + 0.5);                                                                       \
+    d[x] = (uint8_t)(iv < 0 ? 0 : iv > 255 ? 255 : iv);                                            \
+  }
+
+static void surf_lerp_row_c(uint8_t *d, int64_t n, const int64_t *idx, const double *fr, const double *cf,
+                            const uint8_t *p000, const uint8_t *p001, const uint8_t *p100,
+                            const uint8_t *p101, double fz, double gz, double fy, double gy) {
+  SURF_NO_FMA
+  int64_t x = 0;
+  SURF_LERP_ROW_BODY()
+}
+
+#if VF_HAVE_AVX2 && defined(__clang__)
+VF_TARGET_AVX2 static inline __m256d surf_u8x4_pd(const uint8_t *p) {
+  return _mm256_cvtepi32_pd(_mm_cvtepu8_epi32(_mm_cvtsi32_si128((int)(uint32_t)((uint32_t)p[0] | (uint32_t)p[1] << 8 |
+                                                                                (uint32_t)p[2] << 16 |
+                                                                                (uint32_t)p[3] << 24))));
+}
+VF_TARGET_AVX2 static void surf_lerp_row_avx2(uint8_t *d, int64_t n, const int64_t *idx, const double *fr,
+                                              const double *cf, const uint8_t *p000, const uint8_t *p001,
+                                              const uint8_t *p100, const uint8_t *p101, double fz, double gz,
+                                              double fy, double gy) {
+  SURF_NO_FMA
+  const __m256d vfz = _mm256_set1_pd(fz), vgz = _mm256_set1_pd(gz), vfy = _mm256_set1_pd(fy),
+                vgy = _mm256_set1_pd(gy), half = _mm256_set1_pd(0.5);
+  int64_t x = 0;
+  for (; x + 4 <= n; x += 4) {
+    int64_t a = idx[x];
+    if (idx[x + 3] - a != 3) break;  /* the sample point stepped over a voxel: finish scalar */
+    __m256d gx = _mm256_loadu_pd(cf + x), fx = _mm256_loadu_pd(fr + x);
+    __m256d v = _mm256_setzero_pd();
+    const uint8_t *p[4] = {p000, p001, p100, p101};
+    __m256d row[4];
+    for (int r = 0; r < 4; r++)
+      row[r] = _mm256_add_pd(_mm256_mul_pd(gx, surf_u8x4_pd(p[r] + a)),
+                             _mm256_mul_pd(fx, surf_u8x4_pd(p[r] + a + 1)));
+    v = _mm256_add_pd(_mm256_mul_pd(vgz, _mm256_add_pd(_mm256_mul_pd(vgy, row[0]), _mm256_mul_pd(vfy, row[1]))),
+                      _mm256_mul_pd(vfz, _mm256_add_pd(_mm256_mul_pd(vgy, row[2]), _mm256_mul_pd(vfy, row[3]))));
+    __m128i iv = _mm256_cvttpd_epi32(_mm256_add_pd(v, half));
+    iv = _mm_min_epi32(_mm_max_epi32(iv, _mm_setzero_si128()), _mm_set1_epi32(255));
+    iv = _mm_shuffle_epi8(iv, _mm_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1));
+    memcpy(d + x, &iv, 4);
+  }
+  SURF_LERP_ROW_BODY()
+}
+#endif
+
+static inline void surf_lerp_row(uint8_t *d, int64_t n, const int64_t *idx, const double *fr, const double *cf,
+                                 const uint8_t *p000, const uint8_t *p001, const uint8_t *p100,
+                                 const uint8_t *p101, double fz, double gz, double fy, double gy) {
+#if VF_HAVE_AVX2 && defined(__clang__)
+  if (vf_use_avx2()) {
+    surf_lerp_row_avx2(d, n, idx, fr, cf, p000, p001, p100, p101, fz, gz, fy, gy);
+    return;
+  }
+#endif
+  surf_lerp_row_c(d, n, idx, fr, cf, p000, p001, p100, p101, fz, gz, fy, gy);
+}
+
+/* --------------------------------------------------- the fused ramp pipeline ---
+ * The straightforward form above walks the whole sub-box six times (two fields x
+ * three axes) plus the gather, the seeds and the table lookup: ~45 MB of traffic
+ * per 128^3 output chunk, which is memory bound long before it is ALU bound.
+ *
+ * This form walks it ONCE. For each z plane of the box it builds both seed planes
+ * straight out of the assembled region (no gather, no mask copy), runs the x and y
+ * passes into two rings of 2*dmax+1 planes (~300 KB per thread: L2 resident), and
+ * as soon as a plane has its full +-dmax z neighbourhood it runs the z pass for
+ * both fields and writes that plane of the ramp. Only the planes the resample can
+ * actually sample are produced - the box's dmax-deep border planes never were.
+ *
+ * Byte for byte the same result as surf_ramp_region: the same per-voxel min-plus
+ * arithmetic in the same order. The per-pass clamp to SURF_INF is dropped (values
+ * stay <= SURF_INF + 3 * dmax^2 = 37, so nothing saturates) and applied once when
+ * the tables are looked up, which cannot change any value <= dmax^2. */
+
+#define SURF_RING (2 * SURF_DMAX + 1)
+
+/* ramp[(p - dmax) plane] for every box plane p in [dmax, m0 - dmax); planes are
+ * m1 * m2 and include the y/x halo, exactly as surf_ramp_region's output does. */
+static void surf_ramp_fused(const uint8_t *base, int64_t rstride_z, int64_t rstride_y, int64_t m0,
+                            int64_t m1, int64_t m2, int R, const uint8_t *in_tab, const uint8_t *out_tab,
+                            uint8_t *ramp, uint8_t *pool) {
+  const int64_t plane = m1 * m2;
+  uint8_t *seed = pool, *seed2 = pool + plane, *xt = pool + 2 * plane, *za = pool + 3 * plane,
+          *zb = pool + 4 * plane;
+  uint8_t *ring[2][SURF_RING];
+  for (int f = 0; f < 2; f++)
+    for (int r = 0; r < SURF_RING; r++) ring[f][r] = pool + (5 + f * SURF_RING + r) * plane;
+  bool avx2 = false;
+#if VF_HAVE_AVX2
+  avx2 = vf_use_avx2();
+#endif
+  for (int64_t p = 0; p < m0; p++) {
+    const uint8_t *src = base + p * rstride_z;
+#if VF_HAVE_AVX2
+    if (avx2)
+      surf_seed2_avx2(seed, seed2, src, m1, m2, rstride_y);
+    else
+#endif
+      surf_seed2_c(seed, seed2, src, m1, m2, rstride_y);
+    for (int f = 0; f < 2; f++) {
+      const uint8_t *sd = f ? seed2 : seed;
+#if VF_HAVE_AVX2
+      if (avx2) {
+        surf_pass_x_kavx2(xt, sd, plane, R);
+        surf_pass_y_kavx2(ring[f][p % SURF_RING], xt, m1, m2, R);
+      } else
+#endif
+      {
+        surf_pass_x_c(xt, sd, plane, R);
+        surf_pass_y_c(ring[f][p % SURF_RING], xt, m1, m2, R);
+      }
+    }
+    if (p < 2 * R) continue;
+    int64_t p0 = p - R;  /* this plane now has its full +-R neighbourhood */
+    for (int f = 0; f < 2; f++) {
+      uint8_t *dst = f ? zb : za;
+      memcpy(dst, ring[f][p0 % SURF_RING], (size_t)plane);
+      for (int k = 1; k <= R; k++) {
+        unsigned kk = (unsigned)(k * k);
+        surf_min_add(dst, ring[f][(p0 - k + SURF_RING) % SURF_RING], plane, kk);
+        surf_min_add(dst, ring[f][(p0 + k) % SURF_RING], plane, kk);
+      }
+    }
+    surf_apply_tables(ramp + (p0 - R) * plane, za, zb, (size_t)plane, in_tab, out_tab);
+  }
 }
 
 /* ------------------------------------------------------------- parallel for */
@@ -212,11 +572,15 @@ static void surf_parallel_for(int64_t n, int threads, surf_job fn, void *ctx) {
 #define SURF_MAX_CHUNKS 512u  /* 8^3 inner chunks in the level-0 shard */
 
 typedef struct {
-  uint8_t *loc, *s, *a, *b, *ramp; /* per-thread scratch over the local sub-box */
+  double cpu_transform, cpu_encode0;
+  uint8_t *pool;              /* per-thread plane pool for the fused pipeline (4 + 2 * SURF_RING planes) */
+  uint8_t *ramp;              /* the ramp planes of one sub-box */
   uint8_t *chunk;             /* 128^3 output chunk */
   uint8_t *enc, *dec;         /* encode/decode scratch */
   uint8_t *src;               /* one decompressed source chunk */
   uint8_t *tmp;               /* blosc unshuffle scratch */
+  int64_t ridx[3][SURF_CHUNK];        /* resample: source index per output voxel, per axis */
+  double rfrac[3][SURF_CHUNK], rcofr[3][SURF_CHUNK];  /* and its weights (f, 1 - f) */
 } surf_scratch;
 
 typedef struct {
@@ -225,9 +589,13 @@ typedef struct {
   uint8_t *mask;              /* rn[0]*rn[1]*rn[2], 0 or 1 */
   int64_t co[3], ce[3];       /* output level-0 core extent of this shard */
   int64_t clo[3], chi[3];     /* source chunk index range covering the region */
+  int64_t cdim[3];            /* chi - clo + 1 */
+  uint8_t *cstat;             /* per source chunk: 0 all air, 1 all mask, 2 mixed (absent = 0) */
   int64_t ldim[SURF_LEVELS];  /* shard edge per level */
   int64_t lext[SURF_LEVELS][3];
   uint8_t *lvl[SURF_LEVELS];  /* pooled shard volumes for levels 1..3 */
+  uint8_t blk[SURF_MAX_CHUNKS]; /* level-0 chunks that produced data: the coarse levels only
+                                 * have to pool and encode the blocks these fed */
   uint8_t *enc[SURF_LEVELS][SURF_MAX_CHUNKS];
   size_t encn[SURF_LEVELS][SURF_MAX_CHUNKS];
   uint8_t in_tab[SURF_INF + 1], out_tab[SURF_INF + 1];
@@ -272,29 +640,68 @@ static void surf_decode_job(void *ctx, int64_t i, int tid) {
     hi[d] = surf_min64(g0[d] + C, surf_min64(S->rlo[d] + S->rn[d], cfg->src_shape[d]));
     if (hi[d] <= lo[d]) return;
   }
-  bool nonzero = false;
+  unsigned any = 0, all = 1;
   for (int64_t z = lo[0]; z < hi[0]; z++)
     for (int64_t y = lo[1]; y < hi[1]; y++) {
       const uint8_t *s = sc->src + ((z - g0[0]) * C + (y - g0[1])) * C + (lo[2] - g0[2]);
       uint8_t *d = S->mask + ((z - S->rlo[0]) * S->rn[1] + (y - S->rlo[1])) * S->rn[2] + (lo[2] - S->rlo[2]);
       for (int64_t x = 0; x < hi[2] - lo[2]; x++) {
         d[x] = s[x] != 0;
-        nonzero |= d[x] != 0;
+        any |= d[x];
+        all &= d[x];
       }
     }
-  if (nonzero) {
+  /* what this chunk contributes to the region: all air, all mask, or mixed. An output
+   * chunk whose haloed box meets only uniform sources needs no distance transform. */
+  S->cstat[((cz - S->clo[0]) * S->cdim[1] + (cy - S->clo[1])) * S->cdim[2] + (cx - S->clo[2])] =
+      (uint8_t)(!any ? 0 : all ? 1 : 2);
+  if (any) {
     pthread_mutex_lock(&S->lock);
     S->res->src_nonzero = true;
     pthread_mutex_unlock(&S->lock);
   }
 }
 
+/* Is the haloed box [j0, j0 + m) uniform? 0 = all air, 1 = all mask, 2 = mixed.
+ * Everything outside the published array is air. A source chunk that was not
+ * downloaded is absent, hence air: with an occupancy mask the worker only fetches
+ * chunks that meet an occupied output chunk, and unoccupied output chunks are
+ * skipped before this is ever asked. */
+static int surf_box_uniform(const surf_state *S, const int64_t j0[3], const int64_t m[3]) {
+  const int64_t C = S->cfg->csize;
+  int seen0 = 0, seen1 = 0;
+  for (int d = 0; d < 3; d++)
+    if (j0[d] < 0 || j0[d] + m[d] > S->cfg->src_shape[d]) seen0 = 1;  /* padding is air */
+  int64_t lo[3], hi[3];
+  for (int d = 0; d < 3; d++) {
+    lo[d] = surf_max64(j0[d], 0) / C;
+    hi[d] = surf_min64(j0[d] + m[d] - 1, S->cfg->src_shape[d] - 1) / C;
+    if (hi[d] < lo[d]) return 0;  /* the box lies entirely outside the array */
+  }
+  for (int64_t cz = lo[0]; cz <= hi[0]; cz++)
+    for (int64_t cy = lo[1]; cy <= hi[1]; cy++)
+      for (int64_t cx = lo[2]; cx <= hi[2]; cx++) {
+        int st = S->cstat[((cz - S->clo[0]) * S->cdim[1] + (cy - S->clo[1])) * S->cdim[2] + (cx - S->clo[2])];
+        if (st == 2) return 2;
+        if (st) seen1 = 1; else seen0 = 1;
+        if (seen0 && seen1) return 2;
+      }
+  return seen1 ? 1 : 0;
+}
+
 /* ---------------------------------------------------------------- encoding */
 
-static void surf_encode_chunk(surf_state *S, int level, unsigned idx, const uint8_t *chunk, int tid) {
-  bool zero = true;
-  for (size_t k = 0; k < VOLCOMP_CHUNK_VOXELS && zero; k++) zero = chunk[k] == 0;
-  if (zero) return;
+/* `known` is 1 when the caller already knows the chunk holds data (the pooling sweep
+ * saw it), -1 when it does not know. */
+static void surf_encode_chunk(surf_state *S, int level, unsigned idx, const uint8_t *chunk, int tid, int known) {
+  double t0 = surf_now();
+  bool zero = known >= 0 ? known == 0 : true;
+  if (known < 0)
+    for (size_t k = 0; k < VOLCOMP_CHUNK_VOXELS && zero; k++) zero = chunk[k] == 0;
+  if (zero) {
+    S->sc[tid].cpu_encode0 += surf_now() - t0;
+    return;
+  }
   surf_scratch *sc = &S->sc[tid];
   size_t en = 0;
   if (volcomp_encode(chunk, S->cfg->q[level], sc->enc, VOLCOMP_ENCODE_BOUND, &en) != VOLCOMP_OK) {
@@ -323,6 +730,7 @@ static void surf_encode_chunk(surf_state *S, int level, unsigned idx, const uint
     }
     psnr = se == 0 ? 999.0 : 10.0 * log10(65025.0 * (double)VOLCOMP_CHUNK_VOXELS / se);
   }
+  S->sc[tid].cpu_encode0 += surf_now() - t0;
   pthread_mutex_lock(&S->lock);
   S->enc[level][idx] = keep;
   S->encn[level][idx] = en;
@@ -343,6 +751,13 @@ static void surf_level0_job(void *ctx, int64_t i, int tid) {
   const surf_cfg *cfg = S->cfg;
   surf_scratch *sc = &S->sc[tid];
   const int R = cfg->dmax;
+  double t_job = surf_now();
+  if (cfg->mask && !(cfg->mask[i >> 3] >> (i & 7) & 1)) {  /* the occupancy mask says: no data here */
+    pthread_mutex_lock(&S->lock);
+    S->res->skip_mask++;
+    pthread_mutex_unlock(&S->lock);
+    return;
+  }
   int64_t ci[3] = {i >> 6, (i >> 3) & 7, i & 7};
   int64_t o0[3], o1[3], ext[3];
   for (int d = 0; d < 3; d++) {
@@ -364,53 +779,85 @@ static void surf_level0_job(void *ctx, int64_t i, int tid) {
       return;
     }
   }
-  /* gather the mask sub-box */
-  for (int64_t z = 0; z < m[0]; z++)
-    for (int64_t y = 0; y < m[1]; y++) {
-      const uint8_t *s = S->mask + ((j0[0] + z - S->rlo[0]) * S->rn[1] + (j0[1] + y - S->rlo[1])) * S->rn[2] +
-                         (j0[2] - S->rlo[2]);
-      memcpy(sc->loc + (z * m[1] + y) * m[2], s, (size_t)m[2]);
-    }
-  uint8_t *ramp = sc->s;
-  surf_ramp_region(ramp, sc->loc, m[0], m[1], m[2], R, S->in_tab, S->out_tab, sc->a, sc->b, sc->ramp);
-  /* resample onto the exact ladder grid */
+  /* A uniform box needs no distance transform at all: all air -> the chunk is absent,
+   * all mask -> every voxel is dmax deep inside, so the ramp (and its resample, whose
+   * weights sum to one, and its pooling) is the constant 255. Both are common. */
+  int uni = surf_box_uniform(S, j0, m);
+  uint64_t vox = (uint64_t)(ext[0] * ext[1] * ext[2]);
+  if (uni == 0) {
+    pthread_mutex_lock(&S->lock);
+    S->res->skip_zero++;
+    S->res->out_voxels += vox;
+    pthread_mutex_unlock(&S->lock);
+    return;  /* all zero: no chunk, and the level-1 block is already zero */
+  }
   memset(sc->chunk, 0, VOLCOMP_CHUNK_VOXELS);
-  if (S->identity) {
+  if (uni == 1) {
     for (int64_t z = 0; z < ext[0]; z++)
-      for (int64_t y = 0; y < ext[1]; y++) {
-        const uint8_t *s = ramp + ((z + R) * m[1] + (y + R)) * m[2] + R;
-        memcpy(sc->chunk + (z * SURF_CHUNK + y) * SURF_CHUNK, s, (size_t)ext[2]);
-      }
+      for (int64_t y = 0; y < ext[1]; y++) memset(sc->chunk + (z * SURF_CHUNK + y) * SURF_CHUNK, 255, (size_t)ext[2]);
+    pthread_mutex_lock(&S->lock);
+    S->res->skip_full++;
+    pthread_mutex_unlock(&S->lock);
   } else {
-    for (int64_t z = 0; z < ext[0]; z++) {
-      double tz = (double)(o0[0] + z) * cfg->scale;
-      int64_t az = (int64_t)floor(tz) - j0[0];
-      double fz = tz - floor(tz), gz = 1.0 - fz;
-      for (int64_t y = 0; y < ext[1]; y++) {
-        double ty = (double)(o0[1] + y) * cfg->scale;
-        int64_t ay = (int64_t)floor(ty) - j0[1];
-        double fy = ty - floor(ty), gy = 1.0 - fy;
-        const uint8_t *p000 = ramp + (az * m[1] + ay) * m[2], *p001 = p000 + m[2];
-        const uint8_t *p100 = p000 + m[1] * m[2], *p101 = p100 + m[2];
-        uint8_t *d = sc->chunk + (z * SURF_CHUNK + y) * SURF_CHUNK;
-        for (int64_t x = 0; x < ext[2]; x++) {
-          double tx = (double)(o0[2] + x) * cfg->scale;
-          int64_t ax = (int64_t)floor(tx) - j0[2];
-          double fx = tx - floor(tx), gx = 1.0 - fx;
-          double v = gz * (gy * (gx * p000[ax] + fx * p000[ax + 1]) + fy * (gx * p001[ax] + fx * p001[ax + 1])) +
-                     fz * (gy * (gx * p100[ax] + fx * p100[ax + 1]) + fy * (gx * p101[ax] + fx * p101[ax + 1]));
-          v = floor(v + 0.5);
-          d[x] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+    /* the ramp, straight out of the assembled region, one z plane at a time; `ramp`
+     * holds the m[0] - 2R planes the resample can sample, plane 0 being box plane R */
+    const uint8_t *base = S->mask + ((j0[0] - S->rlo[0]) * S->rn[1] + (j0[1] - S->rlo[1])) * S->rn[2] +
+                          (j0[2] - S->rlo[2]);
+    uint8_t *ramp = sc->ramp;
+    surf_ramp_fused(base, S->rn[1] * S->rn[2], S->rn[2], m[0], m[1], m[2], R, S->in_tab, S->out_tab, ramp,
+                    sc->pool);
+    /* resample onto the exact ladder grid */
+    if (S->identity) {
+      for (int64_t z = 0; z < ext[0]; z++)
+        for (int64_t y = 0; y < ext[1]; y++) {
+          const uint8_t *s = ramp + (z * m[1] + (y + R)) * m[2] + R;
+          memcpy(sc->chunk + (z * SURF_CHUNK + y) * SURF_CHUNK, s, (size_t)ext[2]);
+        }
+    } else {
+      /* the sample position of every output voxel, once per axis instead of once per
+       * voxel (t >= 0, so the truncating cast is floor and the values are the same
+       * doubles the per-voxel form produced) */
+      for (int d = 0; d < 3; d++)
+        for (int64_t k = 0; k < ext[d]; k++) {
+          double t = (double)(o0[d] + k) * cfg->scale;
+          double fl = (double)(int64_t)t;
+          sc->ridx[d][k] = (int64_t)fl - j0[d];
+          sc->rfrac[d][k] = t - fl;
+          sc->rcofr[d][k] = 1.0 - (t - fl);
+        }
+      for (int64_t z = 0; z < ext[0]; z++) {
+        int64_t az = sc->ridx[0][z];
+        double fz = sc->rfrac[0][z], gz = sc->rcofr[0][z];
+        for (int64_t y = 0; y < ext[1]; y++) {
+          int64_t ay = sc->ridx[1][y];
+          double fy = sc->rfrac[1][y], gy = sc->rcofr[1][y];
+          const uint8_t *p000 = ramp + ((az - R) * m[1] + ay) * m[2], *p001 = p000 + m[2];
+          const uint8_t *p100 = p000 + m[1] * m[2], *p101 = p100 + m[2];
+          uint8_t *d = sc->chunk + (z * SURF_CHUNK + y) * SURF_CHUNK;
+          surf_lerp_row(d, ext[2], sc->ridx[2], sc->rfrac[2], sc->rcofr[2], p000, p001, p100, p101, fz, gz, fy, gy);
         }
       }
     }
   }
-  /* 2x mean pooling into the level-1 block of this chunk (disjoint per chunk) */
+  /* 2x mean pooling into the level-1 block of this chunk (disjoint per chunk); the
+   * same sweep answers "is this chunk all zero", so the encoder need not scan it */
   int64_t h[3] = {(ext[0] + 1) / 2, (ext[1] + 1) / 2, (ext[2] + 1) / 2};
   uint8_t *l1 = S->lvl[1];
   int64_t d1 = S->ldim[1];
+  unsigned nonzero = 0;
+  bool full = ext[0] == SURF_CHUNK && ext[1] == SURF_CHUNK && ext[2] == SURF_CHUNK;
   for (int64_t z = 0; z < h[0]; z++)
-    for (int64_t y = 0; y < h[1]; y++)
+    for (int64_t y = 0; y < h[1]; y++) {
+      int64_t oz = ci[0] * (SURF_CHUNK / 2) + z, oy = ci[1] * (SURF_CHUNK / 2) + y;
+      uint8_t *d = l1 + (oz * d1 + oy) * d1 + ci[2] * (SURF_CHUNK / 2);
+#if VF_HAVE_AVX2
+      if (full && vf_use_avx2()) {
+        const uint8_t *c = sc->chunk + ((2 * z) * SURF_CHUNK + 2 * y) * SURF_CHUNK;
+        nonzero |= surf_pool_rows_avx2(d, c, c + SURF_CHUNK, c + (int64_t)SURF_CHUNK * SURF_CHUNK,
+                                       c + (int64_t)SURF_CHUNK * SURF_CHUNK + SURF_CHUNK, h[2]);
+        continue;
+      }
+#endif
       for (int64_t x = 0; x < h[2]; x++) {
         unsigned sum = 0, cnt = 0;
         for (int64_t dz = 0; dz < 2 && 2 * z + dz < ext[0]; dz++)
@@ -419,32 +866,50 @@ static void surf_level0_job(void *ctx, int64_t i, int tid) {
               sum += sc->chunk[((2 * z + dz) * SURF_CHUNK + (2 * y + dy)) * SURF_CHUNK + 2 * x + dx];
               cnt++;
             }
-        int64_t oz = ci[0] * (SURF_CHUNK / 2) + z, oy = ci[1] * (SURF_CHUNK / 2) + y, ox = ci[2] * (SURF_CHUNK / 2) + x;
-        l1[(oz * d1 + oy) * d1 + ox] = (uint8_t)((sum + cnt / 2) / cnt);
+        nonzero |= sum != 0;
+        d[x] = (uint8_t)((sum + cnt / 2) / cnt);
       }
+    }
   pthread_mutex_lock(&S->lock);
-  S->res->out_voxels += (uint64_t)(ext[0] * ext[1] * ext[2]);
+  S->res->out_voxels += vox;
   pthread_mutex_unlock(&S->lock);
-  surf_encode_chunk(S, 0, (unsigned)i, sc->chunk, tid);
+  S->blk[i] = nonzero != 0;
+  sc->cpu_transform += surf_now() - t_job;
+  surf_encode_chunk(S, 0, (unsigned)i, sc->chunk, tid, nonzero != 0);
 }
 
-/* pool one level into the next inside the shard */
-static void surf_pool(surf_state *S, int level) {
+/* Pool one level into the next, block by block: level-0 chunk `i` owns a
+ * (128 >> level)^3 block at every level, and 128 >> level is even down to level 3,
+ * so no 2x2x2 group ever straddles two blocks. Blocks whose chunk produced no data
+ * are already zero and are skipped, which is most of a sparse unit. */
+static void surf_pool_job(void *ctx, int64_t i, int tid) {
+  surf_state *S = ctx;
+  (void)tid;
+  if (!S->blk[i]) return;
+  int level = S->level;
   const uint8_t *src = S->lvl[level - 1];
   uint8_t *dst = S->lvl[level];
   int64_t ds = S->ldim[level - 1], dd = S->ldim[level];
+  int64_t bs = SURF_CHUNK >> (level - 1), bd = SURF_CHUNK >> level;  /* block edge, src and dst */
+  int64_t ci[3] = {i >> 6, (i >> 3) & 7, i & 7};
   const int64_t *e = S->lext[level - 1];
-  for (int64_t z = 0; z < S->lext[level][0]; z++)
-    for (int64_t y = 0; y < S->lext[level][1]; y++)
-      for (int64_t x = 0; x < S->lext[level][2]; x++) {
+  int64_t o0[3], n[3];
+  for (int d = 0; d < 3; d++) {
+    o0[d] = ci[d] * bs;
+    n[d] = surf_min64(bs, e[d] - o0[d]);
+    if (n[d] <= 0) return;
+  }
+  for (int64_t z = 0; z < (n[0] + 1) / 2; z++)
+    for (int64_t y = 0; y < (n[1] + 1) / 2; y++)
+      for (int64_t x = 0; x < (n[2] + 1) / 2; x++) {
         unsigned sum = 0, cnt = 0;
-        for (int64_t dz = 0; dz < 2 && 2 * z + dz < e[0]; dz++)
-          for (int64_t dy = 0; dy < 2 && 2 * y + dy < e[1]; dy++)
-            for (int64_t dx = 0; dx < 2 && 2 * x + dx < e[2]; dx++) {
-              sum += src[((2 * z + dz) * ds + (2 * y + dy)) * ds + 2 * x + dx];
+        for (int64_t dz = 0; dz < 2 && 2 * z + dz < n[0]; dz++)
+          for (int64_t dy = 0; dy < 2 && 2 * y + dy < n[1]; dy++)
+            for (int64_t dx = 0; dx < 2 && 2 * x + dx < n[2]; dx++) {
+              sum += src[((o0[0] + 2 * z + dz) * ds + (o0[1] + 2 * y + dy)) * ds + o0[2] + 2 * x + dx];
               cnt++;
             }
-        dst[(z * dd + y) * dd + x] = (uint8_t)((sum + cnt / 2) / cnt);
+        dst[((ci[0] * bd + z) * dd + ci[1] * bd + y) * dd + ci[2] * bd + x] = (uint8_t)((sum + cnt / 2) / cnt);
       }
 }
 
@@ -453,6 +918,16 @@ static void surf_levelN_job(void *ctx, int64_t i, int tid) {
   int level = S->level;
   int64_t g = S->ldim[level] / SURF_CHUNK;
   int64_t ci[3] = {i / (g * g), (i / g) % g, i % g};
+  /* a level-L chunk covers the 2^L cube of level-0 chunks at 2^L * ci */
+  int any = 0;
+  for (int64_t dz = 0; dz < (1 << level) && !any; dz++)
+    for (int64_t dy = 0; dy < (1 << level) && !any; dy++)
+      for (int64_t dx = 0; dx < (1 << level); dx++)
+        if (S->blk[(((ci[0] << level) + dz) << 6) | (((ci[1] << level) + dy) << 3) | ((ci[2] << level) + dx)]) {
+          any = 1;
+          break;
+        }
+  if (!any) return;
   int64_t ext[3];
   for (int d = 0; d < 3; d++) {
     ext[d] = surf_min64(SURF_CHUNK, S->lext[level][d] - ci[d] * SURF_CHUNK);
@@ -466,7 +941,7 @@ static void surf_levelN_job(void *ctx, int64_t i, int tid) {
       memcpy(sc->chunk + (z * SURF_CHUNK + y) * SURF_CHUNK,
              S->lvl[level] + ((ci[0] * SURF_CHUNK + z) * dim + ci[1] * SURF_CHUNK + y) * dim + ci[2] * SURF_CHUNK,
              (size_t)ext[2]);
-  surf_encode_chunk(S, level, (unsigned)i, sc->chunk, tid);
+  surf_encode_chunk(S, level, (unsigned)i, sc->chunk, tid, -1);
 }
 
 /* --------------------------------------------------------------- shard file */
@@ -532,8 +1007,11 @@ static int surface_pack(const surf_cfg *cfg, surf_result *res) {
     S.rn[d] = s1 + cfg->dmax - S.rlo[d] + 1;
     S.clo[d] = surf_max64(S.rlo[d], 0) / cfg->csize;
     S.chi[d] = surf_min64(S.rlo[d] + S.rn[d] - 1, cfg->src_shape[d] - 1) / cfg->csize;
+    S.cdim[d] = S.chi[d] - S.clo[d] + 1;
   }
+  S.cstat = calloc(1, (size_t)(S.cdim[0] * S.cdim[1] * S.cdim[2]));
   S.mask = calloc(1, (size_t)(S.rn[0] * S.rn[1] * S.rn[2]));
+  if (!S.cstat) return 2;
   for (int L = 1; L < SURF_LEVELS; L++) S.lvl[L] = calloc(1, (size_t)(S.ldim[L] * S.ldim[L] * S.ldim[L]));
   if (!S.mask || !S.lvl[1] || !S.lvl[2] || !S.lvl[3]) {
     fprintf(stderr, "surface-pack: out of memory\n");
@@ -545,17 +1023,14 @@ static int surface_pack(const surf_cfg *cfg, surf_result *res) {
     S.mmax[d] = (int64_t)floor((double)(SURF_CHUNK - 1) * cfg->scale) + (S.identity ? 1 : 3) + 2 * cfg->dmax;
   size_t mcap = (size_t)(S.mmax[0] * S.mmax[1] * S.mmax[2]);
   for (int t = 0; t < S.nthreads; t++) {
-    S.sc[t].loc = malloc(mcap);
-    S.sc[t].s = malloc(mcap);
-    S.sc[t].a = malloc(mcap);
-    S.sc[t].b = malloc(mcap);
+    S.sc[t].pool = malloc((size_t)((5 + 2 * SURF_RING) * S.mmax[1] * S.mmax[2]));
     S.sc[t].ramp = malloc(mcap);
     S.sc[t].chunk = malloc(VOLCOMP_CHUNK_VOXELS);
     S.sc[t].enc = malloc(VOLCOMP_ENCODE_BOUND);
     S.sc[t].dec = malloc(VOLCOMP_CHUNK_VOXELS);
     S.sc[t].src = malloc((size_t)(cfg->csize * cfg->csize * cfg->csize));
     S.sc[t].tmp = malloc((size_t)(cfg->csize * cfg->csize * cfg->csize));
-    if (!S.sc[t].loc || !S.sc[t].s || !S.sc[t].a || !S.sc[t].b || !S.sc[t].ramp || !S.sc[t].chunk || !S.sc[t].enc ||
+    if (!S.sc[t].pool || !S.sc[t].ramp || !S.sc[t].chunk || !S.sc[t].enc ||
         !S.sc[t].dec || !S.sc[t].src || !S.sc[t].tmp) {
       fprintf(stderr, "surface-pack: out of memory\n");
       return 2;
@@ -574,8 +1049,15 @@ static int surface_pack(const surf_cfg *cfg, surf_result *res) {
   res->chunks[0] = SURF_MAX_CHUNKS;
   surf_parallel_for(SURF_MAX_CHUNKS, S.nthreads, surf_level0_job, &S);
   double t2 = surf_now();
+  for (int t = 0; t < S.nthreads; t++) {
+    res->cpu_transform += S.sc[t].cpu_transform;
+    res->cpu_encode0 += S.sc[t].cpu_encode0;
+  }
   if (S.error) return 3;
-  for (int L = 2; L < SURF_LEVELS; L++) surf_pool(&S, L);
+  for (int L = 2; L < SURF_LEVELS; L++) {
+    S.level = L;
+    surf_parallel_for(SURF_MAX_CHUNKS, S.nthreads, surf_pool_job, &S);
+  }
   for (int L = 1; L < SURF_LEVELS; L++) {
     int64_t g = S.ldim[L] / SURF_CHUNK;
     S.level = L;
@@ -605,13 +1087,200 @@ static int surface_pack(const surf_cfg *cfg, surf_result *res) {
   for (int L = 0; L < SURF_LEVELS; L++)
     for (unsigned i = 0; i < res->chunks[L]; i++) free(S.enc[L][i]);
   for (int t = 0; t < S.nthreads; t++) {
-    free(S.sc[t].loc), free(S.sc[t].s), free(S.sc[t].a), free(S.sc[t].b), free(S.sc[t].ramp);
+    free(S.sc[t].pool), free(S.sc[t].ramp);
     free(S.sc[t].chunk), free(S.sc[t].enc), free(S.sc[t].dec), free(S.sc[t].src), free(S.sc[t].tmp);
   }
   free(S.sc);
   free(S.mask);
+  free(S.cstat);
   for (int L = 1; L < SURF_LEVELS; L++) free(S.lvl[L]);
   pthread_mutex_destroy(&S.lock);
+  return 0;
+}
+
+/* --------------------------------------------------------- occupancy masks ---
+ * The published prediction pyramids are exact MAX pools (checked on the Paris 4
+ * recto's level 4 and the m7 models' level 3: the published coarse voxel equals
+ * the max of its level-0 block for 100 % of the voxels), so a zero voxel at a
+ * coarse level guarantees a whole block of zeros at level 0. That makes the
+ * coarsest published level a perfect occupancy oracle: one output chunk is
+ * "occupied" when any coarse voxel over the source footprint it reads - its
+ * resampled extent, the dmax ramp halo and the interpolation voxel, dilated by
+ * one coarse voxel - is nonzero. Everything else is air and its chunk is absent.
+ *
+ * This streams one chunk layer of the coarse level at a time and reduces it
+ * separably (x, then y, then z), with an early exit per output chunk, so the cost
+ * is a fraction of the coarse level and the memory is one layer plus the output
+ * chunk grid (one byte per 128^3 output chunk). */
+
+typedef struct {
+  int64_t lo, hi;  /* inclusive coarse-voxel range an output chunk index reads */
+} surf_range;
+
+/* Is one published coarse chunk the exact 2x MAX pool of the eight finer chunks under
+ * it? Returns the number of voxels that are zero in the coarse chunk although their
+ * 2^3 block is not - any of those would make the occupancy mask drop published data, so
+ * the coordinator only builds masks for a prediction whose sampled chunks all return 0.
+ * `fine[i]` is the file for sub-position (i>>2, (i>>1)&1, i&1), or NULL for absent. */
+static inline int surf_maxpool_check(const char *coarse_path, const char *const fine[8], int64_t C,
+                                     uint64_t *misses, uint64_t *coarse_nz, uint64_t *pool_nz) {
+  size_t n = 0;
+  uint8_t *dec = malloc((size_t)(C * C * C)), *tmp = malloc((size_t)(C * C * C));
+  uint8_t *coarse = calloc(1, (size_t)(C * C * C)), *finev = calloc(1, (size_t)(8 * C * C * C));
+  if (!dec || !tmp || !coarse || !finev) return 2;
+  const char *err = NULL;
+  uint8_t *raw = shard_read_file(coarse_path, &n);
+  if (raw) {
+    if (blosc1_decompress(raw, n, coarse, (size_t)(C * C * C), tmp, (size_t)(C * C * C), &err) != C * C * C) {
+      fprintf(stderr, "surface-maxpool-check: %s: %s\n", coarse_path, err ? err : "short chunk");
+      return 3;
+    }
+    free(raw);
+  }
+  for (int i = 0; i < 8; i++) {
+    if (!fine[i]) continue;
+    raw = shard_read_file(fine[i], &n);
+    if (!raw) continue;
+    if (blosc1_decompress(raw, n, dec, (size_t)(C * C * C), tmp, (size_t)(C * C * C), &err) != C * C * C) {
+      fprintf(stderr, "surface-maxpool-check: %s: %s\n", fine[i], err ? err : "short chunk");
+      return 3;
+    }
+    free(raw);
+    int64_t o[3] = {(i >> 2) * C, ((i >> 1) & 1) * C, (i & 1) * C};
+    for (int64_t z = 0; z < C; z++)
+      for (int64_t y = 0; y < C; y++)
+        memcpy(finev + (((o[0] + z) * 2 * C + o[1] + y) * 2 * C + o[2]), dec + (z * C + y) * C, (size_t)C);
+  }
+  uint64_t miss = 0, cnz = 0, pnz = 0;
+  for (int64_t z = 0; z < C; z++)
+    for (int64_t y = 0; y < C; y++)
+      for (int64_t x = 0; x < C; x++) {
+        unsigned any = 0;
+        for (int dz = 0; dz < 2; dz++)
+          for (int dy = 0; dy < 2; dy++)
+            for (int dx = 0; dx < 2; dx++)
+              any |= finev[(((2 * z + dz) * 2 * C + 2 * y + dy) * 2 * C) + 2 * x + dx];
+        unsigned c = coarse[(z * C + y) * C + x];
+        cnz += c != 0;
+        pnz += any != 0;
+        if (any && !c) miss++;
+      }
+  free(dec), free(tmp), free(coarse), free(finev);
+  if (misses) *misses = miss;
+  if (coarse_nz) *coarse_nz = cnz;
+  if (pool_nz) *pool_nz = pnz;
+  return 0;
+}
+
+/* the coarse range one output chunk index reads along one axis */
+static inline surf_range surf_chunk_range(int64_t c, int64_t out_extent, double scale, int dmax, int64_t factor,
+                                   int dilate, int64_t coarse_n, bool identity) {
+  int64_t o0 = c * SURF_CHUNK, o1 = surf_min64(o0 + SURF_CHUNK, out_extent);
+  int64_t j0 = (int64_t)floor((double)o0 * scale) - dmax;
+  int64_t j1 = (int64_t)floor((double)(o1 - 1) * scale) + (identity ? 0 : 1) + dmax;
+  surf_range r = {j0 / factor - dilate, j1 / factor + dilate};
+  if (r.lo < 0) r.lo = 0;
+  if (r.hi > coarse_n - 1) r.hi = coarse_n - 1;
+  return r;
+}
+
+/* out.bin: 64 bytes per output shard (bit (cz*8+cy)*8+cx), shards in z, y, x order -
+ * the same layout the CT occupancy pass writes, so the coordinator stores it the same way. */
+static inline int surface_occupancy(const char *dir, const char *out_path, int64_t csize, const int64_t coarse[3],
+                             int64_t factor, const int64_t out_shape[3], double scale, int dmax, int dilate,
+                             uint64_t *n_occ, uint64_t *n_tot) {
+  const bool identity = scale == 1.0;
+  int64_t cg[3];        /* output chunk grid */
+  int64_t sg[3];        /* output shard grid */
+  for (int d = 0; d < 3; d++) {
+    cg[d] = (out_shape[d] + SURF_CHUNK - 1) / SURF_CHUNK;
+    sg[d] = (out_shape[d] + SURF_SHARD - 1) / SURF_SHARD;
+  }
+  surf_range *rz = malloc((size_t)cg[0] * sizeof *rz), *ry = malloc((size_t)cg[1] * sizeof *ry),
+             *rx = malloc((size_t)cg[2] * sizeof *rx);
+  for (int64_t c = 0; c < cg[0]; c++) rz[c] = surf_chunk_range(c, out_shape[0], scale, dmax, factor, dilate, coarse[0], identity);
+  for (int64_t c = 0; c < cg[1]; c++) ry[c] = surf_chunk_range(c, out_shape[1], scale, dmax, factor, dilate, coarse[1], identity);
+  for (int64_t c = 0; c < cg[2]; c++) rx[c] = surf_chunk_range(c, out_shape[2], scale, dmax, factor, dilate, coarse[2], identity);
+  uint8_t *grid = calloc(1, (size_t)(cg[0] * cg[1] * cg[2]));
+  int64_t lchunks[3] = {(coarse[0] + csize - 1) / csize, (coarse[1] + csize - 1) / csize,
+                        (coarse[2] + csize - 1) / csize};
+  int64_t ly = lchunks[1] * csize, lx = lchunks[2] * csize;  /* padded layer extent */
+  uint8_t *layer = malloc((size_t)(csize * ly * lx));
+  uint8_t *dec = malloc((size_t)(csize * csize * csize)), *tmp = malloc((size_t)(csize * csize * csize));
+  uint8_t *ax = malloc((size_t)(ly * cg[2]));  /* per coarse y: which output chunks x are hit */
+  uint8_t *by = malloc((size_t)(cg[1] * cg[2]));
+  if (!grid || !layer || !dec || !tmp || !ax || !by || !rz || !ry || !rx) {
+    fprintf(stderr, "surface-occupancy: out of memory\n");
+    return 2;
+  }
+  for (int64_t lz = 0; lz < lchunks[0]; lz++) {
+    memset(layer, 0, (size_t)(csize * ly * lx));
+    for (int64_t cy = 0; cy < lchunks[1]; cy++)
+      for (int64_t cx = 0; cx < lchunks[2]; cx++) {
+        char path[4096];
+        snprintf(path, sizeof path, "%s/%lld_%lld_%lld.blosc", dir, (long long)lz, (long long)cy, (long long)cx);
+        size_t n = 0;
+        uint8_t *raw = shard_read_file(path, &n);
+        if (!raw) continue;
+        const char *err = NULL;
+        int64_t got = blosc1_decompress(raw, n, dec, (size_t)(csize * csize * csize), tmp,
+                                        (size_t)(csize * csize * csize), &err);
+        free(raw);
+        if (got != csize * csize * csize) {
+          fprintf(stderr, "surface-occupancy: %s: %s\n", path, err ? err : "short chunk");
+          return 3;
+        }
+        for (int64_t z = 0; z < csize; z++)
+          for (int64_t y = 0; y < csize; y++)
+            memcpy(layer + (z * ly + cy * csize + y) * lx + cx * csize, dec + (z * csize + y) * csize,
+                   (size_t)csize);
+      }
+    for (int64_t z = 0; z < csize; z++) {
+      int64_t gz = lz * csize + z;
+      if (gz >= coarse[0]) break;
+      const uint8_t *plane = layer + z * ly * lx;
+      for (int64_t y = 0; y < coarse[1]; y++) {
+        const uint8_t *row = plane + y * lx;
+        uint8_t *o = ax + y * cg[2];
+        for (int64_t c = 0; c < cg[2]; c++) {
+          uint8_t hit = 0;
+          for (int64_t x = rx[c].lo; x <= rx[c].hi && !hit; x++) hit = row[x] != 0;
+          o[c] = hit;
+        }
+      }
+      memset(by, 0, (size_t)(cg[1] * cg[2]));
+      for (int64_t c = 0; c < cg[1]; c++)
+        for (int64_t y = ry[c].lo; y <= ry[c].hi; y++)
+          for (int64_t x = 0; x < cg[2]; x++) by[c * cg[2] + x] |= ax[y * cg[2] + x];
+      for (int64_t c = 0; c < cg[0]; c++) {
+        if (gz < rz[c].lo || gz > rz[c].hi) continue;
+        uint8_t *g = grid + (c * cg[1]) * cg[2];
+        for (int64_t i = 0; i < cg[1] * cg[2]; i++) g[i] |= by[i];
+      }
+    }
+  }
+  /* pack into one 64-byte mask per shard */
+  size_t nsh = (size_t)(sg[0] * sg[1] * sg[2]);
+  uint8_t *masks = calloc(nsh, 64);
+  uint64_t occ = 0;
+  for (int64_t cz = 0; cz < cg[0]; cz++)
+    for (int64_t cy = 0; cy < cg[1]; cy++)
+      for (int64_t cx = 0; cx < cg[2]; cx++) {
+        if (!grid[(cz * cg[1] + cy) * cg[2] + cx]) continue;
+        size_t sidx = (size_t)(((cz / 8) * sg[1] + cy / 8) * sg[2] + cx / 8);
+        unsigned bit = (unsigned)(((cz % 8) * 8 + cy % 8) * 8 + cx % 8);
+        masks[sidx * 64 + bit / 8] |= (uint8_t)(1u << (bit % 8));
+        occ++;
+      }
+  FILE *f = fopen(out_path, "wb");
+  if (!f || fwrite(masks, 64, nsh, f) != nsh) {
+    fprintf(stderr, "surface-occupancy: cannot write %s\n", out_path);
+    return 2;
+  }
+  fclose(f);
+  if (n_occ) *n_occ = occ;
+  if (n_tot) *n_tot = (uint64_t)(cg[0] * cg[1] * cg[2]);
+  free(grid), free(layer), free(dec), free(tmp), free(ax), free(by), free(masks), free(rz), free(ry), free(rx);
   return 0;
 }
 

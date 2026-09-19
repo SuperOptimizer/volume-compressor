@@ -344,6 +344,150 @@ def surface_info(name, za0, zattrs):
     }
 
 
+def surface_coarse_level(pred, info):
+    """The coarsest published level of a prediction and how many level-0 voxels one of its
+    voxels spans. The published pyramids are exact max pools, so a zero there is a
+    guaranteed block of zeros at level 0."""
+    best = None
+    for k in range(9, -1, -1):
+        za = read_json(f"{pred}{k}/.zarray")
+        if za is not None:
+            best = (k, za)
+            break
+    if best is None:
+        return None
+    k, za = best
+    if len(set(za["chunks"])) != 1:
+        return None
+    return {"level": k, "factor": 2 ** k, "shape": [int(n) for n in za["shape"]], "csize": int(za["chunks"][0])}
+
+
+def surface_maxpool_verified(pred, coarse, a):
+    """Is this prediction's pyramid an exact max pool, all the way down to level 0? The
+    occupancy mask is only sound if a zero coarse voxel guarantees a zero block at level 0,
+    and that is NOT true of every published pyramid: the m7 models' levels are downsampled
+    probabilities re-thresholded (level 1 of the PHercMANBp m7 has 1.7 % of its voxels zero
+    over a nonzero 2^3 block), while the PHercParis4 recto's pyramid is an exact max pool at
+    every level. So sample chunks of every level pair from the coarse level down to 1,
+    compare each with the eight chunks below it, and only use the mask when all match."""
+    k0, C = coarse["level"], coarse["csize"]
+    if k0 < 1:
+        return False
+    work = tempfile.mkdtemp(prefix="surfchk-", dir=a.tmp)
+    try:
+        checked = 0
+        for k in range(k0, 0, -1):
+            za = read_json(f"{pred}{k}/.zarray")
+            if za is None or za["chunks"][0] != C:
+                print(f"  occupancy: level {k} is missing or not chunked {C}^3 -> no mask", flush=True)
+                return False
+            grid = [max(1, math.ceil(n / C)) for n in za["shape"]]
+            coords = [(cz, cy, cx) for cz in range(grid[0]) for cy in range(grid[1]) for cx in range(grid[2])]
+            n = max(1, min(a.occupancy_samples, len(coords)))
+            picks = [coords[(i * len(coords)) // n] for i in range(n)]
+            for c in picks:
+                def get(level, cc, name):
+                    data = http_get(BUCKET + "/" + urllib.parse.quote(f"{pred}{level}/{cc[0]}/{cc[1]}/{cc[2]}"))
+                    if data is None:
+                        return "-"
+                    path = os.path.join(work, name)
+                    with open(path, "wb") as f:
+                        f.write(data)
+                    return path
+
+                coarse_file = get(k, c, "c.blosc")
+                fine = [get(k - 1, (2 * c[0] + dz, 2 * c[1] + dy, 2 * c[2] + dx), f"f{dz}{dy}{dx}.blosc")
+                        for dz in range(2) for dy in range(2) for dx in range(2)]
+                if coarse_file == "-" and all(f == "-" for f in fine):
+                    continue
+                r = subprocess.run([a.volcomp, "surface-maxpool-check",
+                                    coarse_file if coarse_file != "-" else "/dev/null", *fine, f"--csize={C}"],
+                                   capture_output=True, text=True)
+                if r.returncode:
+                    print(f"  occupancy: max-pool check failed to run: {r.stderr[-300:]}", file=sys.stderr)
+                    return False
+                kv = dict(re.findall(r"(\w+)=(\d+)", r.stdout))
+                if int(kv.get("misses", 1)):
+                    print(f"  occupancy: level {k} chunk {c} is NOT the max pool of level {k - 1} "
+                          f"({kv['misses']} voxels zero over a nonzero block) -> no mask for this prediction",
+                          flush=True)
+                    return False
+                if int(kv.get("pooled_nonzero", 0)):
+                    checked += 1
+        if not checked:
+            print("  occupancy: no sampled chunk held data; not trusting the pyramid", flush=True)
+            return False
+        print(f"  occupancy: levels {k0}..0 verified as exact max pools on {checked} sampled chunks", flush=True)
+        return True
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def surface_occupancy(db, pred, info, a):
+    """Per-unit 512-bit chunk masks from the coarsest published level, exactly as the CT
+    occupancy pass does it: units with est = 0 are marked done on the spot (a missing shard
+    key is the fill value) and the workers only fetch source chunks that an occupied chunk
+    reads."""
+    coarse = surface_coarse_level(pred, info)
+    if coarse is None:
+        print(f"{pred}: no usable coarse level; every chunk stays occupied", file=sys.stderr)
+        return
+    os.makedirs(a.tmp, exist_ok=True)
+    if not surface_maxpool_verified(pred, coarse, a):
+        return  # every chunk stays occupied; the exact skips inside surface-pack still apply
+    work = tempfile.mkdtemp(prefix="surfocc-", dir=a.tmp)
+    t0 = time.time()
+    try:
+        C = coarse["csize"]
+        grid = [math.ceil(n / C) for n in coarse["shape"]]
+        keys = [(cz, cy, cx) for cz in range(grid[0]) for cy in range(grid[1]) for cx in range(grid[2])]
+
+        def fetch(c):
+            data = http_get(BUCKET + "/" + urllib.parse.quote(f"{pred}{coarse['level']}/{c[0]}/{c[1]}/{c[2]}"))
+            if data is None:
+                return 0
+            with open(os.path.join(work, f"{c[0]}_{c[1]}_{c[2]}.blosc"), "wb") as f:
+                f.write(data)
+            return 1
+
+        with concurrent.futures.ThreadPoolExecutor(a.threads) as ex:
+            got = sum(ex.map(fetch, keys))
+        t1 = time.time()
+        out = os.path.join(work, "masks.bin")
+        r = subprocess.run([a.volcomp, "surface-occupancy", work, out, f"--csize={C}",
+                            "--coarse-shape={},{},{}".format(*coarse["shape"]),
+                            f"--factor={coarse['factor']}",
+                            "--out-shape={},{},{}".format(*info["out_shape"]),
+                            "--scale=%.17g" % info["scale"], f"--dmax={info['encoding']['dmax']}",
+                            "--dilate=1"], capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError(f"surface-occupancy failed for {pred}: {r.stderr[-500:]}")
+        with open(out, "rb") as f:
+            masks = f.read()
+        sg = shard_grid(info["out_shape"])
+        assert len(masks) == sg[0] * sg[1] * sg[2] * 64, (len(masks), sg)
+        rows, empties, est_sum = [], [], 0
+        for uid, sz, sy, sx in db.execute("SELECT id, sz, sy, sx FROM unit WHERE volume=?", (pred,)):
+            i = ((sz * sg[1] + sy) * sg[2] + sx) * 64
+            m = masks[i:i + 64]
+            est = int.from_bytes(m, "little").bit_count()
+            est_sum += est
+            rows.append((est, m if est else None, uid))
+            if est == 0:
+                empties.append((uid,))
+        db.execute("BEGIN")
+        db.executemany("UPDATE unit SET est=?, mask=? WHERE id=?", rows)
+        n_skip = db.executemany("UPDATE unit SET state='done', bytes=0, present=0, done_at=strftime('%s','now'), "
+                                "error='occupancy:empty', worker=NULL, lease_until=NULL WHERE id=? "
+                                "AND state IN ('todo','failed')", empties).rowcount
+        db.execute("COMMIT")
+        print(f"  occupancy: level {coarse['level']} {coarse['shape']} ({got}/{len(keys)} chunks, "
+              f"{t1 - t0:.0f}s dl, {time.time() - t1:.0f}s scan): {est_sum}/{len(rows) * 512} chunks occupied, "
+              f"{len(empties)}/{len(rows)} units empty ({n_skip} marked done)", flush=True)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def cmd_manifest_surfaces(a):
     db = open_db(a.db)
     if a.volume:
@@ -374,7 +518,11 @@ def cmd_manifest_surfaces(a):
         n_new += max(0, cur.rowcount)
         print(f"{p}: native {info['native_um']:.4f}um -> rung {info['rung_um']}um "
               f"(scale {info['scale']:.5f}), {info['src_shape']} -> {info['out_shape']}, "
-              f"chunks {info['csize']}, levels {[lv['path'] for lv in info['levels']]}, {len(rows)} units")
+              f"chunks {info['csize']}, levels {[lv['path'] for lv in info['levels']]}, {len(rows)} units",
+              flush=True)
+        if not a.no_occupancy:
+            os.makedirs(a.tmp, exist_ok=True)
+            surface_occupancy(db, p, info, a)
     total = db.execute("SELECT COUNT(*) FROM unit").fetchone()[0]
     print(f"manifest-surfaces: {n_new} new units, {total} total")
 
@@ -542,7 +690,8 @@ class Coordinator:
                 lv = meta["levels"][:SURF_LEVELS]
                 unit.update(shape=meta["out_shape"], src_shape=meta["src_shape"], csize=meta["csize"],
                             scale=meta["scale"], dmax=meta["encoding"]["dmax"],
-                            q=[x["q"] for x in lv], paths=[x["path"] for x in lv])
+                            q=[x["q"] for x in lv], paths=[x["path"] for x in lv],
+                            mask=mask.hex() if mask else None)
             else:
                 unit.update(shape=meta[lvl]["shape"], q=level_q(lvl), mask=mask.hex() if mask else None)
             self.db.execute("UPDATE unit SET state='leased', worker=?, lease_until=?, attempts=attempts+1 WHERE id=?",
@@ -832,6 +981,13 @@ def main():
     p = sub.add_parser("manifest-surfaces", help="queue the published surface predictions")
     p.add_argument("--db", required=True)
     p.add_argument("--volume", action="append", help="bucket prefix of one prediction (repeatable); default: all")
+    p.add_argument("--volcomp", default="volcomp")
+    p.add_argument("--tmp", default="/var/tmp/volcomp-occ")
+    p.add_argument("--threads", type=int, default=16)
+    p.add_argument("--no-occupancy", action="store_true",
+                   help="skip the occupancy masks (every chunk is then assumed occupied)")
+    p.add_argument("--occupancy-samples", type=int, default=6,
+                   help="coarse chunks compared with the level below before trusting the pyramid")
     p.set_defaults(fn=cmd_manifest_surfaces)
     p = sub.add_parser("pool-levels", help="build the coarse levels of the predictions offline")
     p.add_argument("--db", required=True)

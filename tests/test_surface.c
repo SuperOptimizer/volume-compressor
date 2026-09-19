@@ -4,6 +4,7 @@
 #include "check.h"
 #include "surface_pack.h"
 
+#include <stdbool.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -444,12 +445,311 @@ static void test_pool_shard(void) {
   }
 }
 
-int main(void) {
+static int main_tests(void);
+
+/* ---------------- 6. golden bytes: a dense and a sparse unit, end to end -----
+ * Hashes of the four shard files of two synthetic units, at the real quantisers.
+ * The constants were produced by the build BEFORE surface-pack was optimised
+ * (uniform-box and occupancy skips, AVX2 min-plus, fused ramp pipeline, AVX2
+ * resample and pooling): every one of those is required to be byte-identical, and
+ * this is what says so. Run this file with --print to regenerate them. */
+static uint64_t fnv1a(const uint8_t *p, size_t n) {
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull;
+  return h;
+}
+/* a synthetic prediction: `dense` fills the unit with sheets, otherwise it holds
+ * two small blobs and is empty everywhere else (the common case in the bucket) */
+static void golden_mask(uint8_t *m, int64_t S0, int64_t S1, int64_t S2, bool dense) {
+  for (int64_t z = 0; z < S0; z++)
+    for (int64_t y = 0; y < S1; y++)
+      for (int64_t x = 0; x < S2; x++) {
+        int on;
+        if (dense)
+          on = (x + z / 3) % 23 < 3 || (y + x / 5) % 31 < 2 ||
+               ((z - 200) * (z - 200) + (y - 150) * (y - 150) + (x - 150) * (x - 150) < 3600);
+        else
+          on = ((z - 70) * (z - 70) + (y - 60) * (y - 60) + (x - 50) * (x - 50) < 400) ||
+               ((z - 300) * (z - 300) + (y - 260) * (y - 260) + (x - 300) * (x - 300) < 144);
+        m[(z * S1 + y) * S2 + x] = on ? 255 : 0;
+      }
+}
+static void golden_unit(bool dense, bool lossless, int print, const uint64_t want[4]) {
+  char dir[] = "/tmp/volcomp_golden_XXXXXX";
+  CHECK(mkdtemp(dir) != NULL);
+  char src[4096], out[4096];
+  snprintf(src, sizeof src, "%s/src", dir);
+  snprintf(out, sizeof out, "%s/out", dir);
+  mkdir(src, 0700);
+  mkdir(out, 0700);
+  const int64_t S0 = 400, S1 = 330, S2 = 350, csize = 192;
+  uint8_t *mask = malloc((size_t)(S0 * S1 * S2));
+  golden_mask(mask, S0, S1, S2, dense);
+  uint8_t *chunk = malloc((size_t)(csize * csize * csize));
+  uint8_t *cbuf = malloc((size_t)(csize * csize * csize) + BLOSC1_HEADER);
+  for (int64_t cz = 0; cz * csize < S0; cz++)
+    for (int64_t cy = 0; cy * csize < S1; cy++)
+      for (int64_t cx = 0; cx * csize < S2; cx++) {
+        memset(chunk, 0, (size_t)(csize * csize * csize));
+        int any = 0;
+        for (int64_t z = 0; z < csize && cz * csize + z < S0; z++)
+          for (int64_t y = 0; y < csize && cy * csize + y < S1; y++)
+            for (int64_t x = 0; x < csize && cx * csize + x < S2; x++) {
+              uint8_t v = mask[((cz * csize + z) * S1 + cy * csize + y) * S2 + cx * csize + x];
+              chunk[(z * csize + y) * csize + x] = v;
+              any |= v != 0;
+            }
+        if (!any) continue;
+        size_t bn = blosc_memcpyed(cbuf, chunk, (size_t)(csize * csize * csize));
+        char p[4200];
+        snprintf(p, sizeof p, "%s/%lld_%lld_%lld.blosc", src, (long long)cz, (long long)cy, (long long)cx);
+        FILE *f = fopen(p, "wb");
+        CHECK(f && fwrite(cbuf, 1, bn, f) == bn);
+        if (f) fclose(f);
+      }
+  const double scale = 9.6 / 9.362;  /* a real rung snap: 9.362 um onto the 9.6 um rung */
+  surf_cfg cfg = {.srcdir = src,
+                  .outdir = out,
+                  .csize = csize,
+                  .src_shape = {S0, S1, S2},
+                  .shard = {0, 0, 0},
+                  .scale = scale,
+                  .dmax = SURF_DMAX,
+                  .threads = 3,
+                  .samples = 8};
+  for (int L = 0; L < SURF_LEVELS; L++)
+    cfg.q[L] = lossless ? VOLCOMP_Q_LOSSLESS : (L == 0 ? 2.0f : 1.0f);
+  for (int d = 0; d < 3; d++) cfg.out_shape[d] = (int64_t)floor((double)cfg.src_shape[d] / scale + 0.5);
+  surf_result res;
+  CHECK_EQ(surface_pack(&cfg, &res), 0);
+  for (int L = 0; L < SURF_LEVELS; L++) {
+    char p[4200];
+    snprintf(p, sizeof p, "%s/%d.shard", out, L);
+    size_t n = 0;
+    uint8_t *img = shard_read_file(p, &n);
+    uint64_t h = img ? fnv1a(img, n) : 0;
+    if (print)
+      printf("  0x%016llxull, /* %s %s level %d: %zu bytes */\n", (unsigned long long)h,
+             dense ? "dense" : "sparse", lossless ? "lossless" : "q", L, n);
+    else
+      CHECK_EQ(h, (int64_t)want[L]);
+    free(img);
+  }
+  free(mask), free(chunk), free(cbuf);
+  char cmd[4300];
+  snprintf(cmd, sizeof cmd, "rm -rf %s", dir);
+  if (system(cmd)) { /* best effort */
+  }
+}
+/* q = 0: the lossless mode has no float math, so these hold on every build and
+ * pin the transform itself (the ramp, the resample and the pooling). */
+static const uint64_t golden_dense_l[4] = {
+    0xaf598eed7eb514b2ull, /* level 0: 14879274 bytes */
+    0x303907b8be7f0ae8ull, /* level 1: 2418235 bytes */
+    0x4884ba471fd2bb6full, /* level 2: 399457 bytes */
+    0x5df650d90bde7807ull, /* level 3: 73616 bytes */
+};
+static const uint64_t golden_sparse_l[4] = {
+    0x187be9a7d082e0a2ull, /* level 0: 49175 bytes */
+    0x645fc722436c31d7ull, /* level 1: 10497 bytes */
+    0xc6dabd613b401a4cull, /* level 2: 2318 bytes */
+    0xedd5c2622c021a5cull, /* level 3: 1079 bytes */
+};
+/* the real quantisers (q 2 / 1 / 1 / 1). volcomp's own DCT kernels are allowed to
+ * differ by a bit between the AVX2 and the plain C kernel sets (spec "Cross-build
+ * agreement"), so these are checked on the AVX2 kernels the fleet runs on. */
+static const uint64_t golden_dense_q[4] = {
+    0x83ba9af17a9ef3d2ull, /* level 0: 3681737 bytes */
+    0xd8fbccd6b6fb1927ull, /* level 1: 1144917 bytes */
+    0xf082226ed9cffb74ull, /* level 2: 208541 bytes */
+    0x5b56069797689574ull, /* level 3: 29777 bytes */
+};
+static const uint64_t golden_sparse_q[4] = {
+    0x661c1774bffc3f85ull, /* level 0: 19849 bytes */
+    0x41495d0bbfe5f12cull, /* level 1: 10718 bytes */
+    0x035174f8e93db178ull, /* level 2: 6313 bytes */
+    0xb7c1d17ef34ef5eeull, /* level 3: 2665 bytes */
+};
+
+/* ------------- 7. the occupancy mask and the max-pool it depends on --------- */
+static void test_occupancy(void) {
+  char dir[] = "/tmp/volcomp_occ_XXXXXX";
+  CHECK(mkdtemp(dir) != NULL);
+  char l0[4096], l5[4096], out[4096];
+  snprintf(l0, sizeof l0, "%s/l0", dir);
+  snprintf(l5, sizeof l5, "%s/l5", dir);
+  snprintf(out, sizeof out, "%s/out", dir);
+  mkdir(l0, 0700);
+  mkdir(l5, 0700);
+  mkdir(out, 0700);
+  const int64_t S0 = 400, S1 = 330, S2 = 350, csize = 192, factor = 32;
+  uint8_t *mask = malloc((size_t)(S0 * S1 * S2));
+  golden_mask(mask, S0, S1, S2, false); /* the sparse unit: two small blobs */
+  /* level 0 chunks */
+  uint8_t *chunk = malloc((size_t)(csize * csize * csize));
+  uint8_t *cbuf = malloc((size_t)(csize * csize * csize) + BLOSC1_HEADER);
+  for (int64_t cz = 0; cz * csize < S0; cz++)
+    for (int64_t cy = 0; cy * csize < S1; cy++)
+      for (int64_t cx = 0; cx * csize < S2; cx++) {
+        memset(chunk, 0, (size_t)(csize * csize * csize));
+        int any = 0;
+        for (int64_t z = 0; z < csize && cz * csize + z < S0; z++)
+          for (int64_t y = 0; y < csize && cy * csize + y < S1; y++)
+            for (int64_t x = 0; x < csize && cx * csize + x < S2; x++) {
+              uint8_t v = mask[((cz * csize + z) * S1 + cy * csize + y) * S2 + cx * csize + x];
+              chunk[(z * csize + y) * csize + x] = v;
+              any |= v != 0;
+            }
+        if (!any) continue;
+        size_t bn = blosc_memcpyed(cbuf, chunk, (size_t)(csize * csize * csize));
+        char p[4200];
+        snprintf(p, sizeof p, "%s/%lld_%lld_%lld.blosc", l0, (long long)cz, (long long)cy, (long long)cx);
+        FILE *f = fopen(p, "wb");
+        CHECK(f && fwrite(cbuf, 1, bn, f) == bn);
+        if (f) fclose(f);
+      }
+  /* the "published" coarse level: an exact 32x max pool, one chunk */
+  int64_t c0 = (S0 + factor - 1) / factor, c1 = (S1 + factor - 1) / factor, c2 = (S2 + factor - 1) / factor;
+  memset(chunk, 0, (size_t)(csize * csize * csize));
+  for (int64_t z = 0; z < S0; z++)
+    for (int64_t y = 0; y < S1; y++)
+      for (int64_t x = 0; x < S2; x++)
+        if (mask[(z * S1 + y) * S2 + x])
+          chunk[((z / factor) * csize + y / factor) * csize + x / factor] = 255;
+  {
+    size_t bn = blosc_memcpyed(cbuf, chunk, (size_t)(csize * csize * csize));
+    char p[4200];
+    snprintf(p, sizeof p, "%s/0_0_0.blosc", l5);
+    FILE *f = fopen(p, "wb");
+    CHECK(f && fwrite(cbuf, 1, bn, f) == bn);
+    if (f) fclose(f);
+  }
+  const double scale = 9.6 / 9.362;
+  int64_t coarse_shape[3] = {c0, c1, c2}, src_shape[3] = {S0, S1, S2}, out_shape[3];
+  for (int d = 0; d < 3; d++) out_shape[d] = (int64_t)floor((double)src_shape[d] / scale + 0.5);
+  char maskfile[4200];
+  snprintf(maskfile, sizeof maskfile, "%s/masks.bin", dir);
+  uint64_t occ = 0, tot = 0;
+  CHECK_EQ(surface_occupancy(l5, maskfile, csize, coarse_shape, factor, out_shape, scale, SURF_DMAX, 1, &occ,
+                             &tot),
+           0);
+  size_t mn = 0;
+  uint8_t *masks = shard_read_file(maskfile, &mn);
+  CHECK(masks != NULL && mn == 64);       /* one shard */
+  CHECK(occ > 0 && occ < tot);            /* the sparse unit is mostly air */
+  /* the mask must not change a single byte: it may only drop chunks that are all air */
+  surf_cfg cfg = {.srcdir = l0,
+                  .outdir = out,
+                  .csize = csize,
+                  .src_shape = {S0, S1, S2},
+                  .shard = {0, 0, 0},
+                  .scale = scale,
+                  .q = {VOLCOMP_Q_LOSSLESS, VOLCOMP_Q_LOSSLESS, VOLCOMP_Q_LOSSLESS, VOLCOMP_Q_LOSSLESS},
+                  .mask = masks,
+                  .dmax = SURF_DMAX,
+                  .threads = 2,
+                  .samples = 8};
+  for (int d = 0; d < 3; d++) cfg.out_shape[d] = out_shape[d];
+  surf_result res;
+  CHECK_EQ(surface_pack(&cfg, &res), 0);
+  CHECK(res.skip_mask > 0);
+  for (int L = 0; L < SURF_LEVELS; L++) {
+    char p[4200];
+    snprintf(p, sizeof p, "%s/%d.shard", out, L);
+    size_t n = 0;
+    uint8_t *img = shard_read_file(p, &n);
+    CHECK_EQ(img ? fnv1a(img, n) : 0, (int64_t)golden_sparse_l[L]);
+    free(img);
+  }
+  /* and the check that guards it: this pyramid is a max pool, a thinned one is not */
+  free(masks), free(mask), free(chunk), free(cbuf);
+  char cmd[4300];
+  snprintf(cmd, sizeof cmd, "rm -rf %s", dir);
+  if (system(cmd)) { /* best effort */
+  }
+}
+
+/* the guard itself: an exact max pool passes, a pyramid that lost a thin sheet does not */
+static void test_maxpool_check(void) {
+  char dir[] = "/tmp/volcomp_mp_XXXXXX";
+  CHECK(mkdtemp(dir) != NULL);
+  const int64_t C = 64;
+  uint8_t *fine = calloc(1, (size_t)(C * C * C)), *coarse = calloc(1, (size_t)(C * C * C));
+  uint8_t *buf = malloc((size_t)(C * C * C) + BLOSC1_HEADER);
+  uint32_t rs = 4242;
+  for (int64_t i = 0; i < C * C * C; i++) fine[i] = (vt_rng(&rs) % 9) == 0 ? 255 : 0;
+  for (int64_t z = 0; z < C / 2; z++)  /* the true max pool of the (0,0,0) sub-block */
+    for (int64_t y = 0; y < C / 2; y++)
+      for (int64_t x = 0; x < C / 2; x++) {
+        unsigned any = 0;
+        for (int dz = 0; dz < 2; dz++)
+          for (int dy = 0; dy < 2; dy++)
+            for (int dx = 0; dx < 2; dx++) any |= fine[((2 * z + dz) * C + 2 * y + dy) * C + 2 * x + dx];
+        coarse[(z * C + y) * C + x] = (uint8_t)(any ? 255 : 0);
+      }
+  char cp[4200], fp[4200];
+  snprintf(cp, sizeof cp, "%s/c.blosc", dir);
+  snprintf(fp, sizeof fp, "%s/f.blosc", dir);
+  for (int pass = 0; pass < 2; pass++) {
+    if (pass) {  /* lose one coarse voxel, as a re-thresholded probability pyramid does */
+      for (int64_t i = 0; i < C * C * C; i++)
+        if (coarse[i]) {
+          coarse[i] = 0;
+          break;
+        }
+    }
+    FILE *f = fopen(cp, "wb");
+    size_t bn = blosc_memcpyed(buf, coarse, (size_t)(C * C * C));
+    CHECK(f && fwrite(buf, 1, bn, f) == bn);
+    if (f) fclose(f);
+    f = fopen(fp, "wb");
+    bn = blosc_memcpyed(buf, fine, (size_t)(C * C * C));
+    CHECK(f && fwrite(buf, 1, bn, f) == bn);
+    if (f) fclose(f);
+    const char *fines[8] = {fp, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
+    uint64_t misses = 0, cnz = 0, pnz = 0;
+    CHECK_EQ(surf_maxpool_check(cp, fines, C, &misses, &cnz, &pnz), 0);
+    CHECK(pnz > 0);
+    CHECK_EQ(misses, pass ? 1 : 0);
+  }
+  free(fine), free(coarse), free(buf);
+  char cmd[4300];
+  snprintf(cmd, sizeof cmd, "rm -rf %s", dir);
+  if (system(cmd)) { /* best effort */
+  }
+}
+
+
+int main(int argc, char **argv) {
+  if (argc > 1 && !strcmp(argv[1], "--print")) {
+    printf("static const uint64_t golden_dense_l[4] = {\n");
+    golden_unit(true, true, 1, NULL);
+    printf("};\nstatic const uint64_t golden_sparse_l[4] = {\n");
+    golden_unit(false, true, 1, NULL);
+    printf("};\nstatic const uint64_t golden_dense_q[4] = {\n");
+    golden_unit(true, false, 1, NULL);
+    printf("};\nstatic const uint64_t golden_sparse_q[4] = {\n");
+    golden_unit(false, false, 1, NULL);
+    printf("};\n");
+    return 0;
+  }
+  golden_unit(true, true, 0, golden_dense_l);
+  golden_unit(false, true, 0, golden_sparse_l);
+  if (vf_use_avx2()) {
+    golden_unit(true, false, 0, golden_dense_q);
+    golden_unit(false, false, 0, golden_sparse_q);
+  }
+  return main_tests();
+}
+
+static int main_tests(void) {
   test_ramp_values();
   test_tiling();
   test_blosc_fixture();
   test_end_to_end(1.0, 192);   /* identity ladder, source chunks larger than the output tiling */
   test_end_to_end(1.25, 128);
-  test_pool_shard();  /* resampled onto the exact rung */
+  test_pool_shard();
+  test_occupancy();
+  test_maxpool_check();
   TEST_END();
 }

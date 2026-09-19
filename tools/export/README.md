@@ -54,9 +54,10 @@ The bucket also publishes 43 **surface predictions**
 masks (uint8, only 0 and 255) in blosc/zstd zarr v2, chunked 128³ / 192³ / 256³.
 They are exported as a second kind of unit, in their own shape:
 
-- **What is read.** Only level `0` of each prediction. Its own pyramid is a
-  nearest/max copy of a binary mask and is thrown away; ours is built from the
-  data.
+- **What is read.** Only level `0` of each prediction; its own pyramid is a binary
+  copy and never becomes output data — ours is built from the ramp. The coarsest
+  published level is still used, as an occupancy oracle, but only where it is
+  provably an exact max pool (see below).
 - **The ramp.** The mask becomes a continuous *signed-distance ramp*: with `s`
   the signed Euclidean distance to the mask boundary in source voxels, positive
   inside, clipped to ±3, the stored value is `round(127.5 + 42.5 * s)` — inside
@@ -107,6 +108,38 @@ They are exported as a second kind of unit, in their own shape:
   resumable (an output shard that exists is left alone), and it can read the level
   below from a local tree or over HTTPS from the published one.
 
+### Occupancy masks, and the pyramid that is not a max pool
+
+The published prediction pyramids are cheap occupancy oracles **when they are exact
+max pools**: a zero coarse voxel then guarantees a whole block of zeros at level 0,
+so a unit's 512 output chunks can be masked before any worker touches them, exactly
+as the CT `occupancy` pass does it. `manifest-surfaces` builds those masks per
+prediction: it downloads the coarsest published level, reduces it separably to one
+bit per 128³ output chunk (the chunk's resampled source extent, the ramp halo and
+the interpolation voxel, dilated by one coarse voxel), stores the 512-bit mask and
+`est` per unit, and marks `est = 0` units done on the spot.
+
+**It verifies the pyramid first, and not every prediction passes.** `volcomp
+surface-maxpool-check` compares a sampled chunk of each level with the eight chunks
+below it; only a prediction whose whole chain is an exact max pool gets masks.
+
+- PHercParis4 `recto-2um-ps256` (76 800 units, 69 % of the export): levels 5..0
+  verified as exact max pools on 15 sampled chunks. The mask marks **50 509 of the
+  76 800 units empty** (65.8 %, done without a worker round-trip) and leaves
+  **11 424 267 of 39 321 600 chunks** occupied — 71 % of the chunks never touched.
+  The whole pass costs ~2.5 minutes, most of it the verification downloads.
+- The m7 predictions (the other 42): **not max pools**. Their coarse levels are
+  downsampled probabilities re-thresholded, so they *lose* structure going up:
+  level 1 of the PHercMANBp m7 has 279 598 voxels (1.7 % of a chunk) that are zero
+  over a nonzero 2³ block, and a coarse voxel at level 5 reads zero where its
+  level-0 block holds 11 781 nonzero voxels. Using them as an oracle silently drops
+  published data — it dropped exactly one 128³ chunk in a test unit before the
+  check was added. They are exported with every chunk occupied; the exact skips
+  below cost them nothing.
+
+Use `--no-occupancy` to skip the pass entirely, `--occupancy-samples N` to widen the
+verification.
+
 ### The hot path is C
 
 `volcomp surface-pack` does everything numeric in one invocation per unit, with
@@ -121,7 +154,8 @@ volcomp surface-pack SRCDIR OUTDIR --csize=192 --src-shape=4287,3145,3145 \
 #    present0=489 bytes0=19157548 present1=64 ... bytes=27765986
 ```
 
-`SRCDIR` holds the raw source chunks the worker downloaded, named
+`--mask` is the unit's 512-bit occupancy mask (128 hex digits) when the prediction
+has one. `SRCDIR` holds the raw source chunks the worker downloaded, named
 `<cz>_<cy>_<cx>.blosc` by their absolute source chunk index (a missing file is an
 absent, all-zero chunk); `OUTDIR` gets `0.shard` .. `3.shard`. The tool decodes
 the blosc1/zstd containers itself (`tools/cli/blosc1.h`, ~80 lines against
@@ -138,20 +172,57 @@ covering its footprint plus the halo (threads, standard library), run the C tool
 upload one shard per level, report. **The VMs stay standard-library only** — no
 numpy, no scipy; `bootstrap.sh` adds `libzstd-dev` for the build.
 
-Measured on a 24-core laptop, one 1024³ unit of the PHercMANBp m7 prediction
-(9.6 um, 192³ source chunks) straight from S3: **1.4 s** to download its 203
-stored source chunks (18.6 MB), **0.33 s** to decode them, **4.9 s** for ramp +
-resample + pooling, **0.25 s** to encode, 1.8 GB peak RSS. Single-threaded the
-transform runs at **2.4e7 output voxels/s/core** (47.8 s for the unit); with 24
-threads the whole unit takes 5.6 s. Output for that unit: 19.2 MB at 9.6 um
-(q 2), 6.7 MB at 19.2, 1.6 MB at 38.4, 0.34 MB at 76.8 — 27.8 MB for a 1024³
-region whose binary source is 18.6 MB of blosc over a slightly larger footprint
-(a ramp carries more than a threshold, and we add three levels).
+**What a unit costs.** The transform runs one thread per output chunk and skips
+what it can prove is uniform:
+
+- an output chunk the occupancy mask clears is never touched (`skip_mask`);
+- a chunk whose haloed source box meets only all-air source chunks is absent, and
+  one that meets only all-mask chunks is the constant 255 — no distance transform,
+  no resample (`skip_zero`, `skip_full`). Source chunks are classified as air /
+  mask / mixed as they are decoded, so this costs nothing to find out. **A sparse
+  unit now costs what its data costs**, not what its footprint costs;
+- the coarse levels only pool and encode the 128³ blocks whose level-0 chunk
+  produced data.
+
+The rest is the ramp itself, which walks its sub-box **once**: for each z plane it
+builds both seed planes straight out of the assembled region, runs the x and y
+min-plus passes into two 7-plane rings (~300 KB per thread, L2 resident) and, as
+soon as a plane has its full ±3 neighbourhood, runs the z pass and writes that ramp
+plane. Both min-plus passes, the table lookup, the trilinear resample and the 2×
+pooling have AVX2 kernels (32 uint8 lanes for the distance passes, four output
+voxels at a time for the resample, `maddubs` for the pooling) with the scalar
+kernels kept and selected at runtime, exactly as `volcomp.h` does it. The AVX2 and
+scalar kernels are byte-identical, and so is the whole optimised pipeline against
+the straightforward one: `tests/test_surface.c` pins 16 golden hashes of a dense and
+a sparse unit (four levels each, lossless and at the real quantisers), generated
+from the build before any of this.
+
+Measured on a 24-thread laptop, one 1024³ unit of the PHercMANBp m7 prediction
+(9.6 µm, 192³ source chunks) straight from S3, best of three:
+
+| | ramp + resample + pool + level-0 encode | |
+|---|---|---|
+| dense unit (203 source chunks, 489 chunks out) | before | after |
+| 1 thread | 37.6 s | **7.0 s** |
+| 4 threads (the VM class) | 10.7 s | **2.0 s** |
+| 24 threads | 4.9 s | **1.3 s** |
+| sparse unit (2 source chunks of 216, 6 chunks out) | | |
+| 4 threads, whole unit wall clock | 9.5 s | **0.07 s** |
+
+That stage still contains the level-0 encode and verify (2.6 CPU-seconds, untouched
+by any of this); the transform alone went from 40.2 to 6.2 CPU-seconds on the dense
+unit, 6.4×. Peak RSS is 1.27 GB dense, 58 MB sparse. The rest of the unit: 1.4 s to
+download its 203 stored source chunks (18.6 MB), 0.7 s to blosc-decode them, 0.3 s
+to encode levels 1..3. Output for that unit: 19.2 MB at 9.6 µm (q 2), 6.7 MB at
+19.2, 1.6 MB at 38.4, 0.34 MB at 76.8 — 27.8 MB for a 1024³ region whose binary
+source is 18.6 MB of blosc over a slightly larger footprint (a ramp carries more
+than a threshold, and we add three levels).
 
 ### Run it
 
 ```sh
-sudo volcomp-coordinator manifest-surfaces --db /var/lib/volcomp/export.db
+sudo volcomp-coordinator manifest-surfaces --db /var/lib/volcomp/export.db \
+     --volcomp /usr/local/bin/volcomp --tmp /var/tmp/volcomp-occ    # + the occupancy masks
 sudo volcomp-coordinator metadata --db /var/lib/volcomp/export.db --out /var/lib/volcomp/meta
 volcomp-worker upload-tree /var/lib/volcomp/meta --sftp ... --netrc ...
 tools/export/fleet.py bootstrap --role worker --kind surface ...     # PARALLEL=1, all cores in C
@@ -159,9 +230,10 @@ tools/export/fleet.py bootstrap --role worker --kind surface ...     # PARALLEL=
 volcomp-coordinator pool-levels --db export.db --volcomp volcomp --src /tree --out /tree
 ```
 
-No occupancy pass is needed: a surface unit lists the source rows it needs
-(`<pred>0/<cz>/<cy>/`), so absent chunks cost no GETs and a 404 can never be
-mistaken for a transient failure.
+A surface unit lists the source rows it needs (`<pred>0/<cz>/<cy>/`) before
+downloading, so absent chunks cost no GETs and a 404 can never be mistaken for a
+transient failure; with an occupancy mask it only lists and fetches the chunks an
+occupied output chunk actually reads.
 
 Local dry run, exactly as for CT but with `manifest-surfaces`; the offline
 end-to-end test does precisely this against a synthetic bucket:

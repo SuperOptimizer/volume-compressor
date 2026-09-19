@@ -193,9 +193,29 @@ def download_shard(unit, workdir, pool):
 # ----------------------------------------------------------------------------- surface predictions
 
 
+def surface_box(unit, c):
+    """The source voxel range `volcomp surface-pack` reads for one output chunk of the unit
+    (c = the chunk's index within the shard, 0..7 per axis): its resampled extent, one voxel
+    for the trilinear interpolation and dmax for the ramp, clipped to the source array."""
+    scale, dmax = float(unit["scale"]), int(unit.get("dmax", 3))
+    identity = scale == 1.0
+    lo, hi = [], []
+    for d in range(3):
+        o0 = unit["shard"][d] * 1024 + c[d] * 128
+        o1 = min(o0 + 128, unit["shape"][d])
+        if o1 <= o0:
+            return None
+        s0 = math.floor(o0 * scale)
+        s1 = math.floor((o1 - 1) * scale) + (0 if identity else 1)
+        lo.append(max(0, s0 - dmax))
+        hi.append(min(unit["src_shape"][d] - 1, s1 + dmax))
+        if hi[d] < lo[d]:
+            return None
+    return lo, hi
+
+
 def surface_footprint(unit):
-    """The source voxel range one unit needs: its output footprint mapped back through
-    the resample, plus 1 voxel for the trilinear interpolation and dmax for the ramp."""
+    """The source voxel range of the whole unit (the union of its chunks' boxes)."""
     scale, dmax = float(unit["scale"]), int(unit.get("dmax", 3))
     identity = scale == 1.0
     lo, hi = [], []
@@ -209,27 +229,52 @@ def surface_footprint(unit):
     return lo, hi
 
 
+def surface_needed_chunks(unit):
+    """The source chunks the unit will actually read. With an occupancy mask (from the
+    prediction's coarsest published level, which is an exact max pool) only the chunks that
+    an occupied output chunk reads are fetched; without one, the whole footprint."""
+    C = int(unit["csize"])
+    mask = bytes.fromhex(unit["mask"]) if unit.get("mask") else None
+    if mask is None:
+        lo, hi = surface_footprint(unit)
+        return {(cz, cy, cx)
+                for cz in range(lo[0] // C, hi[0] // C + 1)
+                for cy in range(lo[1] // C, hi[1] // C + 1)
+                for cx in range(lo[2] // C, hi[2] // C + 1)}
+    need = set()
+    for bit in range(512):
+        if not mask[bit >> 3] >> (bit & 7) & 1:
+            continue
+        box = surface_box(unit, ((bit >> 6) & 7, (bit >> 3) & 7, bit & 7))
+        if box is None:
+            continue
+        lo, hi = box
+        for cz in range(lo[0] // C, hi[0] // C + 1):
+            for cy in range(lo[1] // C, hi[1] // C + 1):
+                for cx in range(lo[2] // C, hi[2] // C + 1):
+                    need.add((cz, cy, cx))
+    return need
+
+
 def download_surface(unit, workdir, pool):
-    """Fetch every stored source chunk covering the footprint into workdir/<cz>_<cy>_<cx>.blosc.
+    """Fetch every stored source chunk the unit reads into workdir/<cz>_<cy>_<cx>.blosc.
     Each (cz, cy) row is listed first, so absent (masked) chunks cost no GETs and a 404 can
     never be confused with a transient failure."""
-    vol, C = unit["volume"], int(unit["csize"])
-    lo, hi = surface_footprint(unit)
-    rng = [range(lo[d] // C, hi[d] // C + 1) for d in range(3)]
-    rows = [(cz, cy) for cz in rng[0] for cy in rng[1]]
+    vol = unit["volume"]
+    need = surface_needed_chunks(unit)
+    rows = sorted({(cz, cy) for cz, cy, _ in need})
     listed = list(pool.map(lambda r: s3_list_row(f"{vol}0/{r[0]}/{r[1]}/"), rows))
-    jobs, n_in_grid = [], 0
-    for (cz, cy), keys in zip(rows, listed):
-        for cx in rng[2]:
-            n_in_grid += 1
-            key = f"{vol}0/{cz}/{cy}/{cx}"
-            if key.encode() not in keys:
-                continue
-            jobs.append(pool.submit(fetch_source_chunk, key, os.path.join(workdir, f"{cz}_{cy}_{cx}.blosc")))
+    have = set().union(*listed) if listed else set()
+    jobs = []
+    for cz, cy, cx in sorted(need):
+        key = f"{vol}0/{cz}/{cy}/{cx}"
+        if key.encode() not in have:
+            continue
+        jobs.append(pool.submit(fetch_source_chunk, key, os.path.join(workdir, f"{cz}_{cy}_{cx}.blosc")))
     present = 0
     for j in jobs:
         present += bool(j.result())
-    return n_in_grid, present
+    return len(need), present
 
 
 def fetch_source_chunk(key, dest):
@@ -266,6 +311,7 @@ def process_surface_unit(unit, a, pool):
                              "--scale=%.17g" % unit["scale"],
                              "--q=" + ",".join("%g" % q for q in unit["q"]),
                              f"--dmax={unit.get('dmax', 3)}",
+                             *( [f"--mask={unit['mask']}"] if unit.get("mask") else [] ),
                              f"--threads={a.threads}", f"--samples={a.samples}"]))
         t2 = time.time()
         size, npresent = 0, 0
@@ -283,6 +329,8 @@ def process_surface_unit(unit, a, pool):
         t3 = time.time()
         log(f"done #{unit['id']} {unit['volume']} {unit['shard']}: {present}/{n_jobs} source chunks, "
             f"{npresent} chunks out, {size / 1e6:.1f} MB, psnr_min {info.get('psnr_min', 0):.1f}, "
+            f"skipped {info.get('skip_mask', 0)} masked + {info.get('skip_zero', 0)} air + "
+            f"{info.get('skip_full', 0)} solid of 512, "
             f"dl {t1 - t0:.1f}s pack {t2 - t1:.1f}s (ramp {info.get('t_ramp', 0)}s) up {t3 - t2:.1f}s")
         return {"id": unit["id"], "bytes": size, "present": npresent,
                 "psnr_min": info.get("psnr_min"), "max_err": info.get("max_err")}

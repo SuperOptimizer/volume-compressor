@@ -11,7 +11,7 @@
  *       dilated by D voxels, is nonzero); --shards emits 64-byte per-shard chunk bitmasks.
  *       Used on a downsampled level to know which chunks of finer levels hold data.
  *   volcomp surface-pack SRCDIR OUTDIR --csize=C --src-shape=Z,Y,X --out-shape=Z,Y,X --shard=SZ,SY,SX
- *       [--scale=S] [--q=Q0,Q1,Q2,Q3] [--threads=N] [--samples=N] [--dmax=3]
+ *       [--scale=S] [--q=Q0,Q1,Q2,Q3] [--mask=HEX] [--threads=N] [--samples=N] [--dmax=3]
  *       one export unit of a surface-prediction volume: blosc/zstd source chunks ->
  *       signed-distance ramp -> exact-ladder resample -> levels 0..3 shard files
  *   volcomp shard-pool out.shard --q=Q --shape=Z,Y,X --pos=SZ,SY,SX in0 .. in7
@@ -320,6 +320,21 @@ static int surface_cli(int argc, char **argv) {
   }
   if (!parse_i64_3(argc, argv, "--out-shape=", cfg.out_shape))
     for (int d = 0; d < 3; d++) cfg.out_shape[d] = (int64_t)floor((double)cfg.src_shape[d] / cfg.scale + 0.5);
+  uint8_t maskbuf[64];
+  for (int i = 2; i < argc; i++)
+    if (!strncmp(argv[i], "--mask=", 7)) {
+      const char *h = argv[i] + 7;
+      if (strlen(h) != 128) {
+        fprintf(stderr, "--mask needs 128 hex digits (a 512-bit chunk mask)\n");
+        return 1;
+      }
+      for (int b = 0; b < 64; b++) {
+        unsigned v = 0;
+        if (sscanf(h + b * 2, "%2x", &v) != 1) return 1;
+        maskbuf[b] = (uint8_t)v;
+      }
+      cfg.mask = maskbuf;
+    }
   if (cfg.csize <= 0 || cfg.dmax < 1 || cfg.dmax > 3 || cfg.scale <= 0) {
     fprintf(stderr, "surface-pack: bad --csize / --dmax / --scale\n");
     return 1;
@@ -329,16 +344,56 @@ static int surface_cli(int argc, char **argv) {
   if (rc) return rc;
   double vox = (double)r.out_voxels, secs = r.t_ramp > 0 ? r.t_ramp : 1e-9;
   printf("ok src_chunks=%llu src_nonzero=%d out_voxels=%llu compared=%u psnr_min=%.2f max_err=%u "
-         "t_decode=%.2f t_ramp=%.2f t_encode=%.2f vox_per_s=%.3g vox_per_s_core=%.3g",
+         "t_decode=%.2f t_ramp=%.2f t_encode=%.2f cpu_transform=%.2f cpu_encode0=%.2f "
+         "skip_mask=%u skip_zero=%u skip_full=%u vox_per_s=%.3g vox_per_s_core=%.3g",
          (unsigned long long)r.src_chunks, (int)r.src_nonzero, (unsigned long long)r.out_voxels, r.compared,
-         r.compared ? r.psnr_min : 0.0, r.max_err, r.t_decode, r.t_ramp, r.t_encode, vox / secs,
-         vox / secs / cfg.threads);
+         r.compared ? r.psnr_min : 0.0, r.max_err, r.t_decode, r.t_ramp, r.t_encode, r.cpu_transform,
+         r.cpu_encode0, r.skip_mask, r.skip_zero, r.skip_full, vox / secs, vox / secs / cfg.threads);
   uint64_t total = 0;
   for (int L = 0; L < SURF_LEVELS; L++) {
     printf(" present%d=%u bytes%d=%llu", L, r.present[L], L, (unsigned long long)r.bytes[L]);
     total += r.bytes[L];
   }
   printf(" bytes=%llu\n", (unsigned long long)total);
+  return 0;
+}
+static int surface_maxpool_check_cli(int argc, char **argv) {
+  /* volcomp surface-maxpool-check coarse.blosc f000 .. f111 --csize=C  ("-" = absent) */
+  long csize = parse_opt(argc, argv, "--csize=", 0);
+  const char *fine[8] = {0};
+  int n = 0;
+  for (int i = 3; i < argc && n < 8; i++) {
+    if (!strncmp(argv[i], "--", 2)) continue;
+    fine[n++] = strcmp(argv[i], "-") ? argv[i] : NULL;
+  }
+  if (csize < 1 || n != 8) {
+    fprintf(stderr, "surface-maxpool-check needs --csize=C, one coarse chunk and 8 finer chunks\n");
+    return 1;
+  }
+  uint64_t misses = 0, cnz = 0, pnz = 0;
+  int rc = surf_maxpool_check(argv[2], fine, csize, &misses, &cnz, &pnz);
+  if (rc) return rc;
+  printf("ok misses=%llu coarse_nonzero=%llu pooled_nonzero=%llu\n", (unsigned long long)misses,
+         (unsigned long long)cnz, (unsigned long long)pnz);
+  return 0;
+}
+static int surface_occupancy_cli(int argc, char **argv) {
+  /* volcomp surface-occupancy DIR out.bin --csize=C --coarse-shape=Z,Y,X --factor=F
+   *                           --out-shape=Z,Y,X [--scale=S] [--dmax=3] [--dilate=1] */
+  int64_t coarse[3], out_shape[3];
+  long factor = parse_opt(argc, argv, "--factor=", 0), csize = parse_opt(argc, argv, "--csize=", 0);
+  long dmax = parse_opt(argc, argv, "--dmax=", SURF_DMAX), dilate = parse_opt(argc, argv, "--dilate=", 1);
+  double scale = parse_double(argc, argv, "--scale=", 1.0);
+  if (!parse_i64_3(argc, argv, "--coarse-shape=", coarse) || !parse_i64_3(argc, argv, "--out-shape=", out_shape) ||
+      factor < 1 || csize < 1 || scale <= 0) {
+    fprintf(stderr, "surface-occupancy needs --csize=C --coarse-shape=Z,Y,X --factor=F --out-shape=Z,Y,X\n");
+    return 1;
+  }
+  uint64_t occ = 0, tot = 0;
+  int rc = surface_occupancy(argv[2], argv[3], csize, coarse, factor, out_shape, scale, (int)dmax, (int)dilate,
+                             &occ, &tot);
+  if (rc) return rc;
+  printf("ok occupied=%llu chunks=%llu\n", (unsigned long long)occ, (unsigned long long)tot);
   return 0;
 }
 static int surface_pool_cli(int argc, char **argv) {
@@ -371,7 +426,9 @@ static int usage(void) {
                   "  volcomp verify in.volc ref.u8\n  volcomp shard-pack DIR out.shard --q=Q\n"
                   "  volcomp shard-verify in.shard DIR [--samples=N]\n"
                   "  volcomp occupancy in.u8|DIR out.bin [--shape=Z,Y,X] [--factor=F] [--dilate=D] [--grid=GZ,GY,GX] [--shards] [--chunks]\n"
-                  "  volcomp surface-pack SRCDIR OUTDIR --csize=C --src-shape=Z,Y,X --out-shape=Z,Y,X --shard=SZ,SY,SX [--scale=S] [--q=Q0,Q1,Q2,Q3] [--threads=N] [--samples=N]\n"
+                  "  volcomp surface-pack SRCDIR OUTDIR --csize=C --src-shape=Z,Y,X --out-shape=Z,Y,X --shard=SZ,SY,SX [--scale=S] [--q=Q0,Q1,Q2,Q3] [--mask=HEX] [--threads=N] [--samples=N]\n"
+                  "  volcomp surface-maxpool-check coarse.blosc f000 .. f111 --csize=C\n"
+                  "  volcomp surface-occupancy DIR out.bin --csize=C --coarse-shape=Z,Y,X --factor=F --out-shape=Z,Y,X [--scale=S] [--dilate=1]\n"
                   "  volcomp shard-pool out.shard --q=Q --shape=Z,Y,X --pos=SZ,SY,SX in0 .. in7\n"
                   "  volcomp label-encode DIR out.voll --q=Q [--q-plane=CLS=Q ...]\n"
                   "  volcomp label-decode in.voll DIR\n  volcomp label-verify in.voll DIR\n"
@@ -445,6 +502,8 @@ int main(int argc, char **argv) {
   if (!strcmp(cmd, "occupancy")) return occupancy(argc, argv);
   if (!strcmp(cmd, "surface-pack")) return surface_cli(argc, argv);
   if (!strcmp(cmd, "shard-pool")) return surface_pool_cli(argc, argv);
+  if (!strcmp(cmd, "surface-occupancy")) return surface_occupancy_cli(argc, argv);
+  if (!strcmp(cmd, "surface-maxpool-check")) return surface_maxpool_check_cli(argc, argv);
   if (!strcmp(cmd, "label-encode")) return label_encode(argc, argv);
   if (!strcmp(cmd, "label-decode")) return label_decode(argc, argv);
   if (!strcmp(cmd, "label-verify")) return label_verify(argc, argv);
