@@ -9,6 +9,15 @@ Compute VMs run tools/export/worker.py against the HTTP API below.
       Enumerate the public S3 bucket, read every uncompressed volume's zarr v2
       metadata and insert all (volume, level, shard) units. Re-runnable: units
       already present are left alone (progress is never lost).
+  coordinator.py manifest-surfaces --db export.db [--volume PREFIX ...]
+      The same for the published surface predictions
+      (<Scroll>/representations/predictions/surfaces/*.zarr): resolve each one's
+      native voxel size, snap it to the ladder rung, and insert one unit per
+      1024^3 output shard. A unit emits the four finest levels at once.
+  coordinator.py pool-levels --db export.db --volcomp PATH --src DIR|URL --out DIR
+      Build the coarse levels (everything above the four a unit writes) offline
+      by 2x mean pooling, one 128^3 shard at a time. Streaming and resumable:
+      shards that already exist under --out are skipped.
   coordinator.py metadata  --db export.db --out DIR [--q 8]
       Write the zarr v3 group/array metadata (OME-Zarr 0.5 multiscales,
       sharding_indexed 1024^3 -> 128^3, codec "volcomp" with q = 8 at level 0,
@@ -39,6 +48,7 @@ import concurrent.futures
 import json
 import math
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -53,10 +63,50 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-BUCKET = "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com"
+# the open-data bucket over plain HTTPS; VOLCOMP_S3_ENDPOINT points the whole
+# pipeline at another S3-style endpoint (the offline end-to-end test serves one)
+BUCKET = os.environ.get("VOLCOMP_S3_ENDPOINT", "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com")
 SHARD = 1024
 CHUNK = 128
 Q_NATIVE = 8.0
+
+# ----------------------------------------------------------------- the resolution ladder
+#
+# THE quality schedule of the export, in one place: q is a function of the
+# PHYSICAL voxel size of a level, not of its index. The ladder is the power of
+# two grid rung k = 0.6 * 2^k um, and every exported array lives exactly on it:
+#
+#   rung k    0      1      2      3      4      5      6 ...
+#   um        0.6    1.2    2.4    4.8    9.6    19.2   38.4 ...
+#   q         32     16     8      4      2      1      1
+#
+# so a 2.4 um array is q 8 and each 2x downscale halves q down to 1 (downscaling
+# averages noise away, so coarser levels keep more per voxel). The CT export
+# still uses level_q() below; it is the same rule for a 2.4 um scan and can move
+# over to rung_q() at its next re-export.
+RUNG0_UM = 0.6
+Q_RUNG0 = 32.0
+LADDER_TOP = 11  # 1228.8 um: the whole scroll fits one 128^3 chunk at this rung
+
+
+def rung_um(k):
+    """Exact voxel size of rung k, in micrometres."""
+    return round(RUNG0_UM * 2 ** k, 4)
+
+
+def rung_name(k):
+    """Directory name of rung k: "0.6", "1.2", ... "1228.8" (exact spellings)."""
+    return f"{rung_um(k):.1f}"
+
+
+def rung_of(um):
+    """The rung a measured voxel size snaps to (nearest in log2: 9.362 and 8.640 -> 9.6)."""
+    return min(range(LADDER_TOP + 1), key=lambda k: abs(math.log2(um / rung_um(k))))
+
+
+def rung_q(k):
+    """Quantiser for an array whose voxels are rung k."""
+    return max(1.0, Q_RUNG0 / 2 ** k)
 
 
 def level_q(level, q0=Q_NATIVE):
@@ -112,7 +162,9 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS volume (
   name TEXT PRIMARY KEY,              -- e.g. PHerc0009B/volumes/2025...-masked.zarr
   zattrs TEXT NOT NULL,               -- source .zattrs (multiscales), verbatim
-  levels TEXT NOT NULL                -- JSON: {level: {"shape": [z,y,x]}}
+  levels TEXT NOT NULL,               -- JSON: {level: {"shape": [z,y,x]}}
+  kind TEXT NOT NULL DEFAULT 'ct',    -- 'ct' | 'surface'
+  info TEXT                           -- surface: JSON (ladder, scale, csize, per-level paths)
 );
 CREATE TABLE IF NOT EXISTS unit (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,8 +191,11 @@ def open_db(path):
     for col, typ in (("est", "INTEGER"), ("mask", "BLOB")):  # databases created before the occupancy pass
         if col not in have:
             db.execute(f"ALTER TABLE unit ADD COLUMN {col} {typ}")
-    if "occ_level" not in {r[1] for r in db.execute("PRAGMA table_info(volume)")}:
-        db.execute("ALTER TABLE volume ADD COLUMN occ_level INTEGER")
+    have_v = {r[1] for r in db.execute("PRAGMA table_info(volume)")}
+    for col, typ, dflt in (("occ_level", "INTEGER", ""), ("kind", "TEXT", " NOT NULL DEFAULT 'ct'"),
+                           ("info", "TEXT", "")):
+        if col not in have_v:
+            db.execute(f"ALTER TABLE volume ADD COLUMN {col} {typ}{dflt}")
     return db
 
 
@@ -197,6 +252,129 @@ def cmd_manifest(a):
     print(f"manifest: {n_new} new units, {total} total")
 
 
+# ------------------------------------------------------------------- surface predictions
+
+SURF_PREFIX = "representations/predictions/surfaces/"
+SURF_LEVELS = 4  # levels one unit writes: the native rung and three above it
+SURF_DMAX = 3    # ramp clip, in source voxels
+
+
+def surface_source_volume(scroll, pred_name):
+    """The CT volume a prediction was made from: its key starts with the same
+    14-digit timestamp. Returns (volume prefix, voxel size in um) or (None, None)."""
+    stamp = pred_name[:14]
+    if not stamp.isdigit():
+        return None, None
+    for v in s3_prefixes(scroll + "volumes/"):
+        base = v.rstrip("/").split("/")[-1]
+        if base.startswith(stamp):
+            m = re.search(r"-(\d+\.\d+)um", base)
+            if m:
+                return v, float(m.group(1))
+    return None, None
+
+
+def surface_native_level(vol, pred_shape, pred_name):
+    """Which multiscale level of the source volume the prediction was computed on:
+    the level whose shape matches, else the -L<k>- in the prediction name."""
+    for k in range(6):
+        za = read_json(f"{vol}{k}/.zarray")
+        if za is not None and list(za["shape"]) == list(pred_shape):
+            return k
+    m = re.search(r"-L(\d)-", pred_name)
+    return int(m.group(1)) if m else None
+
+
+def surface_info(name, za0, zattrs):
+    """Everything the workers and the metadata step need for one prediction.
+    Raises ValueError if the array is not a published binary surface mask."""
+    scroll = name.split("/")[0] + "/"
+    base = name.rstrip("/").split("/")[-1]
+    stem = base[:-5] if base.endswith(".zarr") else base
+    if za0["dtype"] != "|u1" or za0.get("dimension_separator", ".") != "/":
+        raise ValueError(f"unsupported layout {za0.get('dtype')} / {za0.get('dimension_separator')}")
+    comp = za0.get("compressor") or {}
+    if comp.get("id") != "blosc" or comp.get("cname") != "zstd":
+        raise ValueError(f"unsupported compressor {comp}")
+    if len(set(za0["chunks"])) != 1:
+        raise ValueError(f"non-cubic chunks {za0['chunks']}")
+    src_shape = [int(n) for n in za0["shape"]]
+    vol, um = surface_source_volume(scroll, stem)
+    if vol is None:
+        raise ValueError("no source volume with that timestamp")
+    k = surface_native_level(vol, src_shape, stem)
+    if k is None:
+        raise ValueError("cannot tell which level of the source volume this is")
+    native_um = um * 2 ** k
+    rk = rung_of(native_um)
+    scale = rung_um(rk) / native_um  # source voxels per output voxel
+    out0 = [int(round(n / scale)) for n in src_shape]
+    levels = []
+    shape = out0
+    for j in range(LADDER_TOP - rk + 1):
+        # The ladder's q applies to every level the fleet writes and to every coarse level
+        # bigger than a single chunk. The last rungs
+        # of a prediction fit in one 128^3 chunk and hold a handful of small values, which a
+        # dead-zone quantiser at q = 1 can wipe out entirely; there lossless costs a few
+        # hundred bytes, so the top of the ladder is stored exactly.
+        q = 0.0 if j >= SURF_LEVELS and max(shape) <= CHUNK else rung_q(rk + j)
+        levels.append({"path": rung_name(rk + j), "um": rung_um(rk + j), "shape": list(shape),
+                       "q": q, "shard": SHARD >> j if j < SURF_LEVELS else CHUNK})
+        shape = [math.ceil(n / 2) for n in shape]
+    th = re.search(r"-th([0-9]*\.?[0-9]+)", stem)
+    return {
+        "source": BUCKET + "/" + name, "source_volume": vol, "source_level": k,
+        "volume_um": um, "native_um": round(native_um, 6), "rung": rk, "rung_um": rung_um(rk),
+        "scale": scale, "csize": int(za0["chunks"][0]), "src_shape": src_shape, "out_shape": out0,
+        "threshold": float(th.group(1)) if th else None, "levels": levels,
+        "encoding": {
+            "name": "surface-ramp", "dmax": SURF_DMAX,
+            "formula": "v = round(127.5 + (127.5/dmax) * clip(s, -dmax, dmax)), s = signed Euclidean "
+                       "distance to the published mask boundary in source voxels, positive inside; "
+                       "inside 1/2/3 voxels -> 170/213/255, outside -> 85/43/0, the 128 crossing lies "
+                       "on the published edge",
+            "resample": "trilinear, on the ramp (never on the mask), output voxel i samples source "
+                        "coordinate i * scale",
+        },
+        "zattrs": zattrs,
+    }
+
+
+def cmd_manifest_surfaces(a):
+    db = open_db(a.db)
+    if a.volume:
+        preds = [v if v.endswith("/") else v + "/" for v in a.volume]
+    else:
+        preds = []
+        for scroll in s3_prefixes(""):
+            if scroll.startswith("_"):
+                continue
+            preds += [p for p in s3_prefixes(scroll + SURF_PREFIX) if p.rstrip("/").endswith(".zarr")]
+    n_new = 0
+    for p in preds:
+        za0 = read_json(p + "0/.zarray")
+        if za0 is None:
+            print(f"skip {p}: no level 0", file=sys.stderr)
+            continue
+        try:
+            info = surface_info(p, za0, read_json(p + ".zattrs") or {})
+        except ValueError as e:
+            print(f"skip {p}: {e}", file=sys.stderr)
+            continue
+        levels = {lv["path"]: {"shape": lv["shape"]} for lv in info["levels"]}
+        db.execute("INSERT OR REPLACE INTO volume(name, zattrs, levels, kind, info) VALUES (?,?,?,?,?)",
+                   (p, json.dumps(info["zattrs"]), json.dumps(levels), "surface", json.dumps(info)))
+        gz, gy, gx = shard_grid(info["out_shape"])
+        rows = [(p, 0, z, y, x) for z in range(gz) for y in range(gy) for x in range(gx)]
+        cur = db.executemany("INSERT OR IGNORE INTO unit(volume, level, sz, sy, sx) VALUES (?,?,?,?,?)", rows)
+        n_new += max(0, cur.rowcount)
+        print(f"{p}: native {info['native_um']:.4f}um -> rung {info['rung_um']}um "
+              f"(scale {info['scale']:.5f}), {info['src_shape']} -> {info['out_shape']}, "
+              f"chunks {info['csize']}, levels {[lv['path'] for lv in info['levels']]}, {len(rows)} units")
+    total = db.execute("SELECT COUNT(*) FROM unit").fetchone()[0]
+    print(f"manifest-surfaces: {n_new} new units, {total} total")
+
+
 # ----------------------------------------------------------------------------- metadata
 
 
@@ -244,10 +422,63 @@ def group_metadata(volume_name, zattrs, levels):
             "consolidated_metadata": None}
 
 
+def surface_array_metadata(level, info):
+    """zarr v3 array metadata for one rung of a prediction: shard 1024/512/256 for the
+    three finest levels and 128 for everything from the fourth up, 128^3 volcomp chunks."""
+    md = array_metadata(level["shape"], level["q"])
+    sh = int(level["shard"])
+    md["chunk_grid"]["configuration"]["chunk_shape"] = [sh, sh, sh]
+    md["attributes"] = {"volcomp": {"q": level["q"], "voxel_size_um": level["um"],
+                                    "encoding": info["encoding"]["name"]}}
+    return md
+
+
+def surface_group_metadata(name, info):
+    """OME-Zarr 0.5 multiscales on the exact ladder: dataset paths are the voxel size in
+    micrometres and the coordinate transforms state that size."""
+    datasets = [{"path": lv["path"],
+                 "coordinateTransformations": [{"type": "scale", "scale": [lv["um"]] * 3}]}
+                for lv in info["levels"]]
+    ms = {
+        "version": "0.5",
+        "name": name.rstrip("/").split("/")[-1],
+        "axes": [{"name": n, "type": "space", "unit": "micrometer"} for n in "zyx"],
+        "datasets": datasets,
+        "type": "mean",
+        "metadata": {"source": info["source"], "codec": "volcomp",
+                     "description": "2x mean pooling of the level below"},
+    }
+    export = {
+        "source": info["source"], "source_volume": BUCKET + "/" + info["source_volume"],
+        "source_level": info["source_level"], "source_chunk": info["csize"],
+        "threshold": info["threshold"], "encoding": info["encoding"],
+        "native_voxel_size_um": info["native_um"], "rung_voxel_size_um": info["rung_um"],
+        "resample_scale": info["scale"], "source_shape": info["src_shape"],
+        "shape": info["out_shape"],
+        "levels": [{"path": lv["path"], "voxel_size_um": lv["um"], "shape": lv["shape"],
+                    "q": lv["q"], "shard": lv["shard"]} for lv in info["levels"]],
+    }
+    return {"zarr_format": 3, "node_type": "group",
+            "attributes": {"ome": {"version": "0.5", "multiscales": [ms]}, "volcomp": export},
+            "consolidated_metadata": None}
+
+
 def cmd_metadata(a):
     db = open_db(a.db)
     n = 0
-    for name, zattrs, levels in db.execute("SELECT name, zattrs, levels FROM volume"):
+    for name, info in db.execute("SELECT name, info FROM volume WHERE kind='surface'"):
+        info = json.loads(info)
+        root = os.path.join(a.out, name.rstrip("/"))
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, "zarr.json"), "w") as f:
+            json.dump(surface_group_metadata(name, info), f, indent=2)
+        for lv in info["levels"]:
+            d = os.path.join(root, lv["path"])
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "zarr.json"), "w") as f:
+                json.dump(surface_array_metadata(lv, info), f, indent=2)
+        n += 1
+    for name, zattrs, levels in db.execute("SELECT name, zattrs, levels FROM volume WHERE kind='ct'"):
         levels = {int(k): v for k, v in json.loads(levels).items()}
         root = os.path.join(a.out, name.rstrip("/"))
         os.makedirs(root, exist_ok=True)
@@ -269,15 +500,22 @@ class Coordinator:
     def __init__(self, db, lease):
         self.db, self.lease, self.lock = db, lease, threading.RLock()
         self.max_attempts = 8
-        self._levels = {}  # volume -> {level: {"shape": ...}}; filled lazily so manifests can be added while serving
+        self._levels = {}  # volume -> (kind, levels|info); filled lazily so manifests can be added while serving
 
-    def levels(self, vol):
+    def volume(self, vol):
         if vol not in self._levels:
-            row = self.db.execute("SELECT levels FROM volume WHERE name=?", (vol,)).fetchone()
+            row = self.db.execute("SELECT levels, kind, info FROM volume WHERE name=?", (vol,)).fetchone()
             if row is None:
                 raise KeyError(vol)
-            self._levels[vol] = {int(k): v for k, v in json.loads(row[0]).items()}
+            if row[1] == "surface":
+                self._levels[vol] = ("surface", json.loads(row[2]))
+            else:
+                self._levels[vol] = ("ct", {int(k): v for k, v in json.loads(row[0]).items()})
         return self._levels[vol]
+
+    def levels(self, vol):
+        kind, v = self.volume(vol)
+        return v
 
     def claim(self, worker):
         with self.lock:
@@ -293,11 +531,19 @@ class Coordinator:
                     break
                 # give up on poison units so the queue can drain; they stay visible in /status as "failed"
                 self.db.execute("UPDATE unit SET state='failed' WHERE id=?", (uid,))
-            shape = self.levels(vol)[lvl]["shape"]  # before the lease so a bad row cannot leak a lease
+            kind, meta = self.volume(vol)  # before the lease so a bad row cannot leak a lease
+            unit = {"id": uid, "kind": kind, "volume": vol, "level": lvl, "shard": [sz, sy, sx],
+                    "lease_seconds": self.lease}
+            if kind == "surface":
+                lv = meta["levels"][:SURF_LEVELS]
+                unit.update(shape=meta["out_shape"], src_shape=meta["src_shape"], csize=meta["csize"],
+                            scale=meta["scale"], dmax=meta["encoding"]["dmax"],
+                            q=[x["q"] for x in lv], paths=[x["path"] for x in lv])
+            else:
+                unit.update(shape=meta[lvl]["shape"], q=level_q(lvl), mask=mask.hex() if mask else None)
             self.db.execute("UPDATE unit SET state='leased', worker=?, lease_until=?, attempts=attempts+1 WHERE id=?",
                             (worker, now + self.lease, uid))
-        return {"id": uid, "volume": vol, "level": lvl, "shard": [sz, sy, sx], "shape": shape,
-                "q": level_q(lvl), "lease_seconds": self.lease, "mask": mask.hex() if mask else None}
+        return unit
 
     def done(self, body):
         with self.lock:
@@ -416,7 +662,8 @@ OCC_DILATE = 1  # coarse voxels: absorbs averaging/rounding at the edge of maske
 
 def cmd_occupancy(a):
     db = open_db(a.db)
-    vols = [r[0] for r in db.execute("SELECT name FROM volume ORDER BY name")]
+    # CT volumes only: a surface unit lists the source rows it needs instead
+    vols = [r[0] for r in db.execute("SELECT name FROM volume WHERE kind='ct' ORDER BY name")]
     if a.volume:
         want = [v if v.endswith("/") else v + "/" for v in a.volume]
         vols = [v for v in vols if v in want]
@@ -487,6 +734,88 @@ def cmd_occupancy(a):
     print(f"occupancy done in {time.time() - t_all:.0f}s")
 
 
+# ----------------------------------------------------------------------------- pool-levels
+
+
+def pool_fetch(src, key, dest):
+    """Copy one shard from the level-below tree into dest. `src` is a local directory or
+    an http(s) root (the published tree). Returns False if the shard does not exist."""
+    if src.startswith("http://") or src.startswith("https://"):
+        data = http_get(src.rstrip("/") + "/" + urllib.parse.quote(key))
+        if data is None:
+            return False
+        with open(dest, "wb") as f:
+            f.write(data)
+        return True
+    path = os.path.join(src, key)
+    if not os.path.exists(path):
+        return False
+    if os.path.realpath(path) != os.path.realpath(dest):
+        shutil.copyfile(path, dest)
+    return True
+
+
+def cmd_pool_levels(a):
+    """Levels above the four a unit writes, by 2x mean pooling, one 128^3 shard at a time.
+    Streaming (never more than 8 input shards in memory) and resumable: an output shard
+    that already exists is left alone."""
+    db = open_db(a.db)
+    rows = db.execute("SELECT name, info FROM volume WHERE kind='surface' ORDER BY name").fetchall()
+    if a.volume:
+        want = {v if v.endswith("/") else v + "/" for v in a.volume}
+        rows = [r for r in rows if r[0] in want]
+    os.makedirs(a.tmp, exist_ok=True)
+    t_all = time.time()
+    for name, info in rows:
+        info = json.loads(info)
+        levels = info["levels"]
+        made = skipped = 0
+        t0 = time.time()
+        for j in range(a.first, len(levels)):
+            below, here = levels[j - 1], levels[j]
+            grid = [math.ceil(n / CHUNK) for n in here["shape"]]
+            for sz in range(grid[0]):
+                for sy in range(grid[1]):
+                    for sx in range(grid[2]):
+                        key = f"{name}{here['path']}/c/{sz}/{sy}/{sx}"
+                        out = os.path.join(a.out, key)
+                        if os.path.exists(out):
+                            skipped += 1
+                            continue
+                        work = tempfile.mkdtemp(prefix="pool-", dir=a.tmp)
+                        try:
+                            ins, got = [], 0
+                            for dz in range(2):
+                                for dy in range(2):
+                                    for dx in range(2):
+                                        k = f"{name}{below['path']}/c/{2 * sz + dz}/{2 * sy + dy}/{2 * sx + dx}"
+                                        dest = os.path.join(work, f"{dz}{dy}{dx}.shard")
+                                        if pool_fetch(a.src, k, dest):
+                                            ins.append(dest)
+                                            got += 1
+                                        else:
+                                            ins.append("-")
+                            if not got:
+                                continue  # nothing below: a missing shard is the fill value
+                            tmp_out = os.path.join(work, "out.shard")
+                            r = subprocess.run([a.volcomp, "shard-pool", tmp_out, f"--q={here['q']:g}",
+                                                "--shape={},{},{}".format(*below["shape"]),
+                                                f"--pos={sz},{sy},{sx}"] + ins, capture_output=True, text=True)
+                            if r.returncode:
+                                raise RuntimeError(f"shard-pool failed for {key}: {r.stderr[-400:]}")
+                            if not os.path.exists(tmp_out):
+                                continue  # pooled to all zero
+                            os.makedirs(os.path.dirname(out), exist_ok=True)
+                            shutil.move(tmp_out, out + ".part")
+                            os.replace(out + ".part", out)
+                            made += 1
+                        finally:
+                            shutil.rmtree(work, ignore_errors=True)
+            a.src = a.out if a.chain else a.src  # levels above the first read what we just wrote
+        print(f"{name}: {made} shards written, {skipped} already there, {time.time() - t0:.0f}s", flush=True)
+    print(f"pool-levels done in {time.time() - t_all:.0f}s")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -496,6 +825,21 @@ def main():
     p.add_argument("--levels", default="all", help="comma list of multiscale levels, default all")
     p.add_argument("--include-compressed", action="store_true")
     p.set_defaults(fn=cmd_manifest)
+    p = sub.add_parser("manifest-surfaces", help="queue the published surface predictions")
+    p.add_argument("--db", required=True)
+    p.add_argument("--volume", action="append", help="bucket prefix of one prediction (repeatable); default: all")
+    p.set_defaults(fn=cmd_manifest_surfaces)
+    p = sub.add_parser("pool-levels", help="build the coarse levels of the predictions offline")
+    p.add_argument("--db", required=True)
+    p.add_argument("--volcomp", default="volcomp")
+    p.add_argument("--src", required=True, help="tree holding the levels a unit wrote: a directory or an https root")
+    p.add_argument("--out", required=True, help="directory to write the coarse levels into")
+    p.add_argument("--volume", action="append")
+    p.add_argument("--first", type=int, default=SURF_LEVELS, help="first level index to build (default 4)")
+    p.add_argument("--tmp", default="/var/tmp/volcomp-pool")
+    p.add_argument("--no-chain", dest="chain", action="store_false", default=True,
+                   help="read every level from --src instead of chaining through --out")
+    p.set_defaults(fn=cmd_pool_levels)
     p = sub.add_parser("metadata")
     p.add_argument("--db", required=True)
     p.add_argument("--out", required=True)

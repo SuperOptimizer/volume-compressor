@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""volcomp export worker (Python 3 standard library + the `volcomp` CLI + curl).
+"""volcomp export worker (Python 3 standard library + the `volcomp` CLI).
 
 Runs on every compute VM, one process per N cores:
 
@@ -11,6 +11,13 @@ Runs on every compute VM, one process per N cores:
             rename -> report done. Any failure reports /fail and the unit is
             re-queued; the coordinator's lease also expires if this process dies.
   worker.py run ... --local-out DIR        write shards under DIR instead of SFTP (testing)
+  A surface-prediction unit (kind = "surface") instead downloads the blosc/zstd
+  source chunks covering its footprint plus the ramp halo, hands them to
+  `volcomp surface-pack` (which decodes them, builds the signed-distance ramp,
+  resamples onto the exact ladder rung, pools levels 1..3 and writes + verifies
+  all four shard files), and uploads one shard per level. The VMs stay
+  stdlib-only: everything numeric happens in C.
+
   worker.py upload-tree DIR --sftp URL --netrc FILE
       upload a local tree (e.g. the coordinator's metadata directory) to SFTP.
 
@@ -21,6 +28,7 @@ shard, so a VM is bound by its S3 download rate. Shard keys mirror the bucket:
 """
 import argparse
 import concurrent.futures as cf
+import math
 import http.client
 import json
 import os
@@ -36,7 +44,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-BUCKET = "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com"
+BUCKET = os.environ.get("VOLCOMP_S3_ENDPOINT", "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com")
 CHUNK_BYTES = 128 ** 3
 SHARD_CHUNKS = 8
 
@@ -72,7 +80,8 @@ def api(url, path, body=None, retries=1000):
 
 # ----------------------------------------------------------------------------- S3 download
 
-BUCKET_HOST = "vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com"
+BUCKET_HOST = urllib.parse.urlsplit(BUCKET).netloc
+BUCKET_TLS = urllib.parse.urlsplit(BUCKET).scheme != "http"
 _tls = threading.local()
 
 
@@ -90,7 +99,8 @@ def s3_conn(reset=False):
                 c.close()
             except Exception:  # noqa: BLE001
                 pass
-        c = http.client.HTTPSConnection(BUCKET_HOST, timeout=120)
+        cls = http.client.HTTPSConnection if BUCKET_TLS else http.client.HTTPConnection
+        c = cls(BUCKET_HOST, timeout=120)
         _tls.conn = c
     return c
 
@@ -180,6 +190,106 @@ def download_shard(unit, workdir, pool):
     return n_in_grid - n_masked, present
 
 
+# ----------------------------------------------------------------------------- surface predictions
+
+
+def surface_footprint(unit):
+    """The source voxel range one unit needs: its output footprint mapped back through
+    the resample, plus 1 voxel for the trilinear interpolation and dmax for the ramp."""
+    scale, dmax = float(unit["scale"]), int(unit.get("dmax", 3))
+    identity = scale == 1.0
+    lo, hi = [], []
+    for d in range(3):
+        co = unit["shard"][d] * 1024
+        ce = min(co + 1024, unit["shape"][d])
+        s0 = math.floor(co * scale)
+        s1 = math.floor((ce - 1) * scale) + (0 if identity else 1)
+        lo.append(max(0, s0 - dmax))
+        hi.append(min(unit["src_shape"][d] - 1, s1 + dmax))
+    return lo, hi
+
+
+def download_surface(unit, workdir, pool):
+    """Fetch every stored source chunk covering the footprint into workdir/<cz>_<cy>_<cx>.blosc.
+    Each (cz, cy) row is listed first, so absent (masked) chunks cost no GETs and a 404 can
+    never be confused with a transient failure."""
+    vol, C = unit["volume"], int(unit["csize"])
+    lo, hi = surface_footprint(unit)
+    rng = [range(lo[d] // C, hi[d] // C + 1) for d in range(3)]
+    rows = [(cz, cy) for cz in rng[0] for cy in rng[1]]
+    listed = list(pool.map(lambda r: s3_list_row(f"{vol}0/{r[0]}/{r[1]}/"), rows))
+    jobs, n_in_grid = [], 0
+    for (cz, cy), keys in zip(rows, listed):
+        for cx in rng[2]:
+            n_in_grid += 1
+            key = f"{vol}0/{cz}/{cy}/{cx}"
+            if key.encode() not in keys:
+                continue
+            jobs.append(pool.submit(fetch_source_chunk, key, os.path.join(workdir, f"{cz}_{cy}_{cx}.blosc")))
+    present = 0
+    for j in jobs:
+        present += bool(j.result())
+    return n_in_grid, present
+
+
+def fetch_source_chunk(key, dest):
+    """GET one compressed source chunk (any size: it is a blosc container)."""
+    data = s3_request("/" + urllib.parse.quote(key))
+    if data is None:
+        return False
+    tmp = dest + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, dest)
+    return True
+
+
+def process_surface_unit(unit, a, pool):
+    t0 = time.time()
+    workdir = tempfile.mkdtemp(prefix="shard-", dir=a.tmp)
+    try:
+        src = os.path.join(workdir, "src")
+        out = os.path.join(workdir, "out")
+        os.makedirs(src)
+        os.makedirs(out)
+        n_jobs, present = download_surface(unit, src, pool)
+        t1 = time.time()
+        if not present:
+            log(f"done #{unit['id']} {unit['volume']} {unit['shard']}: 0/{n_jobs} source chunks, "
+                f"empty (not written), dl {t1 - t0:.1f}s")
+            return {"id": unit["id"], "bytes": 0, "present": 0, "psnr_min": None, "max_err": None}
+        info = parse_kv(run([a.volcomp, "surface-pack", src, out,
+                             f"--csize={unit['csize']}",
+                             "--src-shape={},{},{}".format(*unit["src_shape"]),
+                             "--out-shape={},{},{}".format(*unit["shape"]),
+                             "--shard={},{},{}".format(*unit["shard"]),
+                             "--scale=%.17g" % unit["scale"],
+                             "--q=" + ",".join("%g" % q for q in unit["q"]),
+                             f"--dmax={unit.get('dmax', 3)}",
+                             f"--threads={a.threads}", f"--samples={a.samples}"]))
+        t2 = time.time()
+        size, npresent = 0, 0
+        for lvl, path in enumerate(unit["paths"]):
+            shard = os.path.join(out, f"{lvl}.shard")
+            if not os.path.exists(shard):
+                continue
+            key = f"{unit['volume']}{path}/c/{unit['shard'][0]}/{unit['shard'][1]}/{unit['shard'][2]}"
+            size += os.path.getsize(shard)
+            npresent += int(info.get(f"present{lvl}", 0))
+            if a.local_out:
+                local_store(shard, a.local_out, key)
+            else:
+                sftp_upload(shard, a.sftp, key, a.netrc)
+        t3 = time.time()
+        log(f"done #{unit['id']} {unit['volume']} {unit['shard']}: {present}/{n_jobs} source chunks, "
+            f"{npresent} chunks out, {size / 1e6:.1f} MB, psnr_min {info.get('psnr_min', 0):.1f}, "
+            f"dl {t1 - t0:.1f}s pack {t2 - t1:.1f}s (ramp {info.get('t_ramp', 0)}s) up {t3 - t2:.1f}s")
+        return {"id": unit["id"], "bytes": size, "present": npresent,
+                "psnr_min": info.get("psnr_min"), "max_err": info.get("max_err")}
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 # ----------------------------------------------------------------------------- pack / verify / upload
 
 
@@ -197,6 +307,8 @@ def parse_kv(s):
 
 def shard_key(unit):
     sz, sy, sx = unit["shard"]
+    if unit.get("kind") == "surface":
+        return f"{unit['volume']}{unit['paths'][0]}/c/{sz}/{sy}/{sx}"
     return f"{unit['volume']}{unit['level']}/c/{sz}/{sy}/{sx}"
 
 
@@ -256,6 +368,8 @@ def local_store(local, root, key):
 
 
 def process_unit(unit, a, pool):
+    if unit.get("kind") == "surface":
+        return process_surface_unit(unit, a, pool)
     t0 = time.time()
     workdir = tempfile.mkdtemp(prefix="shard-", dir=a.tmp)
     try:
@@ -378,6 +492,7 @@ def main():
     p.add_argument("--parallel", type=int, default=4, help="shards in flight per process")
     p.add_argument("--connections", type=int, default=16, help="keep-alive S3 connections per shard in flight")
     p.add_argument("--q", type=float, default=8.0, help="fallback only; the coordinator assigns q per level")
+    p.add_argument("--threads", type=int, default=0, help="threads inside `volcomp surface-pack` (0 = all cores)")
     p.add_argument("--samples", type=int, default=8, help="chunks per shard compared against the source (0 = all)")
     p.add_argument("--exit-when-idle", action="store_true")
     p.set_defaults(fn=cmd_run)
