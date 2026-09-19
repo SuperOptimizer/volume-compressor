@@ -7,6 +7,8 @@ Q_LOSSLESS = 0.0  # volcomp_encode(..., q=0) is exact
 CHUNK_DIM = 128
 CHUNK_VOXELS = CHUNK_DIM ** 3
 BLOCK_VOXELS = 16 ** 3
+MASK_DIM = 64            # the grid a mask chunk stores: CHUNK_DIM // 2
+MASK_VOXELS = MASK_DIM ** 3
 STATUS = ["OK", "ERR_ARG", "ERR_CORRUPT", "ERR_VERSION", "ERR_NOMEM", "ERR_SHORT_BUF"]
 
 
@@ -46,6 +48,17 @@ _L.volcomp_shim_decode_block.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctype
                                          ctypes.c_uint, ctypes.c_void_p, ctypes.c_size_t]
 _L.volcomp_shim_stream_q.restype = ctypes.c_int
 _L.volcomp_shim_stream_q.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_float)]
+_L.volcomp_shim_mask_encode.restype = ctypes.c_int
+_L.volcomp_shim_mask_encode.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                                        ctypes.POINTER(ctypes.c_size_t)]
+_L.volcomp_shim_mask_info.restype = ctypes.c_int
+_L.volcomp_shim_mask_info.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint32)]
+_L.volcomp_shim_mask_decode_stored.restype = ctypes.c_int
+_L.volcomp_shim_mask_decode_stored.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+                                               ctypes.c_size_t]
+_L.volcomp_shim_mask_voxels.restype = ctypes.c_size_t
+_L.volcomp_shim_is_lossless.restype = ctypes.c_int
+_L.volcomp_shim_is_lossless.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int)]
 _L.volcomp_shim_deblock.restype = None
 _L.volcomp_shim_deblock.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_float]
 
@@ -98,6 +111,42 @@ def decode(enc, out=None):
     return dst
 
 
+def mask_encode(src):
+    """src: 128^3 z-major uint8 bytes-like -> a volcomp MASK chunk.
+
+    Any nonzero source voxel is 1; the encoder stores the 2x2x2 MAJORITY pool
+    (a 64^3 grid) exactly, and `decode` returns it trilinearly interpolated back
+    to 128^3 as a continuous 0..255 field. Nothing is configurable.
+    """
+    p, n, keep = _buf(src)
+    if n != CHUNK_VOXELS:
+        raise VolcompError(f"source must be {CHUNK_VOXELS} bytes, got {n}")
+    out = ctypes.create_string_buffer(ENCODE_BOUND)
+    got = ctypes.c_size_t()
+    _check(_L.volcomp_shim_mask_encode(p, out, ENCODE_BOUND, ctypes.byref(got)))
+    return out.raw[: got.value]
+
+
+def mask_info(enc):
+    """The stored grid edge (64) if `enc` is a mask chunk, else None."""
+    p, n, keep = _buf(enc)
+    dim = ctypes.c_uint32()
+    st = _L.volcomp_shim_mask_info(p, n, ctypes.byref(dim))
+    if st == 1:  # ERR_ARG: a well-formed stream that is not a mask chunk
+        return None
+    _check(st)
+    return dim.value
+
+
+def mask_decode_stored(enc, out=None):
+    """The STORED 64^3 grid of a mask chunk, as 0/255 (a bytearray, or `out` filled)."""
+    p, n, keep = _buf(enc)
+    dst = out if out is not None else bytearray(MASK_VOXELS)
+    dp, dn, dkeep = _buf(dst)
+    _check(_L.volcomp_shim_mask_decode_stored(p, n, dp, dn))
+    return dst
+
+
 def stream_q(enc):
     """The q a stream was encoded with; 0.0 (Q_LOSSLESS) for a lossless stream."""
     p, n, keep = _buf(enc)
@@ -107,8 +156,11 @@ def stream_q(enc):
 
 
 def is_lossless(enc):
-    """True if the stream decodes to its source exactly."""
-    return stream_q(enc) == Q_LOSSLESS
+    """True if the stream decodes to its source exactly (false for a mask chunk)."""
+    p, n, keep = _buf(enc)
+    out = ctypes.c_int()
+    _check(_L.volcomp_shim_is_lossless(p, n, ctypes.byref(out)))
+    return bool(out.value)
 
 
 def decode_block(enc, bz, by, bx):

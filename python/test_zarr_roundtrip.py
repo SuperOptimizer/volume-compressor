@@ -82,14 +82,42 @@ def main():
         # reopening from the stored metadata must pick the codec back up
         assert np.array_equal(zarr.open_array(store, mode="r")[:], a), name
 
+    print("\n-- zarr v3 array, codec volcomp(mode=mask) --")
+    mask = np.where(three_class() != 0, 255, 0).astype(np.uint8)
+    store = zarr.storage.MemoryStore()
+    z = zarr.create_array(store, shape=mask.shape, chunks=(D, D, D), dtype="uint8",
+                          serializer=VolcompCodec(mode="mask"), fill_value=0)
+    z[:] = mask
+    got = z[:]
+    # the stored grid is the 2x2x2 majority pool, and the decode interpolates it
+    c = sum((mask != 0)[dz::2, dy::2, dx::2].astype(np.uint16)
+            for dz in range(2) for dy in range(2) for dx in range(2))
+    grid = np.where(c * 2 >= 8, 255, 0).astype(np.uint8)
+    assert np.array_equal(got[0::2, 0::2, 0::2], grid), "block centres are not the majority pool"
+    assert set(np.unique(got)) <= {0, 32, 64, 96, 128, 159, 191, 223, 255}
+    enc = vz.mask_encode(mask.tobytes())
+    assert vz.mask_info(enc) == vz.MASK_DIM and not vz.is_lossless(enc)
+    assert np.array_equal(np.frombuffer(bytes(vz.mask_decode_stored(enc)), np.uint8).reshape(64, 64, 64),
+                          grid)
+    assert vz.mask_info(vz.encode(mask.tobytes(), 0.0)) is None
+    assert np.array_equal(zarr.open_array(store, mode="r")[:], got)
+    print(f"{'mask':>14}: {len(enc):9d} bytes ({raw / len(enc):9.1f}x)  "
+          f"{8 * len(enc) / raw:.5f} bits/voxel")
+
     # the codec's own metadata round trip and validation
     assert VolcompCodec.from_dict(VolcompCodec(q=0.0).to_dict()) == VolcompCodec(q=0.0)
+    assert VolcompCodec.from_dict(VolcompCodec(mode="mask").to_dict()) == VolcompCodec(mode="mask")
     for bad in (0.5, -1.0, 256.0):
         try:
             VolcompCodec(q=bad)
             raise SystemExit(f"expected q={bad} to be rejected")
         except ValueError:
             pass
+    try:
+        VolcompCodec(mode="nope")
+        raise SystemExit("expected mode=nope to be rejected")
+    except ValueError:
+        pass
 
     print("\nFAIL" if fails else "\nok")
     return 1 if fails else 0

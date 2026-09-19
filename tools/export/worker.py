@@ -12,10 +12,11 @@ Runs on every compute VM, one process per N cores:
             re-queued; the coordinator's lease also expires if this process dies.
   worker.py run ... --local-out DIR        write shards under DIR instead of SFTP (testing)
   A surface-prediction unit (kind = "surface") instead downloads the blosc/zstd
-  source chunks covering its footprint plus the ramp halo, hands them to
-  `volcomp surface-pack` (which decodes them, builds the signed-distance ramp,
-  resamples onto the exact ladder rung, pools levels 1..3 and writes + verifies
-  all four shard files), and uploads one shard per level. The VMs stay
+  source chunks covering its footprint plus the halo, hands them to
+  `volcomp surface-pack` (which decodes them, resamples the binary mask onto the
+  exact ladder rung, stores it as volcomp mask chunks — or, for a "ramp" unit,
+  builds the signed-distance ramp at the level's q — pools levels 1..3 and
+  writes + verifies all four shard files), and uploads one shard per level. The VMs stay
   stdlib-only: everything numeric happens in C.
 
   worker.py upload-tree DIR --sftp URL --netrc FILE
@@ -309,9 +310,10 @@ def process_surface_unit(unit, a, pool):
                              "--out-shape={},{},{}".format(*unit["shape"]),
                              "--shard={},{},{}".format(*unit["shard"]),
                              "--scale=%.17g" % unit["scale"],
-                             "--q=" + ",".join("%g" % q for q in unit["q"]),
+                             *( ["--mask"] if unit.get("encoding") == "mask"
+                                else ["--q=" + ",".join("%g" % q for q in unit["q"])] ),
                              f"--dmax={unit.get('dmax', 3)}",
-                             *( [f"--mask={unit['mask']}"] if unit.get("mask") else [] ),
+                             *( [f"--occupancy={unit['mask']}"] if unit.get("mask") else [] ),
                              f"--threads={a.threads}", f"--samples={a.samples}"]))
         t2 = time.time()
         size, npresent = 0, 0

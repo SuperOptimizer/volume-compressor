@@ -416,7 +416,7 @@ static void test_pool_shard(void) {
   snprintf(outp, sizeof outp, "%s/out.shard", dir);
   unsigned present = 0;
   uint64_t bytes = 0;
-  CHECK_EQ(surface_pool_shard(in, outp, VOLCOMP_Q_LOSSLESS, shape, pos, &present, &bytes), 0);
+  CHECK_EQ(surface_pool_shard(in, outp, VOLCOMP_Q_LOSSLESS, shape, pos, false, &present, &bytes), 0);
   CHECK_EQ(present, 1);
   size_t n = 0;
   uint8_t *img = shard_read_file(outp, &n);
@@ -645,7 +645,7 @@ static void test_occupancy(void) {
                   .shard = {0, 0, 0},
                   .scale = scale,
                   .q = {VOLCOMP_Q_LOSSLESS, VOLCOMP_Q_LOSSLESS, VOLCOMP_Q_LOSSLESS, VOLCOMP_Q_LOSSLESS},
-                  .mask = masks,
+                  .occ = masks,
                   .dmax = SURF_DMAX,
                   .threads = 2,
                   .samples = 8};
@@ -742,6 +742,191 @@ int main(int argc, char **argv) {
   return main_tests();
 }
 
+/* ---------------- 8. mask mode: the pyramid the fleet writes ----------------
+ * Level 0 stores the published mask itself as volcomp MASK chunks, levels 1..3
+ * its successive 2x majority pools. Nothing here depends on the ramp, so the
+ * checks are structural: every chunk is a mask chunk, its block centres come
+ * back 0/255, and the level above is exactly the majority pool of the level
+ * below's own stored grid. */
+static void mask_write_source(const char *src, const uint8_t *mask, int64_t S0, int64_t S1, int64_t S2,
+                              int64_t csize) {
+  uint8_t *chunk = malloc((size_t)(csize * csize * csize));
+  uint8_t *cbuf = malloc((size_t)(csize * csize * csize) + BLOSC1_HEADER);
+  for (int64_t cz = 0; cz * csize < S0; cz++)
+    for (int64_t cy = 0; cy * csize < S1; cy++)
+      for (int64_t cx = 0; cx * csize < S2; cx++) {
+        memset(chunk, 0, (size_t)(csize * csize * csize));
+        int any = 0;
+        for (int64_t z = 0; z < csize && cz * csize + z < S0; z++)
+          for (int64_t y = 0; y < csize && cy * csize + y < S1; y++)
+            for (int64_t x = 0; x < csize && cx * csize + x < S2; x++) {
+              uint8_t v = mask[((cz * csize + z) * S1 + cy * csize + y) * S2 + cx * csize + x];
+              chunk[(z * csize + y) * csize + x] = v;
+              any |= v != 0;
+            }
+        if (!any) continue;
+        size_t bn = blosc_memcpyed(cbuf, chunk, (size_t)(csize * csize * csize));
+        char p[4200];
+        snprintf(p, sizeof p, "%s/%lld_%lld_%lld.blosc", src, (long long)cz, (long long)cy, (long long)cx);
+        FILE *f = fopen(p, "wb");
+        CHECK(f && fwrite(cbuf, 1, bn, f) == bn);
+        if (f) fclose(f);
+      }
+  free(chunk), free(cbuf);
+}
+/* the stored 64^3 grids of one shard level, as one (1024 >> level)/2 cube */
+static uint8_t *mask_level_grids(const char *out, int level, int64_t *edge) {
+  char p[4200];
+  snprintf(p, sizeof p, "%s/%d.shard", out, level);
+  size_t n = 0;
+  uint8_t *img = shard_read_file(p, &n);
+  if (!img) return NULL;
+  unsigned g = (unsigned)((SURF_SHARD >> level) / SURF_CHUNK), nch = g * g * g;
+  uint64_t *off = malloc(nch * sizeof *off), *nb = malloc(nch * sizeof *nb);
+  CHECK(shard_entries(img, n, nch, off, nb));
+  int64_t e = (SURF_SHARD >> level) / 2;
+  uint8_t *grids = calloc(1, (size_t)(e * e * e));
+  uint8_t *one = malloc(VOLCOMP_MASK_VOXELS);
+  const int64_t G = VOLCOMP_MASK_DIM;
+  for (unsigned i = 0; i < nch; i++) {
+    if (off[i] == ~0ull) continue;
+    uint32_t dim = 0;
+    CHECK_EQ(volcomp_mask_info(img + off[i], (size_t)nb[i], &dim), VOLCOMP_OK);
+    CHECK_EQ(dim, VOLCOMP_MASK_DIM);
+    CHECK_EQ(volcomp_mask_decode_stored(img + off[i], (size_t)nb[i], one, VOLCOMP_MASK_VOXELS), VOLCOMP_OK);
+    int64_t o[3] = {(i / (g * g)) * G, ((i / g) % g) * G, (i % g) * G};
+    for (int64_t z = 0; z < G; z++)
+      for (int64_t y = 0; y < G; y++)
+        memcpy(grids + (((o[0] + z) * e + o[1] + y) * e + o[2]), one + (z * G + y) * G, (size_t)G);
+  }
+  free(off), free(nb), free(img), free(one);
+  *edge = e;
+  return grids;
+}
+static void test_mask_mode(void) {
+  char dir[] = "/tmp/volcomp_maskmode_XXXXXX";
+  CHECK(mkdtemp(dir) != NULL);
+  char src[4096], out[4096];
+  snprintf(src, sizeof src, "%s/src", dir);
+  snprintf(out, sizeof out, "%s/out", dir);
+  mkdir(src, 0700);
+  mkdir(out, 0700);
+  const int64_t S0 = 400, S1 = 330, S2 = 350, csize = 192;
+  uint8_t *mask = malloc((size_t)(S0 * S1 * S2));
+  golden_mask(mask, S0, S1, S2, true);
+  mask_write_source(src, mask, S0, S1, S2, csize);
+  const double scale = 9.6 / 9.362;
+  surf_cfg cfg = {.srcdir = src,
+                  .outdir = out,
+                  .csize = csize,
+                  .src_shape = {S0, S1, S2},
+                  .shard = {0, 0, 0},
+                  .scale = scale,
+                  .mask_mode = true,
+                  .dmax = SURF_DMAX,
+                  .threads = 3,
+                  .samples = 0};
+  for (int d = 0; d < 3; d++) cfg.out_shape[d] = (int64_t)floor((double)cfg.src_shape[d] / scale + 0.5);
+  surf_result res;
+  CHECK_EQ(surface_pack(&cfg, &res), 0);
+  CHECK(res.present[0] > 0);
+
+  /* every stored chunk is a mask chunk whose block centres decode 0/255, and the
+   * level above is the majority pool of this level's stored grids */
+  uint8_t *dec = malloc(VOLCOMP_CHUNK_VOXELS), *grid = malloc(VOLCOMP_MASK_VOXELS);
+  for (int L = 0; L < SURF_LEVELS; L++) {
+    char p[4200];
+    snprintf(p, sizeof p, "%s/%d.shard", out, L);
+    size_t n = 0;
+    uint8_t *img = shard_read_file(p, &n);
+    if (!img) continue;
+    unsigned g = (unsigned)((SURF_SHARD >> L) / SURF_CHUNK), nch = g * g * g;
+    uint64_t *off = malloc(nch * sizeof *off), *nb = malloc(nch * sizeof *nb);
+    CHECK(shard_entries(img, n, nch, off, nb));
+    unsigned checked = 0;
+    for (unsigned i = 0; i < nch && checked < 4; i++) {
+      if (off[i] == ~0ull) continue;
+      checked++;
+      CHECK_EQ(volcomp_decode(img + off[i], (size_t)nb[i], dec, VOLCOMP_CHUNK_VOXELS), VOLCOMP_OK);
+      CHECK_EQ(volcomp_mask_decode_stored(img + off[i], (size_t)nb[i], grid, VOLCOMP_MASK_VOXELS), VOLCOMP_OK);
+      unsigned bad = 0;
+      const int64_t G = VOLCOMP_MASK_DIM, C = SURF_CHUNK;
+      for (int64_t z = 0; z < G; z++)
+        for (int64_t y = 0; y < G; y++)
+          for (int64_t x = 0; x < G; x++)
+            bad += dec[((2 * z) * C + 2 * y) * C + 2 * x] != grid[(z * G + y) * G + x];
+      CHECK_EQ(bad, 0);
+    }
+    free(off), free(nb), free(img);
+  }
+  for (int L = 0; L + 1 < SURF_LEVELS; L++) {
+    int64_t e0 = 0, e1 = 0;
+    uint8_t *a = mask_level_grids(out, L, &e0), *b = mask_level_grids(out, L + 1, &e1);
+    if (a && b) {
+      /* grids of level L ARE level L+1's mask; level L+1's grids are its majority pool */
+      unsigned bad = 0;
+      for (int64_t z = 0; z < e1; z++)
+        for (int64_t y = 0; y < e1; y++)
+          for (int64_t x = 0; x < e1; x++) {
+            unsigned c = 0;
+            for (int dz = 0; dz < 2; dz++)
+              for (int dy = 0; dy < 2; dy++)
+                for (int dx = 0; dx < 2; dx++)
+                  c += a[(((2 * z + dz) * e0 + 2 * y + dy) * e0) + 2 * x + dx] != 0;
+            bad += b[(z * e1 + y) * e1 + x] != (c * 2 >= 8 ? 255u : 0u);
+          }
+      CHECK_EQ(bad, 0);
+    }
+    free(a), free(b);
+  }
+  /* shard-pool carries the same pyramid up: the level-4 chunk is the assembly of
+   * the eight level-3 stored grids below it (only the first is present here), so
+   * its own stored grid is the majority pool of that */
+  {
+    char p3[4200], outp[4200];
+    snprintf(p3, sizeof p3, "%s/3.shard", out);
+    snprintf(outp, sizeof outp, "%s/pooled.shard", dir);
+    const char *in[8] = {p3, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
+    int64_t shape[3] = {128, 128, 128}, pos[3] = {0, 0, 0};
+    unsigned present = 0;
+    uint64_t bytes = 0;
+    CHECK_EQ(surface_pool_shard(in, outp, 0.0f, shape, pos, true, &present, &bytes), 0);
+    int64_t e3 = 0;
+    uint8_t *a = mask_level_grids(out, 3, &e3);  /* the level-4 mask, 64^3 */
+    CHECK(a && e3 == VOLCOMP_MASK_DIM);
+    size_t n = 0;
+    uint8_t *img = shard_read_file(outp, &n);
+    CHECK_EQ(present, 1);
+    if (a && img && present) {
+      uint64_t off[1], nb[1];
+      CHECK(shard_entries(img, n, 1, off, nb));
+      uint8_t *g4 = malloc(VOLCOMP_MASK_VOXELS);
+      CHECK_EQ(volcomp_mask_decode_stored(img + off[0], (size_t)nb[0], g4, VOLCOMP_MASK_VOXELS), VOLCOMP_OK);
+      const int64_t G = VOLCOMP_MASK_DIM;
+      unsigned bad = 0;
+      for (int64_t z = 0; z < G; z++)
+        for (int64_t y = 0; y < G; y++)
+          for (int64_t x = 0; x < G; x++) {
+            unsigned c = 0;
+            if (z < G / 2 && y < G / 2 && x < G / 2)
+              for (int dz = 0; dz < 2; dz++)
+                for (int dy = 0; dy < 2; dy++)
+                  for (int dx = 0; dx < 2; dx++)
+                    c += a[(((2 * z + dz) * G + 2 * y + dy) * G) + 2 * x + dx] != 0;
+            bad += g4[(z * G + y) * G + x] != (c * 2 >= 8 ? 255u : 0u);
+          }
+      CHECK_EQ(bad, 0);
+      free(g4);
+    }
+    free(a), free(img);
+  }
+  free(mask), free(dec), free(grid);
+  char cmd[4300];
+  snprintf(cmd, sizeof cmd, "rm -rf %s", dir);
+  if (system(cmd)) { /* best effort */
+  }
+}
+
 static int main_tests(void) {
   test_ramp_values();
   test_tiling();
@@ -751,5 +936,6 @@ static int main_tests(void) {
   test_pool_shard();
   test_occupancy();
   test_maxpool_check();
+  test_mask_mode();
   TEST_END();
 }

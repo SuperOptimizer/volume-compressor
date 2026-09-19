@@ -18,6 +18,22 @@ VOLCOMP_EXPORT int volcomp_shim_decode_block(const void *enc, size_t n, unsigned
                                              uint8_t *dst, size_t cap) {
   return (int)volcomp_decode_block(enc, n, bz, by, bx, dst, cap);
 }
+VOLCOMP_EXPORT int volcomp_shim_mask_encode(const uint8_t *src, void *dst, size_t cap, size_t *out_n) {
+  return (int)volcomp_mask_encode(src, dst, cap, out_n);
+}
+VOLCOMP_EXPORT int volcomp_shim_mask_info(const void *enc, size_t n, uint32_t *dim) {
+  return (int)volcomp_mask_info(enc, n, dim);
+}
+VOLCOMP_EXPORT int volcomp_shim_mask_decode_stored(const void *enc, size_t n, uint8_t *dst, size_t cap) {
+  return (int)volcomp_mask_decode_stored(enc, n, dst, cap);
+}
+VOLCOMP_EXPORT size_t volcomp_shim_mask_voxels(void) { return VOLCOMP_MASK_VOXELS; }
+VOLCOMP_EXPORT int volcomp_shim_is_lossless(const void *enc, size_t n, int *out) {
+  bool b = false;
+  int st = (int)volcomp_is_lossless(enc, n, &b);
+  *out = b;
+  return st;
+}
 VOLCOMP_EXPORT int volcomp_shim_stream_q(const void *enc, size_t n, float *q) {
   return (int)volcomp_stream_q(enc, n, q);
 }

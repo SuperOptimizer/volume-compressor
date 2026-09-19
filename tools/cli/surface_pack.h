@@ -25,6 +25,13 @@
  *   3. levels 1..3 are exact 2x mean pooling of the level-0 ramp (float mean,
  *      rounded), computed inside the unit.
  *
+ * In MASK mode (surf_cfg.mask_mode, `--mask`) there is no ramp and no quantiser:
+ * level 0 stores the published binary mask itself as a volcomp MASK chunk (the
+ * 2x2x2 majority pool, coded exactly, decoded trilinearly interpolated), the
+ * resample is trilinear on the 0/255 mask thresholded at 128, and levels 1..3
+ * are its successive 2x majority pools, each stored the same way. That is what
+ * the fleet writes; the ramp above stays available for the old flags.
+ *
  * Memory: the source mask region of one unit (~(1024 * scale + 8)^3 bytes, 1.1-1.3
  * GB) plus ~15 MB of scratch per thread plus the level-1 block (134 MB); no float
  * volume is ever materialised.
@@ -60,8 +67,11 @@ typedef struct {
   int64_t shard[3];           /* shard index (same for every level) */
   double scale;               /* source voxels per output voxel = rung_um / native_um */
   float q[SURF_LEVELS];
-  const uint8_t *mask;  /* optional 64-byte occupancy mask of the 8^3 level-0 chunks (see
+  const uint8_t *occ;   /* optional 64-byte occupancy mask of the 8^3 level-0 chunks (see
                          * coordinator.py surface-occupancy); NULL = every chunk is occupied */
+  bool mask_mode;       /* store binary MASK chunks (volcomp.h §11) instead of the ramp: level 0
+                         * is the published mask itself, levels 1..3 its 2x majority pools, and
+                         * every level is encoded with volcomp_mask_encode (q is unused) */
   int dmax, threads, samples;
 } surf_cfg;
 
@@ -531,6 +541,25 @@ static void surf_ramp_fused(const uint8_t *base, int64_t rstride_z, int64_t rstr
   }
 }
 
+/* The mask-mode stand-in for surf_ramp_fused: the same `ramp` buffer, holding
+ * the box planes [R, m0 - R) of the 0/255 mask, so the resample, the pooling and
+ * the encoder below do not care which mode they are in. */
+static void surf_mask_fill(const uint8_t *base, int64_t rstride_z, int64_t rstride_y, int64_t m0,
+                           int64_t m1, int64_t m2, int R, uint8_t *ramp) {
+  for (int64_t p = R; p < m0 - R; p++)
+    for (int64_t y = 0; y < m1; y++) {
+      const uint8_t *s = base + p * rstride_z + y * rstride_y;
+      uint8_t *d = ramp + ((p - R) * m1 + y) * m2;
+      for (int64_t x = 0; x < m2; x++) d[x] = s[x] ? 255u : 0u;
+    }
+}
+/* Back to 0/255. A 0/255 field crosses 128 exactly where the 0/1 field crosses
+ * 1/2, so this is the threshold of the trilinear resample, and — over a full
+ * 2x2x2 block — the MAJORITY of the mean pool. */
+static inline void surf_binarise(uint8_t *p, int64_t n) {
+  for (int64_t i = 0; i < n; i++) p[i] = p[i] >= 128u ? 255u : 0u;
+}
+
 /* ------------------------------------------------------------- parallel for */
 
 typedef void (*surf_job)(void *ctx, int64_t i, int tid);
@@ -704,7 +733,10 @@ static void surf_encode_chunk(surf_state *S, int level, unsigned idx, const uint
   }
   surf_scratch *sc = &S->sc[tid];
   size_t en = 0;
-  if (volcomp_encode(chunk, S->cfg->q[level], sc->enc, VOLCOMP_ENCODE_BOUND, &en) != VOLCOMP_OK) {
+  volcomp_status est = S->cfg->mask_mode
+                           ? volcomp_mask_encode(chunk, sc->enc, VOLCOMP_ENCODE_BOUND, &en)
+                           : volcomp_encode(chunk, S->cfg->q[level], sc->enc, VOLCOMP_ENCODE_BOUND, &en);
+  if (est != VOLCOMP_OK) {
     fprintf(stderr, "surface-pack: encode failed at level %d chunk %u\n", level, idx);
     S->error = 1;
     return;
@@ -721,14 +753,40 @@ static void surf_encode_chunk(surf_state *S, int level, unsigned idx, const uint
   double psnr = -1;
   unsigned mx = 0;
   if ((long)idx % S->stride == 0) {
-    double se = 0;
-    for (size_t k = 0; k < VOLCOMP_CHUNK_VOXELS; k++) {
-      int d = (int)chunk[k] - (int)sc->dec[k];
-      unsigned ad = (unsigned)(d < 0 ? -d : d);
-      se += (double)d * d;
-      if (ad > mx) mx = ad;
+    if (S->cfg->mask_mode) {
+      /* A mask chunk decodes to the interpolated field, so PSNR against the mask
+       * says nothing. What must hold is the invariant: every stored block centre
+       * (even coordinates) comes back as the 2x2x2 MAJORITY of the source, 0 or
+       * 255 exactly. */
+      const unsigned C = SURF_CHUNK;
+      unsigned bad = 0;
+      for (unsigned z = 0; z < C; z += 2)
+        for (unsigned y = 0; y < C; y += 2)
+          for (unsigned x = 0; x < C; x += 2) {
+            unsigned c = 0;
+            for (unsigned dz = 0; dz < 2; dz++)
+              for (unsigned dy = 0; dy < 2; dy++)
+                for (unsigned dx = 0; dx < 2; dx++)
+                  c += chunk[((size_t)(z + dz) * C + y + dy) * C + x + dx] != 0;
+            bad += sc->dec[((size_t)z * C + y) * C + x] != (c * 2 >= 8 ? 255u : 0u);
+          }
+      if (bad) {
+        fprintf(stderr, "surface-pack: level %d chunk %u: %u block centres do not round trip\n", level,
+                idx, bad);
+        S->error = 1;
+        return;
+      }
+      psnr = 999.0;
+    } else {
+      double se = 0;
+      for (size_t k = 0; k < VOLCOMP_CHUNK_VOXELS; k++) {
+        int d = (int)chunk[k] - (int)sc->dec[k];
+        unsigned ad = (unsigned)(d < 0 ? -d : d);
+        se += (double)d * d;
+        if (ad > mx) mx = ad;
+      }
+      psnr = se == 0 ? 999.0 : 10.0 * log10(65025.0 * (double)VOLCOMP_CHUNK_VOXELS / se);
     }
-    psnr = se == 0 ? 999.0 : 10.0 * log10(65025.0 * (double)VOLCOMP_CHUNK_VOXELS / se);
   }
   S->sc[tid].cpu_encode0 += surf_now() - t0;
   pthread_mutex_lock(&S->lock);
@@ -752,7 +810,7 @@ static void surf_level0_job(void *ctx, int64_t i, int tid) {
   surf_scratch *sc = &S->sc[tid];
   const int R = cfg->dmax;
   double t_job = surf_now();
-  if (cfg->mask && !(cfg->mask[i >> 3] >> (i & 7) & 1)) {  /* the occupancy mask says: no data here */
+  if (cfg->occ && !(cfg->occ[i >> 3] >> (i & 7) & 1)) {  /* the occupancy mask says: no data here */
     pthread_mutex_lock(&S->lock);
     S->res->skip_mask++;
     pthread_mutex_unlock(&S->lock);
@@ -804,8 +862,11 @@ static void surf_level0_job(void *ctx, int64_t i, int tid) {
     const uint8_t *base = S->mask + ((j0[0] - S->rlo[0]) * S->rn[1] + (j0[1] - S->rlo[1])) * S->rn[2] +
                           (j0[2] - S->rlo[2]);
     uint8_t *ramp = sc->ramp;
-    surf_ramp_fused(base, S->rn[1] * S->rn[2], S->rn[2], m[0], m[1], m[2], R, S->in_tab, S->out_tab, ramp,
-                    sc->pool);
+    if (cfg->mask_mode)
+      surf_mask_fill(base, S->rn[1] * S->rn[2], S->rn[2], m[0], m[1], m[2], R, ramp);
+    else
+      surf_ramp_fused(base, S->rn[1] * S->rn[2], S->rn[2], m[0], m[1], m[2], R, S->in_tab, S->out_tab, ramp,
+                      sc->pool);
     /* resample onto the exact ladder grid */
     if (S->identity) {
       for (int64_t z = 0; z < ext[0]; z++)
@@ -835,6 +896,7 @@ static void surf_level0_job(void *ctx, int64_t i, int tid) {
           const uint8_t *p100 = p000 + m[1] * m[2], *p101 = p100 + m[2];
           uint8_t *d = sc->chunk + (z * SURF_CHUNK + y) * SURF_CHUNK;
           surf_lerp_row(d, ext[2], sc->ridx[2], sc->rfrac[2], sc->rcofr[2], p000, p001, p100, p101, fz, gz, fy, gy);
+          if (cfg->mask_mode) surf_binarise(d, ext[2]);  /* trilinear on 0/1, threshold 0.5 */
         }
       }
     }
@@ -855,6 +917,7 @@ static void surf_level0_job(void *ctx, int64_t i, int tid) {
         const uint8_t *c = sc->chunk + ((2 * z) * SURF_CHUNK + 2 * y) * SURF_CHUNK;
         nonzero |= surf_pool_rows_avx2(d, c, c + SURF_CHUNK, c + (int64_t)SURF_CHUNK * SURF_CHUNK,
                                        c + (int64_t)SURF_CHUNK * SURF_CHUNK + SURF_CHUNK, h[2]);
+        if (cfg->mask_mode) surf_binarise(d, h[2]);  /* a full block: the majority */
         continue;
       }
 #endif
@@ -867,15 +930,27 @@ static void surf_level0_job(void *ctx, int64_t i, int tid) {
               cnt++;
             }
         nonzero |= sum != 0;
-        d[x] = (uint8_t)((sum + cnt / 2) / cnt);
+        /* mask mode: the majority over the whole 2x2x2 block, voxels outside the
+         * array counting as air — the same rule volcomp_mask_encode applies, so
+         * the pyramid stays exactly consistent at the array edges too */
+        d[x] = cfg->mask_mode ? (uint8_t)(sum >= 4u * 255u ? 255u : 0u) : (uint8_t)((sum + cnt / 2) / cnt);
       }
     }
+  if (cfg->mask_mode) { /* a majority pool can be empty where the chunk is not */
+    nonzero = 0;
+    for (int64_t z = 0; z < h[0]; z++)
+      for (int64_t y = 0; y < h[1]; y++) {
+        const uint8_t *d = l1 + ((ci[0] * (SURF_CHUNK / 2) + z) * d1 + ci[1] * (SURF_CHUNK / 2) + y) * d1 +
+                           ci[2] * (SURF_CHUNK / 2);
+        for (int64_t x = 0; x < h[2]; x++) nonzero |= d[x];
+      }
+  }
   pthread_mutex_lock(&S->lock);
   S->res->out_voxels += vox;
   pthread_mutex_unlock(&S->lock);
   S->blk[i] = nonzero != 0;
   sc->cpu_transform += surf_now() - t_job;
-  surf_encode_chunk(S, 0, (unsigned)i, sc->chunk, tid, nonzero != 0);
+  surf_encode_chunk(S, 0, (unsigned)i, sc->chunk, tid, cfg->mask_mode ? (uni == 1 ? 1 : -1) : (nonzero != 0));
 }
 
 /* Pool one level into the next, block by block: level-0 chunk `i` owns a
@@ -909,7 +984,9 @@ static void surf_pool_job(void *ctx, int64_t i, int tid) {
               sum += src[((o0[0] + 2 * z + dz) * ds + (o0[1] + 2 * y + dy)) * ds + o0[2] + 2 * x + dx];
               cnt++;
             }
-        dst[((ci[0] * bd + z) * dd + ci[1] * bd + y) * dd + ci[2] * bd + x] = (uint8_t)((sum + cnt / 2) / cnt);
+        uint8_t v = S->cfg->mask_mode ? (uint8_t)(sum >= 4u * 255u ? 255u : 0u)
+                                      : (uint8_t)((sum + cnt / 2) / cnt);
+        dst[((ci[0] * bd + z) * dd + ci[1] * bd + y) * dd + ci[2] * bd + x] = v;
       }
 }
 
@@ -1293,10 +1370,15 @@ static inline int surface_occupancy(const char *dir, const char *out_path, int64
  * `shape` is the input level's array shape and `pos` the output shard index, so
  * that a partial edge block averages only over the voxels that exist. */
 static int surface_pool_shard(const char *const in[8], const char *out_path, float q,
-                              const int64_t shape[3], const int64_t pos[3], unsigned *present,
-                              uint64_t *bytes) {
-  const int64_t C = SURF_CHUNK;
-  uint8_t *big = calloc(1, (size_t)(8 * C * C * C));  /* 256^3 */
+                              const int64_t shape[3], const int64_t pos[3], bool mask_mode,
+                              unsigned *present, uint64_t *bytes) {
+  const int64_t C = SURF_CHUNK, G = VOLCOMP_MASK_DIM;
+  /* In MASK mode the coarser level IS the level below's stored grid: a mask
+   * chunk stores the 2x2x2 majority pool of its own mask, which is exactly the
+   * next rung's mask. So the eight 64^3 grids assemble the 128^3 chunk directly
+   * — no pooling arithmetic, and nothing is lost on the way up. */
+  uint8_t *big = mask_mode ? NULL : calloc(1, (size_t)(8 * C * C * C)); /* 256^3 */
+  uint8_t *chunk = calloc(1, VOLCOMP_CHUNK_VOXELS);
   uint8_t *dec = malloc(VOLCOMP_CHUNK_VOXELS);
   int rc = 0;
   for (int i = 0; i < 8 && rc == 0; i++) {
@@ -1320,9 +1402,19 @@ static int surface_pool_shard(const char *const in[8], const char *out_path, flo
       fprintf(stderr, "shard-pool: %s: bad index crc\n", in[i]);
       rc = 3;
     } else if (off != ~0ull) {
-      if (off + nb > n - idxn || volcomp_decode(img + off, (size_t)nb, dec, VOLCOMP_CHUNK_VOXELS) != VOLCOMP_OK) {
+      volcomp_status st =
+          off + nb > n - idxn
+              ? VOLCOMP_ERR_CORRUPT
+              : mask_mode ? volcomp_mask_decode_stored(img + off, (size_t)nb, dec, VOLCOMP_MASK_VOXELS)
+                          : volcomp_decode(img + off, (size_t)nb, dec, VOLCOMP_CHUNK_VOXELS);
+      if (st != VOLCOMP_OK) {
         fprintf(stderr, "shard-pool: %s: chunk does not decode\n", in[i]);
         rc = 3;
+      } else if (mask_mode) {
+        int64_t o[3] = {(i >> 2) * G, ((i >> 1) & 1) * G, (i & 1) * G};
+        for (int64_t z = 0; z < G; z++)
+          for (int64_t y = 0; y < G; y++)
+            memcpy(chunk + (((o[0] + z) * C + o[1] + y) * C + o[2]), dec + (z * G + y) * G, (size_t)G);
       } else {
         int64_t o[3] = {(i >> 2) * C, ((i >> 1) & 1) * C, (i & 1) * C};
         for (int64_t z = 0; z < C; z++)
@@ -1332,33 +1424,38 @@ static int surface_pool_shard(const char *const in[8], const char *out_path, flo
     }
     free(img);
   }
-  int64_t ext[3];
-  for (int d = 0; d < 3; d++) {
-    ext[d] = shape[d] - pos[d] * 2 * C;
-    if (ext[d] > 2 * C) ext[d] = 2 * C;
-    if (ext[d] < 0) ext[d] = 0;
-  }
-  uint8_t *chunk = calloc(1, VOLCOMP_CHUNK_VOXELS);
   bool any = false;
-  for (int64_t z = 0; z < (ext[0] + 1) / 2; z++)
-    for (int64_t y = 0; y < (ext[1] + 1) / 2; y++)
-      for (int64_t x = 0; x < (ext[2] + 1) / 2; x++) {
-        unsigned sum = 0, cnt = 0;
-        for (int64_t dz = 0; dz < 2 && 2 * z + dz < ext[0]; dz++)
-          for (int64_t dy = 0; dy < 2 && 2 * y + dy < ext[1]; dy++)
-            for (int64_t dx = 0; dx < 2 && 2 * x + dx < ext[2]; dx++) {
-              sum += big[(((2 * z + dz) * 2 * C + 2 * y + dy) * 2 * C) + 2 * x + dx];
-              cnt++;
-            }
-        uint8_t v = (uint8_t)((sum + cnt / 2) / cnt);
-        chunk[(z * C + y) * C + x] = v;
-        any |= v != 0;
-      }
+  if (mask_mode) {
+    for (size_t k = 0; k < VOLCOMP_CHUNK_VOXELS && !any; k++) any = chunk[k] != 0;
+  } else {
+    int64_t ext[3];
+    for (int d = 0; d < 3; d++) {
+      ext[d] = shape[d] - pos[d] * 2 * C;
+      if (ext[d] > 2 * C) ext[d] = 2 * C;
+      if (ext[d] < 0) ext[d] = 0;
+    }
+    for (int64_t z = 0; z < (ext[0] + 1) / 2; z++)
+      for (int64_t y = 0; y < (ext[1] + 1) / 2; y++)
+        for (int64_t x = 0; x < (ext[2] + 1) / 2; x++) {
+          unsigned sum = 0, cnt = 0;
+          for (int64_t dz = 0; dz < 2 && 2 * z + dz < ext[0]; dz++)
+            for (int64_t dy = 0; dy < 2 && 2 * y + dy < ext[1]; dy++)
+              for (int64_t dx = 0; dx < 2 && 2 * x + dx < ext[2]; dx++) {
+                sum += big[(((2 * z + dz) * 2 * C + 2 * y + dy) * 2 * C) + 2 * x + dx];
+                cnt++;
+              }
+          uint8_t v = (uint8_t)((sum + cnt / 2) / cnt);
+          chunk[(z * C + y) * C + x] = v;
+          any |= v != 0;
+        }
+  }
   uint8_t *enc = NULL;
   size_t en = 0;
   if (rc == 0 && any) {
     enc = malloc(VOLCOMP_ENCODE_BOUND);
-    if (volcomp_encode(chunk, q, enc, VOLCOMP_ENCODE_BOUND, &en) != VOLCOMP_OK) rc = 3;
+    volcomp_status st = mask_mode ? volcomp_mask_encode(chunk, enc, VOLCOMP_ENCODE_BOUND, &en)
+                                  : volcomp_encode(chunk, q, enc, VOLCOMP_ENCODE_BOUND, &en);
+    if (st != VOLCOMP_OK) rc = 3;
   }
   if (rc == 0 && any) {
     uint64_t payload = 0;

@@ -7,12 +7,13 @@ The low-level binding (encode/decode/decode_block/deblock over bytes) lives in
 volcomp_zarr._lib and needs only the standard library; the codec class below
 needs zarr >= 3 and numpy and is skipped if they are not installed.
 """
-from ._lib import (BLOCK_VOXELS, CHUNK_DIM, CHUNK_VOXELS, ENCODE_BOUND, Q_LOSSLESS, VERSION, VolcompError,
-                   deblock, decode, decode_block, encode, is_lossless, stream_q)
+from ._lib import (BLOCK_VOXELS, CHUNK_DIM, CHUNK_VOXELS, ENCODE_BOUND, MASK_DIM, MASK_VOXELS,
+                   Q_LOSSLESS, VERSION, VolcompError, deblock, decode, decode_block, encode,
+                   is_lossless, mask_decode_stored, mask_encode, mask_info, stream_q)
 
-__all__ = ["encode", "decode", "decode_block", "deblock", "stream_q", "is_lossless", "VolcompError",
-           "VERSION", "ENCODE_BOUND", "Q_LOSSLESS", "CHUNK_DIM", "CHUNK_VOXELS", "BLOCK_VOXELS",
-           "VolcompCodec"]
+__all__ = ["encode", "decode", "decode_block", "deblock", "stream_q", "is_lossless", "mask_encode",
+           "mask_info", "mask_decode_stored", "VolcompError", "VERSION", "ENCODE_BOUND", "Q_LOSSLESS",
+           "CHUNK_DIM", "CHUNK_VOXELS", "BLOCK_VOXELS", "MASK_DIM", "MASK_VOXELS", "VolcompCodec"]
 
 try:  # zarr v3 codec registration (optional dependency)
     from dataclasses import dataclass, replace
@@ -29,22 +30,33 @@ try:  # zarr v3 codec registration (optional dependency)
         """{"name": "volcomp", "configuration": {"q": 8}} — uint8, 128^3 chunks only.
 
         q = 0 (Q_LOSSLESS) is the exact codec; q in 1..255 is the lossy DCT codec.
+        {"mode": "mask"} instead selects the binary MASK mode: the chunk is taken
+        as a mask (nonzero = 1), its 2x2x2 majority pool is stored exactly, and
+        decoding returns that grid trilinearly interpolated back to 128^3 as a
+        continuous 0..255 field. `q` is ignored in mask mode.
         """
 
         q: float = 8.0
+        mode: str = "q"
         is_fixed_size = False
 
         @classmethod
         def from_dict(cls, data: dict[str, JSON]) -> "VolcompCodec":
             _, cfg = parse_named_configuration(data, "volcomp", require_configuration=False)
             cfg = cfg or {}
-            return cls(q=float(cfg.get("q", 8.0)))
+            return cls(q=float(cfg.get("q", 8.0)), mode=str(cfg.get("mode", "q")))
 
         def to_dict(self) -> dict[str, JSON]:
+            if self.mode == "mask":
+                return {"name": "volcomp", "configuration": {"mode": "mask", "q": 0}}
             return {"name": "volcomp", "configuration": {"q": self.q}}
 
         def __post_init__(self) -> None:
-            if not (self.q == 0.0 or 1.0 <= self.q <= 255.0):
+            if self.mode not in ("q", "mask"):
+                raise ValueError(f'volcomp: mode must be "q" or "mask", got {self.mode!r}')
+            if self.mode == "mask":
+                object.__setattr__(self, "q", 0.0)  # a mask chunk has no quantiser
+            elif not (self.q == 0.0 or 1.0 <= self.q <= 255.0):
                 raise ValueError(f"volcomp: q must be 0 (lossless) or 1..255, got {self.q}")
 
         def validate(self, *, shape, dtype, chunk_grid) -> None:  # noqa: D401
@@ -66,7 +78,9 @@ try:  # zarr v3 codec registration (optional dependency)
                 raise ValueError(f"volcomp: chunk must be 128^3, got {arr.shape}")
             if not arr.any() and not chunk_spec.fill_value:
                 return None  # all-zero chunk -> stored as missing (fill value is 0 too)
-            return chunk_spec.prototype.buffer.from_bytes(encode(arr.tobytes(), self.q))
+            raw = arr.tobytes()
+            enc = mask_encode(raw) if self.mode == "mask" else encode(raw, self.q)
+            return chunk_spec.prototype.buffer.from_bytes(enc)
 
         async def _decode_single(self, chunk_bytes: Buffer, chunk_spec: ArraySpec) -> NDBuffer:
             out = np.empty((CHUNK_DIM,) * 3, dtype=np.uint8)

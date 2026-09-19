@@ -289,7 +289,42 @@ def surface_native_level(vol, pred_shape, pred_name):
     return int(m.group(1)) if m else None
 
 
-def surface_info(name, za0, zattrs):
+SURF_ENCODINGS = ("mask", "ramp")
+
+
+def surface_encoding(name):
+    """The per-level storage of a prediction export, for the group attributes.
+
+    "mask" is what the fleet writes: the published binary mask itself, stored as
+    volcomp MASK chunks. "ramp" is the older signed-distance form, kept for
+    re-exports that ask for it."""
+    if name == "mask":
+        return {
+            "name": "surface-mask", "dmax": SURF_DMAX,
+            "storage": "volcomp mask chunk: the binary mask at this rung, 2x2x2 majority-pooled "
+                       "(count*2 >= 8) to a 64^3 grid per 128^3 chunk and stored exactly with a "
+                       "12-neighbour context-model range coder",
+            "decode": "the stored grid trilinearly interpolated back to 128^3 as u8 0..255 = "
+                      "round(255 * v): output voxel j samples the grid at j/2 (the upper neighbour "
+                      "clamped at the top edge), so a block centre is 0 or 255 exactly and the edge "
+                      "carries a two-voxel ramp",
+            "pyramid": "each rung is the 2x2x2 majority pool of the rung below, which is exactly "
+                       "the rung below's own stored grid",
+            "resample": "trilinear on the 0/1 mask, threshold 0.5, onto the exact ladder grid; "
+                        "output voxel i samples source coordinate i * scale",
+        }
+    return {
+        "name": "surface-ramp", "dmax": SURF_DMAX,
+        "formula": "v = round(127.5 + (127.5/dmax) * clip(s, -dmax, dmax)), s = signed Euclidean "
+                   "distance to the published mask boundary in source voxels, positive inside; "
+                   "inside 1/2/3 voxels -> 170/213/255, outside -> 85/43/0, the 128 crossing lies "
+                   "on the published edge",
+        "resample": "trilinear, on the ramp (never on the mask), output voxel i samples source "
+                    "coordinate i * scale",
+    }
+
+
+def surface_info(name, za0, zattrs, encoding="mask"):
     """Everything the workers and the metadata step need for one prediction.
     Raises ValueError if the array is not a published binary surface mask."""
     scroll = name.split("/")[0] + "/"
@@ -321,9 +356,13 @@ def surface_info(name, za0, zattrs):
         # of a prediction fit in one 128^3 chunk and hold a handful of small values, which a
         # dead-zone quantiser at q = 1 can wipe out entirely; there lossless costs a few
         # hundred bytes, so the top of the ladder is stored exactly.
-        q = 0.0 if j >= SURF_LEVELS and max(shape) <= CHUNK else rung_q(rk + j)
+        # a mask level has no quantiser at all: the mask is stored exactly at half
+        # the rung's resolution and interpolated on the way out, so q is recorded as 0
+        q = 0.0 if encoding == "mask" else (
+            0.0 if j >= SURF_LEVELS and max(shape) <= CHUNK else rung_q(rk + j))
         levels.append({"path": rung_name(rk + j), "um": rung_um(rk + j), "shape": list(shape),
-                       "q": q, "shard": SHARD >> j if j < SURF_LEVELS else CHUNK})
+                       "q": q, "encoding": encoding,
+                       "shard": SHARD >> j if j < SURF_LEVELS else CHUNK})
         shape = [math.ceil(n / 2) for n in shape]
     th = re.search(r"-th([0-9]*\.?[0-9]+)", stem)
     return {
@@ -331,15 +370,7 @@ def surface_info(name, za0, zattrs):
         "volume_um": um, "native_um": round(native_um, 6), "rung": rk, "rung_um": rung_um(rk),
         "scale": scale, "csize": int(za0["chunks"][0]), "src_shape": src_shape, "out_shape": out0,
         "threshold": float(th.group(1)) if th else None, "levels": levels,
-        "encoding": {
-            "name": "surface-ramp", "dmax": SURF_DMAX,
-            "formula": "v = round(127.5 + (127.5/dmax) * clip(s, -dmax, dmax)), s = signed Euclidean "
-                       "distance to the published mask boundary in source voxels, positive inside; "
-                       "inside 1/2/3 voxels -> 170/213/255, outside -> 85/43/0, the 128 crossing lies "
-                       "on the published edge",
-            "resample": "trilinear, on the ramp (never on the mask), output voxel i samples source "
-                        "coordinate i * scale",
-        },
+        "encoding": surface_encoding(encoding),
         "zattrs": zattrs,
     }
 
@@ -505,7 +536,7 @@ def cmd_manifest_surfaces(a):
             print(f"skip {p}: no level 0", file=sys.stderr)
             continue
         try:
-            info = surface_info(p, za0, read_json(p + ".zattrs") or {})
+            info = surface_info(p, za0, read_json(p + ".zattrs") or {}, a.encoding)
         except ValueError as e:
             print(f"skip {p}: {e}", file=sys.stderr)
             continue
@@ -578,10 +609,13 @@ def surface_array_metadata(level, info):
     """zarr v3 array metadata for one rung of a prediction: shard 1024/512/256 for the
     three finest levels and 128 for everything from the fourth up, 128^3 volcomp chunks."""
     md = array_metadata(level["shape"], level["q"])
+    if level.get("encoding") == "mask":
+        md["codecs"][0]["configuration"]["codecs"] = [
+            {"name": "volcomp", "configuration": {"mode": "mask", "q": 0}}]
     sh = int(level["shard"])
     md["chunk_grid"]["configuration"]["chunk_shape"] = [sh, sh, sh]
     md["attributes"] = {"volcomp": {"q": level["q"], "voxel_size_um": level["um"],
-                                    "encoding": info["encoding"]["name"]}}
+                                    "encoding": level.get("encoding", "ramp")}}
     return md
 
 
@@ -608,7 +642,8 @@ def surface_group_metadata(name, info):
         "resample_scale": info["scale"], "source_shape": info["src_shape"],
         "shape": info["out_shape"],
         "levels": [{"path": lv["path"], "voxel_size_um": lv["um"], "shape": lv["shape"],
-                    "q": lv["q"], "shard": lv["shard"]} for lv in info["levels"]],
+                    "encoding": lv.get("encoding", "ramp"), "q": lv["q"], "shard": lv["shard"]}
+                   for lv in info["levels"]],
     }
     return {"zarr_format": 3, "node_type": "group",
             "attributes": {"ome": {"version": "0.5", "multiscales": [ms]}, "volcomp": export},
@@ -690,6 +725,7 @@ class Coordinator:
                 lv = meta["levels"][:SURF_LEVELS]
                 unit.update(shape=meta["out_shape"], src_shape=meta["src_shape"], csize=meta["csize"],
                             scale=meta["scale"], dmax=meta["encoding"]["dmax"],
+                            encoding=lv[0].get("encoding", "ramp"),
                             q=[x["q"] for x in lv], paths=[x["path"] for x in lv],
                             mask=mask.hex() if mask else None)
             else:
@@ -951,7 +987,8 @@ def cmd_pool_levels(a):
                             if not got:
                                 continue  # nothing below: a missing shard is the fill value
                             tmp_out = os.path.join(work, "out.shard")
-                            r = subprocess.run([a.volcomp, "shard-pool", tmp_out, f"--q={here['q']:g}",
+                            flag = "--mask" if here.get("encoding") == "mask" else f"--q={here['q']:g}"
+                            r = subprocess.run([a.volcomp, "shard-pool", tmp_out, flag,
                                                 "--shape={},{},{}".format(*below["shape"]),
                                                 f"--pos={sz},{sy},{sx}"] + ins, capture_output=True, text=True)
                             if r.returncode:
@@ -988,6 +1025,9 @@ def main():
                    help="skip the occupancy masks (every chunk is then assumed occupied)")
     p.add_argument("--occupancy-samples", type=int, default=6,
                    help="coarse chunks compared with the level below before trusting the pyramid")
+    p.add_argument("--encoding", choices=SURF_ENCODINGS, default="mask",
+                   help="mask (default): store the binary mask as volcomp mask chunks; "
+                        "ramp: the older signed-distance ramp at the ladder's q")
     p.set_defaults(fn=cmd_manifest_surfaces)
     p = sub.add_parser("pool-levels", help="build the coarse levels of the predictions offline")
     p.add_argument("--db", required=True)

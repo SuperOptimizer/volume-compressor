@@ -1,4 +1,4 @@
-# volcomp stream format, version 1
+# volcomp stream format, version 1 (revision 2)
 
 Normative. A conforming decoder accepts exactly the streams described here and
 rejects everything else with `VOLCOMP_ERR_CORRUPT` (or `VOLCOMP_ERR_VERSION`
@@ -24,7 +24,8 @@ stated otherwise.
 offset  size   field
 0       4      magic  "VOLC"
 4       1      version = 1
-5       1      mode   0 = lossy DCT (this section), 1..3 = lossless (§10)
+5       1      mode   0 = lossy DCT (this section), 1..3 = lossless (§10),
+                      4 = binary mask (§11)
 6       2      q_raw  u16, quantiser step q = q_raw / 256, 256 <= q_raw <= 65280
 8       T      frequency tables (§4.3), 10 models
 8+T     256    directory: 32 × { u32 tok_n, u32 bypass_n }
@@ -38,6 +39,15 @@ equal the stream length. Per substream: `tok_n >= 3`, `tok_n <= 262152`,
 Byte 5 was `reserved = 0` in volcomp 1.0 and every 1.0 decoder rejects a
 nonzero value, so the lossless modes of §10 cannot be misread by an old
 decoder; a mode-0 stream is byte for byte what volcomp 1.0 produced.
+
+**Revisions.** The version byte stays 1 across revisions of this document,
+because every stream a revision defines is a stream every earlier decoder
+already rejects: the mode byte is the compatibility mechanism. Revision 1
+(volcomp 1.0.x) defines modes 0..3 and rejects 4..255 with
+`VOLCOMP_ERR_CORRUPT`; revision 2 (volcomp 1.1.0, `VOLCOMP_FORMAT_REVISION`)
+adds mode 4, the binary mask chunk of §11, and changes nothing else. A writer
+must not emit a mask chunk to a consumer that only reads revision 1; that
+consumer will refuse it cleanly rather than misread it.
 
 ## 3. Encoding pipeline (informative summary; §4–§6 are normative)
 
@@ -259,3 +269,118 @@ zigzagged into 0..255. Prediction never crosses a block boundary.
 **Bound.** The encoder emits mode 2 whenever the coded form would reach
 2 097 160 bytes, so a lossless stream is never larger than the raw chunk plus
 the 8-byte header. `VOLCOMP_ENCODE_BOUND` is unchanged.
+
+## 11. Mask chunks (mode 4)
+
+A mask chunk is the storage form of a binary volume. It stores the 2×2×2
+**majority** pool of a 128³ mask — a 64³ grid of bits — exactly, and decodes to
+that grid **trilinearly interpolated** back to 128³, so the decoded chunk is a
+continuous `u8` field with a two-voxel ramp around the boundary rather than a
+0/255 mask. There is nothing to configure: no factor, no rule, no quantiser.
+`q_raw` is 0, as for the lossless modes.
+
+```
+offset  size   field
+0       8      header, mode = 4, q_raw = 0
+8       1      flags: bits 0..1 = form, bits 2..7 = 0 (reserved, must be zero)
+9       P      payload, per form
+```
+
+```
+form 0  CODED  the range-coded grid (below); P >= 5
+form 1  CONST  P = 1, one byte: 0 or 1, the value of every grid cell
+form 2  RAW    P = 32 768, the grid packed LSB-first, bit i = cell i
+```
+
+Exact accounting is normative: `9 + P` must equal the stream length, and any
+other form value is rejected. The encoder emits CONST for a uniform grid and
+RAW whenever the coded form would not be smaller, so a mask chunk is never
+larger than **32 777 bytes**.
+
+### 11.1 The stored grid
+
+Grid cell `(z, y, x)`, each in 0..63, has index `i = (z·64 + y)·64 + x`, and is
+the majority of the eight source voxels `(2z+dz, 2y+dy, 2x+dx)`:
+
+```
+count = number of the 8 source voxels that are nonzero
+cell  = count * 2 >= 8
+```
+
+### 11.2 Decoding (interpolation)
+
+Stored cell `i` sits at full-resolution voxel `2i`, so output voxel `j` along
+each axis samples the grid at `j/2`:
+
+```
+i0 = j >> 1
+i1 = (j odd and i0 + 1 < 64) ? i0 + 1 : i0        (clamped at the top edge)
+weights: (1, 0) for j even, (1/2, 1/2) for j odd
+```
+
+The output voxel is the trilinear combination of the eight grid cells
+`(i0|i1, i0|i1, i0|i1)` with those per-axis weights. Every weight product is a
+multiple of 1/8, so the value is `k/8` for an integer `k` in 0..8 and the
+stored byte is normatively
+
+```
+k       0   1   2   3   4    5    6    7    8
+value   0   32  64  96  128  159  191  223  255      (= round(255 k / 8))
+```
+
+A block centre — every voxel with all three coordinates even — is therefore
+exactly 0 or 255, and equals its grid cell. The arithmetic is integer, so mask
+chunks are byte-identical on every build.
+
+### 11.3 The coded form
+
+The grid's 262 144 bits are coded in index order with a binary range coder in
+the LZMA arrangement: 32-bit `range` and `low`, renormalisation while
+`range < 2^24`, 12-bit probabilities. Each bit `b` in context `c` with
+probability `p[c]` (the probability of a **zero** bit, initialised to 2048):
+
+```
+bound = (range >> 12) * p[c]
+b = 0:  range  = bound;          p[c] += (4096 - p[c]) >> s
+b = 1:  low   += bound;
+        range -= bound;          p[c] -= p[c] >> s
+```
+
+The adaptation shift `s` depends on how many bits that context has already
+coded: `s = 1, 1, 2, 2` for the first four and 3 from then on (a context here
+sees ~64 bits, so a fixed rate never converges).
+
+The context is the 12 causal neighbours of the cell, bit `j` of the context
+being neighbour `j` of this list, a neighbour outside the grid counting as 0:
+
+```
+j     0        1        2        3        4        5
+d     (0,0,-1) (0,-1,0) (-1,0,0) (0,-1,-1)(-1,0,-1)(-1,-1,0)
+j     6        7        8        9        10       11
+d     (0,0,-2) (0,-2,0) (-2,0,0) (0,-1,1) (-1,0,1) (-1,1,0)      [(dz,dy,dx)]
+```
+
+— 4096 contexts, each with its own probability and count.
+
+The encoder starts with `low = 0`, `range = 0xFFFFFFFF` and a one-byte cache of
+0 (so the payload's first byte is always 0, and a decoder must check it), and
+finishes with five shift-low steps. The payload is then exactly as long as the
+decoder's reads: five bytes to prime it (`code` is the four after the leading
+zero) and one per renormalisation. A decoder must therefore consume the payload
+exactly — a read past its end, or a byte left over, is `VOLCOMP_ERR_CORRUPT`.
+
+### 11.4 Notes for readers
+
+`volcomp_decode` and `volcomp_decode_block` return the interpolated 128³ chunk,
+so a mask chunk needs no special handling anywhere. `volcomp_is_lossless` is
+false for one (the 2× pool is not the source); `volcomp_stream_q` reports 0,
+since there is no quantiser. `volcomp_mask_info` identifies a mask chunk and
+`volcomp_mask_decode_stored` returns the 64³ grid itself, which is what the
+next coarser rung of a pyramid is made of.
+
+Measured on a 256³ region of the PHercParis4 recto surface prediction (2.4 µm,
+19.6 % foreground): **0.0057 bits per full-resolution voxel** (1 500 bytes per
+128³ chunk), against 0.062 for packbits + zstd-19 of the same mask and 0.022 for
+an ideal 12-neighbour model of the full-resolution mask. Thresholding the
+decoded field at 128 changes 1.7 % of the voxels, each of them a mean of 1.06
+and at most 2 voxels from the published boundary.

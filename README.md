@@ -11,6 +11,9 @@ no dependencies beyond libc/libm.
 | **0** (`VOLCOMP_Q_LOSSLESS`) | predictive, exact | none — decoded bytes are the source bytes | class maps, masks, valid/occupancy flags, anything whose values *are* the data (a wrong label is not a "small" error), and archival copies |
 | **1..255** | 3-D DCT + dead-zone quantiser | P99 ≈ 2.5 q on scroll data | greyscale CT and model probability maps, where 20–200× at a controlled error is the point |
 
+and `volcomp_mask_encode` is a third mode for **binary masks** (below), where
+half the spatial resolution costs 30× less than storing the mask exactly.
+
 Both modes share the geometry, the entropy coder, the API and the stream
 header, so a reader does not need to know which one produced a chunk;
 `volcomp_stream_q()` tells it, and `volcomp_decode_block()` works either way.
@@ -28,6 +31,12 @@ the raw chunk plus 8 bytes, so it is always safe to reach for.
   the block edges), zigzag residuals, and per block a choice of CONST (a flat
   block costs a token and a byte), SPARSE (run/level), DENSE (a token per
   voxel) or RAW; same 2-lane tANS. An all-flat chunk is 9 bytes.
+- Mask (`volcomp_mask_encode`): a 128³ binary mask, 2×2×2 majority-pooled to a
+  64³ grid, stored exactly with an adaptive binary range coder over the 12
+  causal neighbours (4096 contexts), and decoded **trilinearly interpolated**
+  back to 128³. **0.0057 bits per voxel** on the PHercParis4 recto surface
+  prediction — 11× smaller than packbits + zstd-19 of the same mask, 350 000× the
+  raw chunk.
 - Format: [`spec/format.md`](spec/format.md). Header byte 5 records the mode,
   and volcomp 1.0 rejects a nonzero value there, so old readers cannot
   misread a lossless chunk; `q >= 1` streams are byte-identical to 1.0's.
@@ -48,6 +57,26 @@ float q; st = volcomp_stream_q(enc, n, &q);               /* 0 => the stream is 
 st = volcomp_decode_block(enc, n, bz, by, bx, block, VOLCOMP_BLOCK_VOXELS);
 volcomp_deblock(volume, nz, ny, nx, 8.0f);   /* optional, after assembling decoded chunks */
 ```
+
+## Binary masks
+
+```c
+st = volcomp_mask_encode(mask /* 128^3, nonzero = set */, enc, VOLCOMP_ENCODE_BOUND, &n);
+st = volcomp_decode(enc, n, dst, VOLCOMP_CHUNK_VOXELS);   /* the same call as any other chunk */
+st = volcomp_mask_info(enc, n, &dim);                     /* OK (dim = 64) iff it is a mask chunk */
+st = volcomp_mask_decode_stored(enc, n, grid, VOLCOMP_MASK_VOXELS);  /* the 64^3 grid itself */
+```
+
+A mask chunk stores the 2×2×2 **majority** pool of the mask — a 64³ grid — and
+nothing else; there is no knob. `volcomp_decode` returns that grid trilinearly
+interpolated back to 128³ as `u8` 0..255, so a stored block centre comes back 0
+or 255 exactly and the boundary carries a two-voxel ramp: a continuous training
+target, not a staircase, from 1/8 of the bits a full-resolution mask would cost.
+Every existing reader — `volcomp_decode_block`, `python/volcomp_zarr`, the shard
+readers — works unchanged. `volcomp_is_lossless` is false for a mask chunk, and
+a mask chunk is never larger than 32 777 bytes. The stored grid of one rung is
+exactly the mask of the next coarser rung, so a mask pyramid is built by reading
+grids, not by pooling pixels.
 
 Everything is `static`; include the header in the translation unit that uses
 it. No arch flags are needed: on x86-64 the AVX2+FMA kernels are compiled with

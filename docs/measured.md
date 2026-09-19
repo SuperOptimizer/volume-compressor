@@ -749,3 +749,44 @@ plain-C output (stream and voxel hashes over the tune set).
   done.
 - Net, tune set, final vs plain-C: encode +22/+36/+45/+60/+57 %, decode
   +19/+18/+31/+39/+50 % at q 2/4/8/16/32.
+
+## 2026-09-19: binary mask chunks (new mode, format revision 2)
+
+Published surface predictions are binary. Storing them as a signed-distance
+ramp through the lossy codec cost ~700 GB for the PHercParis4 recto alone, so
+the mask became its own chunk mode: the 2x2x2 **majority** pool of the 128^3
+mask (a 64^3 grid) stored exactly, decoded trilinearly interpolated back to
+128^3 — a continuous 0..255 target with a two-voxel edge ramp.
+
+Measured on a 256^3 recto chunk set (2.4 um, 19.6 % foreground), in bits per
+**full-resolution** voxel:
+
+| form | bits/voxel |
+|---|---|
+| packbits + zstd-19, full resolution | 0.062 |
+| ideal 12-neighbour context model, full resolution | 0.022 |
+| ideal 12-neighbour context model, 2x majority pool | 0.0050 |
+| **shipped**: adaptive range coder over the 2x pool | **0.0057** |
+
+- **Adaptation rate.** LZMA's fixed 1/32 step costs **0.00734** bpv here: a
+  context sees ~64 bits per chunk, so a slow rate never converges. Per-context
+  rate by age — 1/2, 1/2, 1/4, 1/4 then 1/8 — gives **0.00564** (the ideal
+  static model over the same contexts is 0.0050, so 88 % of the gap closes).
+  Capping at 1/16 gives 0.00578, at 1/32 0.00639, at 1/4 0.00602; a fixed 1/8
+  gives 0.00586. ADOPTED: the {1,1,2,2,3} shift schedule.
+- **A two-rate mix** (fast + slow probabilities averaged) was *worse*:
+  0.00771 (1/16 + 1/64) and 0.00907 (1/8 + 1/128). REJECTED.
+- **Two more context neighbours** (0,-1,-2) and (-1,-1,-1), 16 384 contexts:
+  0.00644 against 0.00639 at the same rate schedule — the extra contexts cost
+  more to learn than they save. REJECTED.
+- **Speed** (one core, x86-64, release, on the fixture): encode **1.2-2.5 G**,
+  decode **0.8-1.9 G** full-resolution voxels/s depending on machine load, i.e.
+  under 2 ms per 128^3 chunk either way — 20-50x the 50 M/s the export needs.
+  The entropy coder only sees 262 144 bits per chunk; the majority pool and the
+  interpolation dominate.
+- **Boundary error.** Thresholding the decoded field at 128 changes 1.72 % of
+  voxels; those voxels are a mean of 1.06 and at most 2.0 voxels from the
+  published boundary (p50 1.0, p99 2.0).
+- **Pyramid.** One rung's stored grid *is* the next rung's mask, so coarser
+  levels are assembled from grids rather than pooled — exact, and `shard-pool`
+  does no arithmetic at all in mask mode.

@@ -2,8 +2,8 @@
 
 Re-encodes every uncompressed volume of the Vesuvius Challenge open-data bucket
 (`vesuvius-challenge-open-data`, 64 volumes, ~760 TB logical at level 0 plus the
-LOD pyramids) — and its 43 published surface predictions, as a signed-distance
-ramp on the exact resolution ladder (see **Surface predictions**) — into zarr v3
+LOD pyramids) — and its 43 published surface predictions, as binary **mask
+chunks** on the exact resolution ladder (see **Surface predictions**) — into zarr v3
 `sharding_indexed` arrays — 1024³ shards of 128³
 `volcomp` chunks (q = 8 at native resolution, 4 / 2 / 1 at LOD levels 1 / 2 / ≥3: downscaling averages noise away, so coarser levels keep more) — under `sftp://dl.ash2txt.org:9238/volcomp/`, mirroring the
 bucket keys: `volcomp/<scroll>/volumes/<volume>.zarr/<level>/c/<sz>/<sy>/<sx>`.
@@ -55,10 +55,26 @@ masks (uint8, only 0 and 255) in blosc/zstd zarr v2, chunked 128³ / 192³ / 256
 They are exported as a second kind of unit, in their own shape:
 
 - **What is read.** Only level `0` of each prediction; its own pyramid is a binary
-  copy and never becomes output data — ours is built from the ramp. The coarsest
-  published level is still used, as an occupancy oracle, but only where it is
-  provably an exact max pool (see below).
-- **The ramp.** The mask becomes a continuous *signed-distance ramp*: with `s`
+  copy and never becomes output data — ours is built from the mask itself. The
+  coarsest published level is still used, as an occupancy oracle, but only where
+  it is provably an exact max pool (see below).
+- **The mask, at half the rung's resolution** (`encoding: "mask"`, the default).
+  Each 128³ output chunk holds the published binary mask; what is *stored* is its
+  2×2×2 majority pool — a 64³ grid — coded exactly by `volcomp.h`'s mask mode
+  (spec §11), and what a reader gets back from `volcomp_decode` is that grid
+  **trilinearly interpolated** to 128³: a continuous `u8` field, 0 or 255 exactly
+  at every stored block centre and a two-voxel ramp across the boundary. It is the
+  training target directly, at **0.0057 bits per voxel** on the PHercParis4 recto —
+  30× less than the ramp below at q 8 and 11× less than packbits + zstd-19 of the
+  mask. There is no quantiser on a mask level: `q` is recorded as 0 everywhere.
+  Air far from any mask is 0, so those chunks (and shards) are simply absent.
+  The resample onto the ladder is trilinear **on the 0/1 mask, thresholded at 0.5**.
+- **Every rung is the majority pool of the one below** — which is exactly the rung
+  below's own stored grid, so the pyramid is built by reading grids, not by pooling
+  pixels, and nothing is lost on the way up. A thin sheet does eventually vanish
+  under repeated majority pooling; those top rungs are then simply absent.
+- **The ramp** (`--encoding ramp`) is the older form, kept for re-exports that ask
+  for it. The mask becomes a continuous *signed-distance ramp*: with `s`
   the signed Euclidean distance to the mask boundary in source voxels, positive
   inside, clipped to ±3, the stored value is `round(127.5 + 42.5 * s)` — inside
   1, 2, 3 voxels deep: **170, 213, 255**; outside: **85, 43, 0**; and the **128
@@ -80,7 +96,7 @@ They are exported as a second kind of unit, in their own shape:
   identity and is skipped. The native voxel size comes from the source volume the
   prediction names (its timestamp prefix) and the level it was run on (`-L2-`, or
   the level whose shape matches).
-- **q per level is a function of the voxel size**, not of the level index
+- **q per level** (ramp encoding only) is a function of the voxel size, not of the level index
   (`rung_q()` in `coordinator.py`, the one table for the whole export):
 
   | um | 0.6 | 1.2 | 2.4 | 4.8 | 9.6 | 19.2 | 38.4 and coarser |
@@ -104,7 +120,9 @@ They are exported as a second kind of unit, in their own shape:
   footprint, so nothing crosses units. Levels 1..3 are exact 2× mean pooling of
   the *exact* ramp, before it is quantised.
 - **Levels above the fourth** are built offline by `coordinator.py pool-levels`,
-  2× mean pooling one 128³ shard at a time (`volcomp shard-pool`): streaming,
+  one 128³ shard at a time (`volcomp shard-pool`: for a mask level, the eight
+  stored grids below assembled into the coarser chunk; for a ramp level, 2× mean
+  pooling): streaming,
   resumable (an output shard that exists is left alone), and it can read the level
   below from a local tree or over HTTPS from the published one.
 
@@ -148,24 +166,27 @@ one thread per output chunk:
 ```sh
 volcomp surface-pack SRCDIR OUTDIR --csize=192 --src-shape=4287,3145,3145 \
     --out-shape=4285,3144,3144 --shard=2,1,1 --scale=1.0004168403418091 \
-    --q=2,1,1,1 [--dmax=3] [--threads=0] [--samples=8]
+    --mask [--dmax=3] [--threads=0] [--samples=8]      # or --q=2,1,1,1 for the ramp
 # ok src_chunks=252 src_nonzero=1 out_voxels=1073741824 compared=11 psnr_min=44.17
 #    max_err=66 t_decode=0.33 t_ramp=4.91 t_encode=0.25 vox_per_s=2.18e+08 ...
 #    present0=489 bytes0=19157548 present1=64 ... bytes=27765986
 ```
 
-`--mask` is the unit's 512-bit occupancy mask (128 hex digits) when the prediction
-has one. `SRCDIR` holds the raw source chunks the worker downloaded, named
+`--mask` selects the mask encoding (no argument, no `--q`); `--occupancy=HEX` is
+the unit's 512-bit occupancy mask (128 hex digits) when the prediction has one.
+(It was spelled `--mask=HEX` before the mask encoding existed.) `SRCDIR` holds the raw source chunks the worker downloaded, named
 `<cz>_<cy>_<cx>.blosc` by their absolute source chunk index (a missing file is an
 absent, all-zero chunk); `OUTDIR` gets `0.shard` .. `3.shard`. The tool decodes
 the blosc1/zstd containers itself (`tools/cli/blosc1.h`, ~80 lines against
 libzstd: the whole format is a 16-byte header, a block offset table and one zstd
 frame per block; byte unshuffle is implemented but is the identity at typesize 1),
-re-tiles source chunks of any size onto the 128³ output grid, builds the ramp,
-resamples, pools, encodes, and verifies — every stored chunk is decoded again and
-a sampled subset is compared with the ramp it came from (`psnr_min`, `max_err`,
-reported back to the coordinator). A unit whose source is nonzero but whose
-level-0 shard came out empty fails.
+re-tiles source chunks of any size onto the 128³ output grid, resamples, pools,
+encodes, and verifies — every stored chunk is decoded again, and for a sampled
+subset the mask encoding checks its own invariant (every stored block centre comes
+back as the 2×2×2 majority of the source, 0 or 255 exactly) while the ramp encoding
+compares against the ramp it came from (`psnr_min`, `max_err`, reported back to the
+coordinator). A unit whose source is nonzero but whose level-0 shard came out empty
+fails.
 
 The Python worker only orchestrates: claim, list + download the source chunks
 covering its footprint plus the halo (threads, standard library), run the C tool,
@@ -213,10 +234,31 @@ That stage still contains the level-0 encode and verify (2.6 CPU-seconds, untouc
 by any of this); the transform alone went from 40.2 to 6.2 CPU-seconds on the dense
 unit, 6.4×. Peak RSS is 1.27 GB dense, 58 MB sparse. The rest of the unit: 1.4 s to
 download its 203 stored source chunks (18.6 MB), 0.7 s to blosc-decode them, 0.3 s
-to encode levels 1..3. Output for that unit: 19.2 MB at 9.6 µm (q 2), 6.7 MB at
-19.2, 1.6 MB at 38.4, 0.34 MB at 76.8 — 27.8 MB for a 1024³ region whose binary
-source is 18.6 MB of blosc over a slightly larger footprint (a ramp carries more
-than a threshold, and we add three levels).
+to encode levels 1..3. Output for that unit **in the ramp encoding**: 19.2 MB at
+9.6 µm (q 2), 6.7 MB at 19.2, 1.6 MB at 38.4, 0.34 MB at 76.8 — 27.8 MB.
+
+### What the mask encoding costs (measured, S3, whole units)
+
+The same PHercMANBp unit [2, 1, 1], `--mask`, 24 threads: 203 of 252 source chunks
+downloaded in 2.2 s, packed in 1.2 s (0.7 s of transform), **502 chunks out**:
+
+| level | 9.6 µm | 19.2 | 38.4 | 76.8 | total |
+|---|---|---|---|---|---|
+| mask | 367 kB | 87 kB | 22.8 kB | 5.3 kB | **482 kB** |
+| ramp (q 2/1/1/1) | 19.2 MB | 6.7 MB | 1.6 MB | 0.34 MB | 27.8 MB |
+| ratio | 52× | 77× | 70× | 64× | **58×** |
+
+Four whole units of the **PHercParis4 recto** (2.4 µm, 256³ source chunks), sampled
+across the occupancy distribution — 1704 occupied chunks in total, 1.4 s to 2.0 s of
+download and 0.3 s to 1.5 s of packing each:
+
+| level | 2.4 µm | 4.8 | 9.6 | 19.2 |
+|---|---|---|---|---|
+| bytes per occupied chunk | 1285 | 286 | 68.5 | 16.6 |
+
+The manifest counts **11 424 267 occupied chunks** over the recto's 26 291 non-empty
+units, so the four levels the fleet writes come to **14.7 + 3.3 + 0.8 + 0.2 = 19 GB**
+— against the ~700 GB the ramp at q 8 would have cost for level 0 alone.
 
 ### Run it
 
@@ -239,8 +281,8 @@ Local dry run, exactly as for CT but with `manifest-surfaces`; the offline
 end-to-end test does precisely this against a synthetic bucket:
 
 ```sh
-python3 -m pytest tools/export/test_export.py     # needs numpy/scipy/numcodecs; no network
-ctest --preset release -R test_surface            # ramp values, tiling, pooling, blosc
+python3 -m pytest tools/export/test_export.py     # both encodings; needs numpy/scipy/numcodecs, no network
+ctest --preset release -R 'test_surface|test_mask'  # ramp values, tiling, pooling, blosc, mask chunks
 ```
 
 ### Reading a prediction back
@@ -251,7 +293,7 @@ g = zarr.open_group("volcomp/PHercMANBp/.../<name>.zarr", mode="r")
 ms = g.attrs["ome"]["multiscales"][0]
 paths = [d["path"] for d in ms["datasets"]]          # ["9.6", "19.2", ...]: never assume ints
 a = zarr.open(f"volcomp/.../<name>.zarr/{paths[0]}", mode="r")
-block = a[2048:2176, 1024:1152, 1024:1152]           # 0 = air, 128 = the published surface, 255 = 3+ voxels inside
+block = a[2048:2176, 1024:1152, 1024:1152]           # mask: 0 = air, 255 = inside, 128 = the edge
 ```
 
 `g.attrs["volcomp"]` records the source key, the encoding and its formula, the

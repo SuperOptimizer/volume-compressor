@@ -4,8 +4,9 @@
 A synthetic zarr v2 prediction (blosc/zstd, exactly like the bucket's) is served
 from a local directory by a tiny S3-listing HTTP server; the real coordinator and
 the real worker then run against it and write the zarr v3 + volcomp tree, which is
-decoded back through python/volcomp_zarr and compared with the ramp recomputed
-with scipy.
+decoded back through python/volcomp_zarr and compared with a reference computed
+with numpy/scipy. Both encodings are exercised: "mask" (the default: the binary
+mask stored as volcomp mask chunks) and "ramp" (the older signed-distance form).
 
     pytest tools/export/test_export.py          # or: python3 tools/export/test_export.py
 
@@ -229,10 +230,8 @@ def assemble(shards, shape, shard_dim):
     return vol
 
 
-@pytest.fixture(scope="module")
-def export(tmp_path_factory):
+def run_export(tmp, encoding):
     """Run the whole pipeline once: manifest -> metadata -> serve -> worker -> pool-levels."""
-    tmp = tmp_path_factory.mktemp("export")
     src_root, out, meta = str(tmp / "bucket"), str(tmp / "out"), str(tmp / "meta")
     mask = synthetic_mask()
     write_source(src_root, mask)
@@ -240,7 +239,7 @@ def export(tmp_path_factory):
     env = dict(os.environ, VOLCOMP_S3_ENDPOINT=url)
     db = str(tmp / "e.db")
     coord = [sys.executable, os.path.join(HERE, "coordinator.py")]
-    subprocess.run(coord + ["manifest-surfaces", "--db", db], env=env, check=True)
+    subprocess.run(coord + ["manifest-surfaces", "--db", db, "--encoding", encoding], env=env, check=True)
     subprocess.run(coord + ["metadata", "--db", db, "--out", meta], env=env, check=True)
     port = 8791
     for _ in range(20):  # a free port for the coordinator
@@ -275,7 +274,95 @@ def export(tmp_path_factory):
     return {"out": out, "mask": mask, "meta": meta}
 
 
-def test_tree_and_metadata(export):
+@pytest.fixture(scope="module")
+def export(tmp_path_factory):
+    return run_export(tmp_path_factory.mktemp("export_mask"), "mask")
+
+
+@pytest.fixture(scope="module")
+def export_ramp(tmp_path_factory):
+    return run_export(tmp_path_factory.mktemp("export_ramp"), "ramp")
+
+
+# ----------------------------------------------------------- the mask encoding
+
+
+def majority_pool(a, pad_to):
+    """The 2x2x2 majority pool a mask chunk stores: `a` is zero padded out to the
+    128^3 chunk grid first, exactly as the exporter pads it."""
+    p = np.zeros(pad_to, np.uint8)
+    p[: a.shape[0], : a.shape[1], : a.shape[2]] = a != 0
+    c = sum(p[dz::2, dy::2, dx::2].astype(np.uint16)
+            for dz in range(2) for dy in range(2) for dx in range(2))
+    return np.where(c * 2 >= 8, 255, 0).astype(np.uint8)
+
+
+def chunk_grid_shape(shape):
+    return tuple(math.ceil(n / 128) * 128 for n in shape)
+
+
+def test_mask_tree_and_metadata(export):
+    root = os.path.join(export["out"], PRED_KEY.rstrip("/"))
+    group = json.load(open(os.path.join(root, "zarr.json")))
+    ex = group["attributes"]["volcomp"]
+    assert ex["encoding"]["name"] == "surface-mask"
+    assert all(lv["encoding"] == "mask" for lv in ex["levels"])
+    assert all(lv["q"] == 0 for lv in ex["levels"])
+    for lv in ex["levels"]:
+        md = json.load(open(os.path.join(root, lv["path"], "zarr.json")))
+        assert md["codecs"][0]["configuration"]["codecs"][0] == {
+            "name": "volcomp", "configuration": {"mode": "mask", "q": 0}}
+        assert md["attributes"]["volcomp"]["encoding"] == "mask"
+
+
+def test_mask_level0_is_the_published_mask(export):
+    """Every stored block centre is the 2x2x2 majority of the published mask, and
+    the decode is the interpolation of that grid (nine possible values)."""
+    root = os.path.join(export["out"], PRED_KEY.rstrip("/"))
+    got = assemble(decode_shard(os.path.join(root, "2.4", "c", "0", "0", "0"), 512), SHAPE, 1024)
+    grid = majority_pool(export["mask"], chunk_grid_shape(SHAPE))
+    h = [(n + 1) // 2 for n in SHAPE]
+    assert np.array_equal(got[0::2, 0::2, 0::2], grid[: h[0], : h[1], : h[2]])
+    assert set(np.unique(got)) <= {0, 32, 64, 96, 128, 159, 191, 223, 255}
+    # the field crosses 128 where the mask edge is: the thresholded decode is the
+    # mask to within the 2-voxel pooling
+    assert np.mean((got >= 128) != (export["mask"] != 0)) < 0.12
+
+
+def test_mask_pyramid_is_majority_pooling(export):
+    """Each rung's stored grid is the 2x2x2 majority pool of the rung below's."""
+    root = os.path.join(export["out"], PRED_KEY.rstrip("/"))
+    shape = list(SHAPE)
+    ref = export["mask"]
+    for path, shard in (("2.4", 1024), ("4.8", 512), ("9.6", 256), ("19.2", 128)):
+        count = (shard // 128) ** 3
+        got = assemble(decode_shard(os.path.join(root, path, "c", "0", "0", "0"), count), shape, shard)
+        grid = majority_pool(ref, chunk_grid_shape(shape))
+        h = [(n + 1) // 2 for n in shape]
+        assert np.array_equal(got[0::2, 0::2, 0::2], grid[: h[0], : h[1], : h[2]]), path
+        # the next rung's mask IS this rung's stored grid
+        shape = [(n + 1) // 2 for n in shape]
+        ref = grid[: shape[0], : shape[1], : shape[2]]
+
+
+def test_mask_pool_levels_and_size(export):
+    root = os.path.join(export["out"], PRED_KEY.rstrip("/"))
+    assert os.path.exists(os.path.join(root, "38.4", "c", "0", "0", "0"))
+    assert os.path.exists(os.path.join(root, "307.2", "c", "0", "0", "0"))
+    # a majority pool can pool a thin sheet away entirely: this synthetic volume is
+    # 480 um across, so the top rungs are empty and their shards are simply absent
+    # (a missing shard key is the fill value, exactly as for an air region)
+    assert not os.path.exists(os.path.join(root, "1228.8", "c", "0", "0", "0"))
+    # a mask level is far smaller than the ramp it replaces
+    n = os.path.getsize(os.path.join(root, "2.4", "c", "0", "0", "0"))
+    assert n < 0.05 * export["mask"].size, n
+
+
+# ----------------------------------------------------------- the ramp encoding
+
+
+def test_tree_and_metadata(export_ramp):
+    export = export_ramp
     root = os.path.join(export["out"], PRED_KEY.rstrip("/"))
     group = json.load(open(os.path.join(root, "zarr.json")))
     ms = group["attributes"]["ome"]["multiscales"][0]
@@ -302,7 +389,8 @@ def test_tree_and_metadata(export):
     assert [lv["shard"] for lv in ex["levels"]][:5] == [1024, 512, 256, 128, 128]
 
 
-def test_level0_matches_the_ramp(export):
+def test_level0_matches_the_ramp(export_ramp):
+    export = export_ramp
     root = os.path.join(export["out"], PRED_KEY.rstrip("/"))
     want = reference_ramp(export["mask"])
     got = assemble(decode_shard(os.path.join(root, "2.4", "c", "0", "0", "0"), 512), SHAPE, 1024)
@@ -315,7 +403,8 @@ def test_level0_matches_the_ramp(export):
     assert np.mean((got >= 128) != (want >= 128)) < 0.01
 
 
-def test_pyramid_is_mean_pooling(export):
+def test_pyramid_is_mean_pooling(export_ramp):
+    export = export_ramp
     root = os.path.join(export["out"], PRED_KEY.rstrip("/"))
     ref = reference_ramp(export["mask"])
     shape = list(SHAPE)
@@ -331,7 +420,8 @@ def test_pyramid_is_mean_pooling(export):
         assert err.mean() < 2.0, (path, err.mean())
 
 
-def test_pool_levels_built_the_coarse_ladder(export):
+def test_pool_levels_built_the_coarse_ladder(export_ramp):
+    export = export_ramp
     root = os.path.join(export["out"], PRED_KEY.rstrip("/"))
     group = json.load(open(os.path.join(root, "zarr.json")))
     ref = reference_ramp(export["mask"])

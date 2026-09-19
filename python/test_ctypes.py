@@ -28,8 +28,46 @@ def psnr(a, b):
     return 999.0 if se == 0 else 10 * math.log10(255 ** 2 * len(a) / se)
 
 
+
+def test_mask():
+    """Mask chunks: the stored grid is the 2x2x2 majority pool, exactly, and the
+    decode is its trilinear interpolation (0/255 at every block centre)."""
+    src = bytearray(vc.CHUNK_VOXELS)
+    i = 0
+    for z in range(128):
+        for y in range(128):
+            for x in range(128):
+                s = math.sin(z * 0.11) * math.cos(y * 0.07) + math.sin((x + y) * 0.05)
+                src[i] = 255 if s > 0 else 0
+                i += 1
+    enc = vc.mask_encode(src)
+    assert vc.mask_info(enc) == vc.MASK_DIM, vc.mask_info(enc)
+    assert not vc.is_lossless(enc)
+    assert vc.stream_q(enc) == 0.0
+    grid = vc.mask_decode_stored(enc)
+    assert len(grid) == vc.MASK_VOXELS
+    bad = 0
+    for z in range(64):
+        for y in range(64):
+            for x in range(64):
+                c = sum(src[((2 * z + dz) * 128 + 2 * y + dy) * 128 + 2 * x + dx] != 0
+                        for dz in range(2) for dy in range(2) for dx in range(2))
+                bad += grid[(z * 64 + y) * 64 + x] != (255 if c * 2 >= 8 else 0)
+    assert bad == 0, bad
+    dec = vc.decode(enc)
+    centres = sum(dec[((2 * z) * 128 + 2 * y) * 128 + 2 * x] != grid[(z * 64 + y) * 64 + x]
+                  for z in range(0, 64, 7) for y in range(0, 64, 5) for x in range(0, 64, 3))
+    assert centres == 0
+    assert set(dec) <= {0, 32, 64, 96, 128, 159, 191, 223, 255}
+    # a plain stream is not a mask chunk
+    assert vc.mask_info(vc.encode(src, 0.0)) is None
+    print(f"mask: {len(enc)} bytes ({8 * len(enc) / vc.CHUNK_VOXELS:.5f} bits/voxel), "
+          f"values {sorted(set(dec))}")
+
+
 def main():
     print("libvolcomp", vc.VERSION, "bound", vc.ENCODE_BOUND)
+    test_mask()
     src = synth()
     for q in (2.0, 8.0, 32.0):
         enc = vc.encode(src, q)
