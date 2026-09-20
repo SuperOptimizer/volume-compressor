@@ -1143,7 +1143,9 @@ static int surface_pack(const surf_cfg *cfg, surf_result *res) {
   }
   double t3 = surf_now();
   if (S.error) return 3;
-  if (res->src_nonzero && res->present[0] == 0) {
+  /* In mask mode a source with only specks (no 2x2x2 majority anywhere in the footprint, or nonzero only in
+   * the halo) legitimately yields an empty level-0 shard: the per-chunk verify already re-decoded everything. */
+  if (!cfg->mask_mode && res->src_nonzero && res->present[0] == 0) {
     fprintf(stderr, "surface-pack: source is nonzero but the level-0 shard is empty\n");
     return 6;
   }
