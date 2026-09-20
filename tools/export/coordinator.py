@@ -1013,9 +1013,14 @@ def pool_fetch(src, key, dest):
 
 
 def cmd_pool_levels(a):
-    """Levels above the four a unit writes, by 2x mean pooling, one 128^3 shard at a time.
-    Streaming (never more than 8 input shards in memory) and resumable: an output shard
-    that already exists is left alone."""
+    """Levels above the four a unit writes, by 2x mean pooling (2x2x2 majority for a mask
+    level), one 128^3 shard at a time. Streaming (never more than 8 input shards in
+    memory) and resumable: an output shard that already exists is left alone.
+
+    Level `--first` reads the level below it from --src (the tree the fleet wrote);
+    every level above that reads what this command just wrote to --out, unless
+    --no-chain. That choice is per level and per volume: --src itself is never
+    reassigned, because it is shared by every volume in the run."""
     db = open_db(a.db)
     rows = db.execute("SELECT name, info FROM volume WHERE kind='surface' ORDER BY name").fetchall()
     if a.volume:
@@ -1030,6 +1035,9 @@ def cmd_pool_levels(a):
         t0 = time.time()
         for j in range(a.first, len(levels)):
             below, here = levels[j - 1], levels[j]
+            # the fleet's tree holds the levels below --first; the ones above it exist
+            # only in --out, where the previous pass of this loop put them
+            src = a.src if j == a.first or not a.chain else a.out
             grid = [math.ceil(n / CHUNK) for n in here["shape"]]
             for sz in range(grid[0]):
                 for sy in range(grid[1]):
@@ -1047,7 +1055,7 @@ def cmd_pool_levels(a):
                                     for dx in range(2):
                                         k = f"{name}{below['path']}/c/{2 * sz + dz}/{2 * sy + dy}/{2 * sx + dx}"
                                         dest = os.path.join(work, f"{dz}{dy}{dx}.shard")
-                                        if pool_fetch(a.src, k, dest):
+                                        if pool_fetch(src, k, dest):
                                             ins.append(dest)
                                             got += 1
                                         else:
@@ -1071,7 +1079,6 @@ def cmd_pool_levels(a):
                             made += 1
                         finally:
                             shutil.rmtree(work, ignore_errors=True)
-            a.src = a.out if a.chain else a.src  # levels above the first read what we just wrote
         print(f"{name}: {made} shards written, {skipped} already there, {time.time() - t0:.0f}s", flush=True)
     print(f"pool-levels done in {time.time() - t_all:.0f}s")
 
@@ -1109,10 +1116,13 @@ def main():
     p = sub.add_parser("pool-levels", help="build the coarse levels of the predictions offline")
     p.add_argument("--db", required=True)
     p.add_argument("--volcomp", default="volcomp")
-    p.add_argument("--src", required=True, help="tree holding the levels a unit wrote: a directory or an https root")
+    p.add_argument("--src", required=True,
+                   help="tree holding the level below --first (what the fleet wrote): a directory "
+                        "or an https root. Read-only, and the same for every volume in the run")
     p.add_argument("--out", required=True, help="directory to write the coarse levels into")
     p.add_argument("--volume", action="append")
-    p.add_argument("--first", type=int, default=SURF_LEVELS, help="first level index to build (default 4)")
+    p.add_argument("--first", type=int, default=SURF_LEVELS,
+                   help="first level index to build (default 4); level --first - 1 is read from --src")
     p.add_argument("--tmp", default="/var/tmp/volcomp-pool")
     p.add_argument("--no-chain", dest="chain", action="store_false", default=True,
                    help="read every level from --src instead of chaining through --out")

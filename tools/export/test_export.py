@@ -49,12 +49,20 @@ SCROLL = "PHercTest"
 STAMP = "20260101000000"
 PRED = f"{STAMP}-surface-20260101000001-surface-m7-L0-th0.2.zarr"
 PRED_KEY = f"{SCROLL}/representations/predictions/surfaces/{PRED}/"
+# a SECOND prediction, from a second source volume. The bucket holds 43 of them and
+# every coordinator command loops over all of them, so one is not enough to test:
+# state that leaks from one volume to the next is invisible with a single volume
+# (it is exactly how pool-levels came to skip every volume but the first).
+STAMP2 = "20260101000010"
+PRED2 = f"{STAMP2}-surface-20260101000011-surface-m7-L0-th0.2.zarr"
+PRED2_KEY = f"{SCROLL}/representations/predictions/surfaces/{PRED2}/"
 VOL_UM = "2.400"
 VOL_KEY = f"{SCROLL}/volumes/{STAMP}-{VOL_UM}um-0.2m-78keV-masked.zarr/"
+SURF_LEVELS = 4  # levels one unit writes; pool-levels builds everything above these
 
 
-def vol_key(um=VOL_UM):
-    return f"{SCROLL}/volumes/{STAMP}-{um}um-0.2m-78keV-masked.zarr/"
+def vol_key(um=VOL_UM, stamp=STAMP):
+    return f"{SCROLL}/volumes/{stamp}-{um}um-0.2m-78keV-masked.zarr/"
 SHAPE = (200, 180, 160)
 CSIZE = 64
 
@@ -174,8 +182,14 @@ def serve(root):
 
 
 def write_source(root, mask, um=VOL_UM):
-    """The synthetic prediction, byte for byte in the bucket's layout."""
-    d = os.path.join(root, PRED_KEY)
+    """The synthetic bucket: two predictions, byte for byte in its layout."""
+    write_prediction(root, mask, PRED_KEY, STAMP, um)
+    write_prediction(root, mask, PRED2_KEY, STAMP2, um)
+
+
+def write_prediction(root, mask, pred_key, stamp, um):
+    """One synthetic prediction plus the level-0 .zarray of the volume it names."""
+    d = os.path.join(root, pred_key)
     os.makedirs(os.path.join(d, "0"), exist_ok=True)
     codec = numcodecs.Blosc(cname="zstd", clevel=1, shuffle=1)
     zarray = {"chunks": [CSIZE] * 3, "compressor": {"id": "blosc", "cname": "zstd", "clevel": 1,
@@ -201,7 +215,7 @@ def write_source(root, mask, um=VOL_UM):
                 os.makedirs(p, exist_ok=True)
                 open(os.path.join(p, str(cx)), "wb").write(codec.encode(blk.tobytes()))
     # the CT volume the prediction was made from: only its level-0 .zarray is read
-    v = os.path.join(root, vol_key(um), "0")
+    v = os.path.join(root, vol_key(um, stamp), "0")
     os.makedirs(v, exist_ok=True)
     json.dump({"chunks": [128] * 3, "compressor": None, "dtype": "|u1", "fill_value": 0,
                "filters": None, "order": "C", "shape": list(mask.shape), "zarr_format": 2,
@@ -270,14 +284,24 @@ def run_export(tmp, encoding, um=VOL_UM):
         serve_proc.terminate()
         serve_proc.wait()
         srv.shutdown()
+    # --src and --out are DIFFERENT trees, as they are in production (the fleet's tree
+    # is read over https and the coarse levels are written locally). Pointing both at
+    # one directory hides any confusion between them, which is how pool-levels shipped
+    # with a --src that it reassigned to --out.
+    pooled = str(tmp / "pooled")
     subprocess.run(coord + ["pool-levels", "--db", db, "--volcomp", VOLCOMP, "--src", out,
-                            "--out", out, "--tmp", str(tmp / "pooltmp")], env=env, check=True)
+                            "--out", pooled, "--tmp", str(tmp / "pooltmp")], env=env, check=True)
+    for root, _, files in os.walk(pooled):  # the published tree is the union of the two
+        for f in files:
+            rel = os.path.relpath(os.path.join(root, f), pooled)
+            os.makedirs(os.path.dirname(os.path.join(out, rel)), exist_ok=True)
+            shutil.copyfile(os.path.join(root, f), os.path.join(out, rel))
     for root, _, files in os.walk(meta):  # the metadata tree ships alongside the shards
         for f in files:
             rel = os.path.relpath(os.path.join(root, f), meta)
             os.makedirs(os.path.dirname(os.path.join(out, rel)), exist_ok=True)
             shutil.copyfile(os.path.join(root, f), os.path.join(out, rel))
-    return {"out": out, "mask": mask, "meta": meta}
+    return {"out": out, "pooled": pooled, "mask": mask, "meta": meta}
 
 
 @pytest.fixture(scope="module")
@@ -456,6 +480,36 @@ def test_mask_lossless_pool_levels_and_size(export_lossless, export):
     m = os.path.getsize(os.path.join(export["out"], PRED_KEY.rstrip("/"), "2.4", "c", "0", "0", "0"))
     assert n > m
     assert n < 0.2 * export_lossless["mask"].size, n
+
+
+# --------------------------------------------- pool-levels, every encoding ---
+
+
+def coarse_ladder(ex, pred_key):
+    """(all level paths, the ones pool-levels wrote into its own --out) for one prediction."""
+    levels = json.load(open(os.path.join(ex["out"], pred_key.rstrip("/"),
+                                         "zarr.json")))["attributes"]["volcomp"]["levels"]
+    root = os.path.join(ex["pooled"], pred_key.rstrip("/"))
+    built = [lv["path"] for lv in levels[SURF_LEVELS:]
+             if os.path.exists(os.path.join(root, lv["path"], "c", "0", "0", "0"))]
+    return [lv["path"] for lv in levels], built
+
+
+@pytest.mark.parametrize("encoding", ["export", "export_lossless", "export_ramp"])
+def test_pool_levels_builds_the_coarse_ladder_for_every_volume(encoding, request):
+    """Regression: pool-levels must build the levels above the four a unit writes for
+    EVERY volume in the db, not just the first one. It used to reassign its --src to
+    --out after the first volume's first level, so every later volume looked for the
+    level below in the (empty) output tree and silently wrote nothing."""
+    ex = request.getfixturevalue(encoding)
+    for key in (PRED_KEY, PRED2_KEY):
+        levels, built = coarse_ladder(ex, key)
+        assert len(levels) > SURF_LEVELS + 1, levels
+        # the first pooled level comes from the fleet's tree ...
+        assert levels[SURF_LEVELS] in built, (encoding, key, levels, built)
+        # ... and the one above it can only come from what pool-levels just wrote,
+        # so its presence is the proof that the chaining works
+        assert levels[SURF_LEVELS + 1] in built, (encoding, key, levels, built)
 
 
 # ----------------------------------------------------------- the ramp encoding

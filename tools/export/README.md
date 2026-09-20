@@ -150,7 +150,11 @@ They are exported as a second kind of unit, in their own shape:
   the eight chunks decoded and 2× majority pooled; for a ramp level, 2× mean
   pooling): streaming,
   resumable (an output shard that exists is left alone), and it can read the level
-  below from a local tree or over HTTPS from the published one.
+  below from a local tree or over HTTPS from the published one. `--src` holds the
+  levels the fleet wrote and is read-only; `--out` gets the coarse ones, and each
+  level above the first reads what the previous pass put in `--out`. They are
+  normally different trees (`--src` the published HTTPS root, `--out` a local
+  directory), and `--volume` restricts the run to one prediction.
 
 ### Occupancy masks, and the pyramid that is not a max pool
 
