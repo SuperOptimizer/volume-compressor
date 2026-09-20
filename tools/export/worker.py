@@ -20,8 +20,9 @@ Runs on every compute VM, one process per N cores:
   writes + verifies all four shard files), and uploads one shard per level. The VMs stay
   stdlib-only: everything numeric happens in C.
 
-  worker.py upload-tree DIR --sftp URL --netrc FILE
-      upload a local tree (e.g. the coordinator's metadata directory) to SFTP.
+  worker.py upload-tree DIR --sftp URL --netrc FILE [--batch 200]
+      upload a local tree (e.g. the coordinator's metadata directory, or the
+      coarse levels pool-levels built) to SFTP, --batch files per connection.
 
 --parallel is the number of shards in flight per process (each shard is one
 download pool of 32 connections + one shard-pack); the encode is ~1 s of CPU per
@@ -521,14 +522,39 @@ def cmd_run(a):
 
 
 def cmd_upload_tree(a):
-    n = 0
-    for root, _, files in os.walk(a.dir):
-        for f in files:
+    """Upload a whole tree, --batch files per sftp connection.
+
+    sftp_upload() opens a connection per file, which is right for a worker that
+    uploads a shard the moment it is made, and wrong for a tree of thousands:
+    the password handshake then costs far more than the data. Each file still
+    goes to <key>.part and is renamed into place, so a batch that dies halfway
+    leaves only whole files behind and re-running is safe."""
+    files = []
+    for root, _, fs in os.walk(a.dir):
+        for f in fs:
             local = os.path.join(root, f)
-            key = os.path.relpath(local, a.dir)
-            sftp_upload(local, a.sftp, key, a.netrc)
-            n += 1
-    log(f"uploaded {n} files")
+            files.append((local, os.path.relpath(local, a.dir)))
+    files.sort(key=lambda t: t[1])
+    total = sum(os.path.getsize(f) for f, _ in files)
+    log(f"uploading {len(files)} files, {total / 1e6:.1f} MB, {a.batch} per connection")
+    n = 0
+    t0 = time.time()
+    for i in range(0, len(files), a.batch):
+        chunk = files[i:i + a.batch]
+        cmds, dirs = [], set()
+        for local, key in chunk:
+            parts = key.split("/")
+            for j in range(1, len(parts)):
+                d = "/".join(parts[:j])
+                if d not in dirs:  # -mkdir tolerates "already there"
+                    dirs.add(d)
+                    cmds.append("-mkdir {root}/" + d)
+            cmds += [f"put {local} {{root}}/{key}.part", f"-rm {{root}}/{key}",
+                     f"rename {{root}}/{key}.part {{root}}/{key}"]
+        sftp_batch(a.sftp, a.netrc, cmds)
+        n += len(chunk)
+        log(f"uploaded {n}/{len(files)} files ({time.time() - t0:.0f}s)")
+    log(f"uploaded {n} files in {time.time() - t0:.0f}s")
 
 
 def main():
@@ -552,6 +578,8 @@ def main():
     p.add_argument("dir")
     p.add_argument("--sftp", required=True)
     p.add_argument("--netrc", required=True)
+    p.add_argument("--batch", type=int, default=200,
+                   help="files per sftp connection (default 200); the handshake dominates")
     p.set_defaults(fn=cmd_upload_tree)
     a = ap.parse_args()
     a.fn(a)

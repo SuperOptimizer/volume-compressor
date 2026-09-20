@@ -482,6 +482,38 @@ def test_mask_lossless_pool_levels_and_size(export_lossless, export):
     assert n < 0.2 * export_lossless["mask"].size, n
 
 
+# ------------------------------------------------------------ upload-tree ---
+
+
+def test_upload_tree_batches_connections(tmp_path):
+    """upload-tree opens one sftp connection per --batch files, not one per file (a
+    password handshake each), and every file still goes to <key>.part and is renamed
+    into place so a half-finished batch leaves only whole files behind."""
+    import worker
+
+    for rel in ("s/9.6/c/0/0/0", "s/9.6/c/0/0/1", "s/19.2/c/0/0/0"):
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"shard")
+    calls = []
+    real = worker.sftp_batch
+    worker.sftp_batch = lambda root, netrc, cmds: calls.append(cmds)
+    try:
+        import types
+        worker.cmd_upload_tree(types.SimpleNamespace(
+            dir=str(tmp_path), sftp="sftp://h:9238/volcomp", netrc="/dev/null", batch=2))
+    finally:
+        worker.sftp_batch = real
+    assert len(calls) == 2, [len(c) for c in calls]          # 3 files, 2 per connection
+    flat = [c for batch in calls for c in batch]
+    for rel in ("s/9.6/c/0/0/0", "s/9.6/c/0/0/1", "s/19.2/c/0/0/0"):
+        assert f"put {tmp_path}/{rel} {{root}}/{rel}.part" in flat, rel
+        assert f"rename {{root}}/{rel}.part {{root}}/{rel}" in flat, rel
+    # parents are made once per batch, and a failed mkdir must not abort it
+    assert flat.count("-mkdir {root}/s") == 2
+    assert all(c.startswith("-mkdir") for c in flat if "mkdir" in c)
+
+
 # --------------------------------------------- pool-levels, every encoding ---
 
 
