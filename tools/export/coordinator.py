@@ -1032,6 +1032,7 @@ def cmd_pool_levels(a):
         info = json.loads(info)
         levels = info["levels"]
         made = skipped = 0
+        lock = threading.Lock()
         t0 = time.time()
         for j in range(a.first, len(levels)):
             below, here = levels[j - 1], levels[j]
@@ -1039,46 +1040,63 @@ def cmd_pool_levels(a):
             # only in --out, where the previous pass of this loop put them
             src = a.src if j == a.first or not a.chain else a.out
             grid = [math.ceil(n / CHUNK) for n in here["shape"]]
-            for sz in range(grid[0]):
-                for sy in range(grid[1]):
-                    for sx in range(grid[2]):
-                        key = f"{name}{here['path']}/c/{sz}/{sy}/{sx}"
-                        out = os.path.join(a.out, key)
-                        if os.path.exists(out):
-                            skipped += 1
-                            continue
-                        work = tempfile.mkdtemp(prefix="pool-", dir=a.tmp)
-                        try:
-                            ins, got = [], 0
-                            for dz in range(2):
-                                for dy in range(2):
-                                    for dx in range(2):
-                                        k = f"{name}{below['path']}/c/{2 * sz + dz}/{2 * sy + dy}/{2 * sx + dx}"
-                                        dest = os.path.join(work, f"{dz}{dy}{dx}.shard")
-                                        if pool_fetch(src, k, dest):
-                                            ins.append(dest)
-                                            got += 1
-                                        else:
-                                            ins.append("-")
-                            if not got:
-                                continue  # nothing below: a missing shard is the fill value
-                            tmp_out = os.path.join(work, "out.shard")
-                            enc = here.get("encoding")
-                            flag = ("--mask-lossless" if enc == "mask-lossless" else
-                                    "--mask" if enc == "mask" else f"--q={here['q']:g}")
-                            r = subprocess.run([a.volcomp, "shard-pool", tmp_out, flag,
-                                                "--shape={},{},{}".format(*below["shape"]),
-                                                f"--pos={sz},{sy},{sx}"] + ins, capture_output=True, text=True)
-                            if r.returncode:
-                                raise RuntimeError(f"shard-pool failed for {key}: {r.stderr[-400:]}")
-                            if not os.path.exists(tmp_out):
-                                continue  # pooled to all zero
-                            os.makedirs(os.path.dirname(out), exist_ok=True)
-                            shutil.move(tmp_out, out + ".part")
-                            os.replace(out + ".part", out)
-                            made += 1
-                        finally:
-                            shutil.rmtree(work, ignore_errors=True)
+
+            def one(pos, below=below, here=here, src=src):
+                """One output shard: fetch the (up to) eight below it, pool, install."""
+                nonlocal made, skipped
+                sz, sy, sx = pos
+                key = f"{name}{here['path']}/c/{sz}/{sy}/{sx}"
+                out = os.path.join(a.out, key)
+                if os.path.exists(out):
+                    with lock:
+                        skipped += 1
+                    return
+                work = tempfile.mkdtemp(prefix="pool-", dir=a.tmp)
+                try:
+                    ins, got = [], 0
+                    for dz in range(2):
+                        for dy in range(2):
+                            for dx in range(2):
+                                k = f"{name}{below['path']}/c/{2 * sz + dz}/{2 * sy + dy}/{2 * sx + dx}"
+                                dest = os.path.join(work, f"{dz}{dy}{dx}.shard")
+                                if pool_fetch(src, k, dest):
+                                    ins.append(dest)
+                                    got += 1
+                                else:
+                                    ins.append("-")
+                    if not got:
+                        return  # nothing below: a missing shard is the fill value
+                    tmp_out = os.path.join(work, "out.shard")
+                    enc = here.get("encoding")
+                    flag = ("--mask-lossless" if enc == "mask-lossless" else
+                            "--mask" if enc == "mask" else f"--q={here['q']:g}")
+                    r = subprocess.run([a.volcomp, "shard-pool", tmp_out, flag,
+                                        "--shape={},{},{}".format(*below["shape"]),
+                                        f"--pos={sz},{sy},{sx}"] + ins, capture_output=True, text=True)
+                    if r.returncode:
+                        raise RuntimeError(f"shard-pool failed for {key}: {r.stderr[-400:]}")
+                    if not os.path.exists(tmp_out):
+                        return  # pooled to all zero
+                    os.makedirs(os.path.dirname(out), exist_ok=True)
+                    shutil.move(tmp_out, out + ".part")
+                    os.replace(out + ".part", out)
+                    with lock:
+                        made += 1
+                finally:
+                    shutil.rmtree(work, ignore_errors=True)
+
+            # The shards of ONE level are independent (they only read the level below),
+            # so they run in parallel; the levels themselves stay sequential because
+            # each is the input of the next. Most of the work is a 200 ms GET, and most
+            # of those GETs are 404s for air, so the win is the whole runtime.
+            todo = [(z, y, x) for z in range(grid[0]) for y in range(grid[1]) for x in range(grid[2])]
+            if a.jobs > 1 and len(todo) > 1:
+                with concurrent.futures.ThreadPoolExecutor(a.jobs) as ex:
+                    for _ in ex.map(one, todo):  # iterating re-raises the first failure
+                        pass
+            else:
+                for pos in todo:
+                    one(pos)
         print(f"{name}: {made} shards written, {skipped} already there, {time.time() - t0:.0f}s", flush=True)
     print(f"pool-levels done in {time.time() - t_all:.0f}s")
 
@@ -1124,6 +1142,9 @@ def main():
     p.add_argument("--first", type=int, default=SURF_LEVELS,
                    help="first level index to build (default 4); level --first - 1 is read from --src")
     p.add_argument("--tmp", default="/var/tmp/volcomp-pool")
+    p.add_argument("--jobs", type=int, default=16,
+                   help="output shards of one level to build at once (default 16); the work is "
+                        "almost all https GETs, so this is what sets the runtime")
     p.add_argument("--no-chain", dest="chain", action="store_false", default=True,
                    help="read every level from --src instead of chaining through --out")
     p.set_defaults(fn=cmd_pool_levels)
