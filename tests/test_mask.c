@@ -1,6 +1,7 @@
-/* Binary mask chunks (spec/format.md §11): the 2x2x2 majority pool stored
- * exactly, the interpolating decode, the const and raw forms, stream
- * validation, and the size of a real PHercParis4 recto mask. */
+/* Binary mask chunks: mode 4 (spec/format.md §11) — the 2x2x2 majority pool
+ * stored exactly and interpolated back — and mode 5 (§12) — the full 128^3 mask
+ * stored exactly with the same coder. Round trips, the const and raw forms,
+ * stream validation, and the size of a real PHercParis4 recto mask at both. */
 #include "../volcomp.h"
 #include "check.h"
 
@@ -55,6 +56,22 @@ static uint8_t ref_interp(const uint8_t *g, uint32_t jz, uint32_t jy, uint32_t j
         v += ww * (double)g[((size_t)zz * N + yy) * N + xx];
       }
   return (uint8_t)floor(255.0 * v + 0.5);
+}
+
+/* a filled sphere: a large smooth surface, the easy end for the context model */
+static void synth_sphere(uint8_t *v, double r) {
+  for (uint32_t z = 0; z < C; z++)
+    for (uint32_t y = 0; y < C; y++)
+      for (uint32_t x = 0; x < C; x++) {
+        double dz = (double)z - 63.5, dy = (double)y - 63.5, dx = (double)x - 63.5;
+        v[((size_t)z * C + y) * C + x] = dz * dz + dy * dy + dx * dx <= r * r ? 255u : 0u;
+      }
+}
+
+/* uniformly random bits: the hard end — the coder must fall back to RAW */
+static void synth_random(uint8_t *v, uint32_t seed) {
+  uint32_t r = seed | 1u;
+  for (size_t i = 0; i < VOLCOMP_CHUNK_VOXELS; i++) v[i] = (uint8_t)(vt_rng(&r) & 1u ? 255u : 0u);
 }
 
 /* deterministic blobby binary chunk */
@@ -262,6 +279,148 @@ static void test_raw(uint8_t *src, uint8_t *dec, uint8_t *grid, uint8_t *ref) {
   free(small);
 }
 
+/* ------------------------------------------------- mode 5: spatially lossless */
+
+/* `src` round trips through mode 5 byte for byte (as 0/255), every block decode
+ * agrees with the full decode, and the stream is never over the bound. */
+static size_t ll_roundtrip(const uint8_t *src, uint8_t *enc, uint8_t *dec) {
+  size_t n = 0;
+  CHECK_EQ(volcomp_mask_encode_lossless(src, enc, VOLCOMP_ENCODE_BOUND, &n), VOLCOMP_OK);
+  CHECK(n <= VOLCOMP_MASK_LL_BOUND);
+  uint32_t dim = 0;
+  CHECK_EQ(volcomp_mask_info(enc, n, &dim), VOLCOMP_OK);
+  CHECK_EQ(dim, VOLCOMP_CHUNK_DIM); /* how a reader tells mode 5 from mode 4 */
+  bool ll = true;
+  CHECK_EQ(volcomp_is_lossless(enc, n, &ll), VOLCOMP_OK);
+  CHECK_EQ(ll, 0); /* spatially exact, but 0/255 is not the u8 source */
+  float q = -1;
+  CHECK_EQ(volcomp_stream_q(enc, n, &q), VOLCOMP_OK);
+  CHECK(q == 0.0f);
+
+  CHECK_EQ(volcomp_decode(enc, n, dec, VOLCOMP_CHUNK_VOXELS), VOLCOMP_OK);
+  unsigned bad = 0;
+  for (size_t i = 0; i < VOLCOMP_CHUNK_VOXELS; i++) bad += dec[i] != (src[i] ? 255u : 0u);
+  CHECK_EQ(bad, 0);
+
+  /* the stored grid is the chunk itself */
+  uint8_t *grid = malloc(VOLCOMP_CHUNK_VOXELS);
+  CHECK_EQ(volcomp_mask_decode_stored(enc, n, grid, VOLCOMP_CHUNK_VOXELS), VOLCOMP_OK);
+  CHECK_EQ(memcmp(grid, dec, VOLCOMP_CHUNK_VOXELS), 0);
+  CHECK_EQ(volcomp_mask_decode_stored(enc, n, grid, VOLCOMP_CHUNK_VOXELS - 1), VOLCOMP_ERR_SHORT_BUF);
+  free(grid);
+
+  uint8_t blk[VOLCOMP_BLOCK_VOXELS];
+  for (uint32_t b = 0; b < 512; b += 37) {
+    uint32_t bz = b >> 6, by = (b >> 3) & 7, bx = b & 7;
+    CHECK_EQ(volcomp_decode_block(enc, n, bz, by, bx, blk, sizeof blk), VOLCOMP_OK);
+    unsigned d = 0;
+    for (uint32_t z = 0; z < 16; z++)
+      for (uint32_t y = 0; y < 16; y++)
+        d += memcmp(blk + z * 256 + y * 16,
+                    dec + ((size_t)(bz * 16 + z) * C + by * 16 + y) * C + bx * 16, 16) != 0;
+    CHECK_EQ(d, 0);
+  }
+  return n;
+}
+
+static void test_ll_roundtrip(uint8_t *src, uint8_t *enc, uint8_t *dec) {
+  for (uint32_t seed = 1; seed <= 3; seed++) {
+    synth_mask(src, seed);
+    ll_roundtrip(src, enc, dec);
+  }
+  synth_sphere(src, 40.0);
+  ll_roundtrip(src, enc, dec);
+  /* a source that is nonzero but pools to nothing under mode 4 is kept exactly here */
+  memset(src, 0, VOLCOMP_CHUNK_VOXELS);
+  for (uint32_t z = 0; z < C; z += 2)
+    for (uint32_t y = 0; y < C; y += 2)
+      for (uint32_t x = 0; x < C; x += 2) src[((size_t)z * C + y) * C + x] = 1; /* any nonzero is 1 */
+  ll_roundtrip(src, enc, dec);
+  /* random bits: incompressible, so the encoder must choose RAW and stay at the bound */
+  synth_random(src, 99);
+  size_t n = ll_roundtrip(src, enc, dec);
+  CHECK_EQ(n, VOLCOMP_MASK_LL_BOUND);
+  uint32_t flags = 0;
+  memcpy(&flags, enc + 8, 1);
+  CHECK_EQ(flags, 2u); /* VMK_FORM_RAW */
+}
+
+static void test_ll_const(uint8_t *src, uint8_t *enc, uint8_t *dec) {
+  for (int one = 0; one <= 1; one++) {
+    memset(src, one ? 255 : 0, VOLCOMP_CHUNK_VOXELS);
+    size_t n = 0;
+    CHECK_EQ(volcomp_mask_encode_lossless(src, enc, VOLCOMP_ENCODE_BOUND, &n), VOLCOMP_OK);
+    CHECK_EQ(n, VMK_HDR_BYTES + 1u);
+    CHECK_EQ(volcomp_decode(enc, n, dec, VOLCOMP_CHUNK_VOXELS), VOLCOMP_OK);
+    unsigned bad = 0;
+    for (size_t i = 0; i < VOLCOMP_CHUNK_VOXELS; i++) bad += dec[i] != (one ? 255u : 0u);
+    CHECK_EQ(bad, 0);
+  }
+}
+
+/* a destination that only fits the raw form, and one that fits nothing */
+static void test_ll_raw(uint8_t *src, uint8_t *dec) {
+  synth_random(src, 7);
+  uint8_t *small = malloc(VOLCOMP_MASK_LL_BOUND);
+  size_t n = 0;
+  CHECK_EQ(volcomp_mask_encode_lossless(src, small, 32u, &n), VOLCOMP_ERR_SHORT_BUF);
+  CHECK_EQ(volcomp_mask_encode_lossless(src, small, VOLCOMP_MASK_LL_BOUND - 1u, &n), VOLCOMP_ERR_SHORT_BUF);
+  CHECK_EQ(volcomp_mask_encode_lossless(src, small, VOLCOMP_MASK_LL_BOUND, &n), VOLCOMP_OK);
+  CHECK_EQ(n, VOLCOMP_MASK_LL_BOUND);
+  CHECK_EQ(volcomp_decode(small, n, dec, VOLCOMP_CHUNK_VOXELS), VOLCOMP_OK);
+  unsigned bad = 0;
+  for (size_t i = 0; i < VOLCOMP_CHUNK_VOXELS; i++) bad += dec[i] != (src[i] ? 255u : 0u);
+  CHECK_EQ(bad, 0);
+  free(small);
+}
+
+static void test_ll_reject(uint8_t *src, uint8_t *enc, uint8_t *dec) {
+  /* a sphere, not a noisy blob: a truncated stream decodes garbage, which
+   * renormalises on nearly every bit and is several times slower than a real
+   * one, so the sweep below wants the smallest representative stream */
+  synth_sphere(src, 50.0);
+  size_t n = 0;
+  CHECK_EQ(volcomp_mask_encode_lossless(src, enc, VOLCOMP_ENCODE_BOUND, &n), VOLCOMP_OK);
+  uint8_t *copy = malloc(n + 1);
+  /* truncation: every length up to the header, then a sample (a 128^3 decode is
+   * ~8 ms, so every one of the thousands of lengths would take minutes) */
+  for (size_t k = 0; k < n; k += k < VMK_HDR_BYTES + 8u ? 1u : 61u) {
+    memcpy(copy, enc, k);
+    volcomp_status st = volcomp_decode(copy, k, dec, VOLCOMP_CHUNK_VOXELS);
+    CHECK(st == VOLCOMP_ERR_CORRUPT || st == VOLCOMP_ERR_VERSION);
+  }
+  CHECK_EQ(volcomp_decode(enc, n - 1, dec, VOLCOMP_CHUNK_VOXELS), VOLCOMP_ERR_CORRUPT);
+  memcpy(copy, enc, n); /* trailing garbage */
+  copy[n] = 0x5A;
+  CHECK_EQ(volcomp_decode(copy, n + 1, dec, VOLCOMP_CHUNK_VOXELS), VOLCOMP_ERR_CORRUPT);
+  memcpy(copy, enc, n); /* reserved flag bits */
+  copy[VF_HDR_BYTES] |= 0x40u;
+  CHECK_EQ(volcomp_decode(copy, n, dec, VOLCOMP_CHUNK_VOXELS), VOLCOMP_ERR_CORRUPT);
+  memcpy(copy, enc, n); /* an unknown form */
+  copy[VF_HDR_BYTES] = 3u;
+  CHECK_EQ(volcomp_decode(copy, n, dec, VOLCOMP_CHUNK_VOXELS), VOLCOMP_ERR_CORRUPT);
+  memcpy(copy, enc, n); /* a nonzero q_raw */
+  copy[6] = 1;
+  CHECK_EQ(volcomp_decode(copy, n, dec, VOLCOMP_CHUNK_VOXELS), VOLCOMP_ERR_CORRUPT);
+  memcpy(copy, enc, n); /* an unknown mode is still refused */
+  copy[5] = 6;
+  CHECK_EQ(volcomp_decode(copy, n, dec, VOLCOMP_CHUNK_VOXELS), VOLCOMP_ERR_CORRUPT);
+  memcpy(copy, enc, n); /* the range coder's priming byte must be zero */
+  copy[VMK_HDR_BYTES] = 1;
+  CHECK_EQ(volcomp_decode(copy, n, dec, VOLCOMP_CHUNK_VOXELS), VOLCOMP_ERR_CORRUPT);
+  uint32_t r = 777;
+  for (int t = 0; t < 40; t++) { /* flipped payload bits never crash */
+    memcpy(copy, enc, n);
+    size_t pos = VMK_HDR_BYTES + 1u + vt_rng(&r) % (n - VMK_HDR_BYTES - 1u);
+    copy[pos] ^= (uint8_t)(1u << (vt_rng(&r) % 8));
+    volcomp_status st = volcomp_decode(copy, n, dec, VOLCOMP_CHUNK_VOXELS);
+    CHECK(st == VOLCOMP_OK || st == VOLCOMP_ERR_CORRUPT);
+  }
+  CHECK_EQ(volcomp_decode(enc, n, dec, VOLCOMP_CHUNK_VOXELS - 1), VOLCOMP_ERR_SHORT_BUF);
+  CHECK_EQ(volcomp_mask_encode_lossless(NULL, enc, VOLCOMP_ENCODE_BOUND, &n), VOLCOMP_ERR_ARG);
+  free(copy);
+}
+
 int main(void) {
   uint8_t *src = malloc(VOLCOMP_CHUNK_VOXELS), *dec = malloc(VOLCOMP_CHUNK_VOXELS);
   uint8_t *enc = malloc(VOLCOMP_ENCODE_BOUND);
@@ -270,6 +429,10 @@ int main(void) {
   test_const(src, enc, dec, grid);
   test_reject(src, enc, dec);
   test_raw(src, dec, grid, ref);
+  test_ll_roundtrip(src, enc, dec);
+  test_ll_const(src, enc, dec);
+  test_ll_raw(src, dec);
+  test_ll_reject(src, enc, dec);
 
   /* ---- the real recto fixture: size and speed ---- */
   uint32_t nch = 0;
@@ -310,6 +473,33 @@ int main(void) {
     for (uint32_t i = 0; i < nch && i < 8; i++) printf(" %zu", sizes[i]);
     printf("\n");
     CHECK(bpv <= 0.007);
+
+    /* the same fixture at mode 5: no downscale, every voxel exact */
+    uint64_t llbytes = 0;
+    double t_lle = 0, t_lld = 0;
+    for (uint32_t i = 0; i < nch; i++) {
+      const uint8_t *c = chunks + (size_t)i * VOLCOMP_CHUNK_VOXELS;
+      size_t n = 0;
+      double t0 = now();
+      CHECK_EQ(volcomp_mask_encode_lossless(c, enc, VOLCOMP_ENCODE_BOUND, &n), VOLCOMP_OK);
+      t_lle += now() - t0;
+      sizes[i & 7] = n;
+      llbytes += n;
+      t0 = now();
+      CHECK_EQ(volcomp_decode(enc, n, dec, VOLCOMP_CHUNK_VOXELS), VOLCOMP_OK);
+      t_lld += now() - t0;
+      unsigned bad = 0;
+      for (size_t k = 0; k < VOLCOMP_CHUNK_VOXELS; k++) bad += dec[k] != (c[k] ? 255u : 0u);
+      CHECK_EQ(bad, 0);
+    }
+    double llbpv = 8.0 * (double)llbytes / vox;
+    printf("recto fixture, mask-lossless: %llu bytes, %.5f bits/voxel "
+           "(encode %.1f Mvox/s, decode %.1f Mvox/s)\n",
+           (unsigned long long)llbytes, llbpv, vox / t_lle / 1e6, vox / t_lld / 1e6);
+    printf("  per chunk:");
+    for (uint32_t i = 0; i < nch && i < 8; i++) printf(" %zu", sizes[i]);
+    printf("\n");
+    CHECK(llbpv <= 0.03);
     free(chunks);
   }
   free(src);

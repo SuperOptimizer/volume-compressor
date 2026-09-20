@@ -11,8 +11,10 @@ no dependencies beyond libc/libm.
 | **0** (`VOLCOMP_Q_LOSSLESS`) | predictive, exact | none — decoded bytes are the source bytes | class maps, masks, valid/occupancy flags, anything whose values *are* the data (a wrong label is not a "small" error), and archival copies |
 | **1..255** | 3-D DCT + dead-zone quantiser | P99 ≈ 2.5 q on scroll data | greyscale CT and model probability maps, where 20–200× at a controlled error is the point |
 
-and `volcomp_mask_encode` is a third mode for **binary masks** (below), where
-half the spatial resolution costs 30× less than storing the mask exactly.
+and there are two further modes for **binary masks** (below):
+`volcomp_mask_encode`, where half the spatial resolution costs 30× less than
+storing the mask exactly, and `volcomp_mask_encode_lossless`, which stores the
+mask itself, voxel for voxel, for 4× that.
 
 Both modes share the geometry, the entropy coder, the API and the stream
 header, so a reader does not need to know which one produced a chunk;
@@ -37,6 +39,10 @@ the raw chunk plus 8 bytes, so it is always safe to reach for.
   back to 128³. **0.0057 bits per voxel** on the PHercParis4 recto surface
   prediction — 11× smaller than packbits + zstd-19 of the same mask, 350 000× the
   raw chunk.
+- Mask, spatially lossless (`volcomp_mask_encode_lossless`): the same coder and
+  the same context model over the **full 128³** mask, no pool and no
+  interpolation, decoding to 0/255 voxel for voxel. **0.0255 bits per voxel** on
+  the same data — 4.5× mode 4, still 2.4× smaller than packbits + zstd-19.
 - Format: [`spec/format.md`](spec/format.md). Header byte 5 records the mode,
   and volcomp 1.0 rejects a nonzero value there, so old readers cannot
   misread a lossless chunk; `q >= 1` streams are byte-identical to 1.0's.
@@ -63,8 +69,11 @@ volcomp_deblock(volume, nz, ny, nx, 8.0f);   /* optional, after assembling decod
 ```c
 st = volcomp_mask_encode(mask /* 128^3, nonzero = set */, enc, VOLCOMP_ENCODE_BOUND, &n);
 st = volcomp_decode(enc, n, dst, VOLCOMP_CHUNK_VOXELS);   /* the same call as any other chunk */
-st = volcomp_mask_info(enc, n, &dim);                     /* OK (dim = 64) iff it is a mask chunk */
+st = volcomp_mask_info(enc, n, &dim);                     /* OK iff a mask chunk; dim = 64 or 128 */
 st = volcomp_mask_decode_stored(enc, n, grid, VOLCOMP_MASK_VOXELS);  /* the 64^3 grid itself */
+
+st = volcomp_mask_encode_lossless(mask, enc, VOLCOMP_ENCODE_BOUND, &n);  /* exact: dim = 128 */
+st = volcomp_decode(enc, n, dst, VOLCOMP_CHUNK_VOXELS);   /* 0/255, voxel for voxel */
 ```
 
 A mask chunk stores the 2×2×2 **majority** pool of the mask — a 64³ grid — and
@@ -77,6 +86,15 @@ readers — works unchanged. `volcomp_is_lossless` is false for a mask chunk, an
 a mask chunk is never larger than 32 777 bytes. The stored grid of one rung is
 exactly the mask of the next coarser rung, so a mask pyramid is built by reading
 grids, not by pooling pixels.
+
+`volcomp_mask_encode_lossless` is the same thing without the pool: the whole
+128³ mask coded with the same 12-neighbour model, so `volcomp_decode` gives back
+0 and 255 exactly where the source was zero and nonzero. It costs 4.5× mode 4
+(0.0255 bits per voxel on the recto) and is never larger than
+`VOLCOMP_MASK_LL_BOUND` = 262 153 bytes. `volcomp_mask_info` reports a stored
+edge of 128 for it and 64 for mode 4, which is how a reader tells them apart;
+`volcomp_is_lossless` is false for both (a nonzero source voxel comes back 255,
+not its own value).
 
 Everything is `static`; include the header in the translation unit that uses
 it. No arch flags are needed: on x86-64 the AVX2+FMA kernels are compiled with
@@ -135,7 +153,7 @@ tools/fetch_corpus.sh fetch tune && ./build/release/volcomp-bench --corpus=corpu
 ```
 
 Presets: `dev` (asan+ubsan), `release`, `bench` (`-march=native`), `fuzz`
-(libFuzzer targets `fuzz_d_chunk`, `fuzz_rt_chunk`). Requires clang or GCC and
+(libFuzzer targets `fuzz_d_chunk`, `fuzz_rt_chunk`, `fuzz_rt_mask`, `fuzz_rt_mask_ll`). Requires clang or GCC and
 C23; Linux x86-64 is where it is measured, arm64 compiles and uses the C
 kernels. `-DVOLCOMP_STATIC_AVX2=ON` adds `-mavx2 -mfma` (no runtime dispatch),
 `-DVOLCOMP_NO_AVX2=ON` builds the C kernels only; `ctest` always runs the

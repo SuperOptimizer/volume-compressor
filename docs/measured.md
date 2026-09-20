@@ -790,3 +790,64 @@ Measured on a 256^3 recto chunk set (2.4 um, 19.6 % foreground), in bits per
 - **Pyramid.** One rung's stored grid *is* the next rung's mask, so coarser
   levels are assembled from grids rather than pooled — exact, and `shard-pool`
   does no arithmetic at all in mask mode.
+
+## 2026-09-20: spatially lossless mask chunks (mode 5, format revision 3)
+
+The 2x mask mode above throws away the boundary: thresholding its decode moves
+1.7 % of the voxels by up to two. Where the published mask must come back
+*exactly* — a label store, a re-export that has to be a bit-for-bit copy of the
+source grid — mode 5 runs the identical coder (same 12 causal neighbours, same
+4096 contexts, same {1,1,2,2,3} adaptation schedule, same CONST/RAW fallbacks)
+over the full 128^3 mask instead of its 64^3 pool.
+
+Same 256^3 recto fixture (2.4 um, 19.6 % foreground), bits per voxel:
+
+| form | bits/voxel | bytes / 128^3 chunk |
+|---|---|---|
+| packbits + zstd-19, full resolution | 0.062 | 16 300 |
+| ideal 12-neighbour context model, full resolution | 0.022 | 5 770 |
+| **mode 5**: adaptive range coder, full resolution | **0.0255** | **6 682** |
+| mode 4: adaptive range coder over the 2x pool | 0.0057 | 1 492 |
+
+The adaptive coder lands within 16 % of the *ideal* (two-pass, non-adaptive)
+model over the same context set, and 2.4x below packbits + zstd-19. Mode 5 is
+4.5x mode 4 on this data.
+
+- **Speed** (one core, Core Ultra 9 275HX, release, on the fixture, best of 15,
+  six runs): encode **247-289 M** voxels/s, decode **227-269 M** — 7-9 ms per
+  128^3 chunk. The coder is bit-serial and touches 8x the bits mode 4 does
+  (2 097 152 against 262 144), so it runs at roughly a fifth of mode 4's
+  1 353-1 538 M / 759-1 139 M on the same box. Still 5x the ~50 M/s the export
+  needs, and the export is download bound anyway.
+- **What was tried and rejected on the hot loop** (identical bitstream, all
+  measured against the same fixture on the same box):
+  - *Packing p and its age into one uint16* (one load and one store per bit
+    instead of two arrays): **slower**, 170-230 M against 245-280 M. Unpacking
+    the age sits on the load -> multiply -> compare -> next-context critical
+    path; splitting the arrays keeps it off. REJECTED.
+  - *Loading both c1 halves as one aligned 32-bit word* so the load address no
+    longer depends on the bit just coded: **slower**, 165-180 M. The read-modify-
+    write store costs more than the ~5 cycles of L1 latency it hides. REJECTED.
+  - *Hoisting the range-coder state into locals for the whole grid*: no
+    measurable gain (the compiler already keeps `range` in a register; `low` is
+    only touched on renormalisation, which happens once per ~300 coded bits at
+    this entropy). REJECTED.
+  - *Halving the context-gather cost*: doubling `vmk_pre_row`'s work changed
+    nothing measurable — the gather is already SSE2-autovectorised and hides
+    entirely in the shadow of the serial coder. Nothing to win there.
+  - ADOPTED: an unconditional saturating age update (`VMK_NEXT`) instead of a
+    branch, and `always_inline` on the two bit coders. Neutral to slightly
+    positive, and branchless.
+- **Export cost** (PHercMANBp m7 prediction, 9.596 um, unit [2, 1, 1], 24
+  threads, real S3 source): the same 4-level pyramid as mode 4, per occupied
+  chunk 3 497 / 5 645 / 10 448 / 22 656 bytes at the four levels against
+  836 / 1 344 / 2 836 / 5 328 — **1.97 MB against 482 kB for the unit, 4.08x**.
+  Pack time 2.0 s against 1.4 s; download (2.3 s) is unchanged and still
+  dominates. Byte-for-byte check: re-running the same unit at `--encoding mask`
+  with this build reproduces the pre-change shard files exactly, so the published
+  2x tree stays valid.
+- **Projection.** The other 41 published predictions hold **7 137 222 occupied
+  level-0 chunks** (measured with `volcomp surface-occupancy` over each one's
+  coarsest published level — the same pass reproduces the recto's 11 424 267
+  exactly): **32.7 GB** at mask-lossless against 7.8 GB at the 2x mode. The recto
+  itself would be ~80 GB against its measured 19 GB.

@@ -104,9 +104,32 @@ def main():
     print(f"{'mask':>14}: {len(enc):9d} bytes ({raw / len(enc):9.1f}x)  "
           f"{8 * len(enc) / raw:.5f} bits/voxel")
 
+    print("\n-- zarr v3 array, codec volcomp(mode=mask-lossless) --")
+    store = zarr.storage.MemoryStore()
+    z = zarr.create_array(store, shape=mask.shape, chunks=(D, D, D), dtype="uint8",
+                          serializer=VolcompCodec(mode="mask-lossless"), fill_value=0)
+    z[:] = mask
+    got = z[:]
+    assert np.array_equal(got, mask), "mask-lossless is not exact"
+    enc = vz.mask_encode_lossless(mask.tobytes())
+    assert vz.mask_info(enc) == vz.MASK_LL_DIM and not vz.is_lossless(enc)
+    assert len(enc) <= vz.MASK_LL_BOUND
+    assert np.array_equal(np.frombuffer(bytes(vz.mask_decode_stored(enc)), np.uint8).reshape(D, D, D),
+                          mask)
+    assert np.array_equal(zarr.open_array(store, mode="r")[:], mask)
+    print(f"{'mask-lossless':>14}: {len(enc):9d} bytes ({raw / len(enc):9.1f}x)  "
+          f"{8 * len(enc) / raw:.5f} bits/voxel")
+
     # the codec's own metadata round trip and validation
     assert VolcompCodec.from_dict(VolcompCodec(q=0.0).to_dict()) == VolcompCodec(q=0.0)
     assert VolcompCodec.from_dict(VolcompCodec(mode="mask").to_dict()) == VolcompCodec(mode="mask")
+    assert (VolcompCodec.from_dict(VolcompCodec(mode="mask-lossless").to_dict())
+            == VolcompCodec(mode="mask-lossless"))
+    try:
+        VolcompCodec(mode="nope")
+        raise SystemExit("expected an unknown mode to be rejected")
+    except ValueError:
+        pass
     for bad in (0.5, -1.0, 256.0):
         try:
             VolcompCodec(q=bad)

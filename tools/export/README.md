@@ -58,7 +58,7 @@ They are exported as a second kind of unit, in their own shape:
   copy and never becomes output data — ours is built from the mask itself. The
   coarsest published level is still used, as an occupancy oracle, but only where
   it is provably an exact max pool (see below).
-- **The mask, at half the rung's resolution** (`encoding: "mask"`, the default).
+- **The mask, at half the rung's resolution** (`--encoding mask`, the default).
   Each 128³ output chunk holds the published binary mask; what is *stored* is its
   2×2×2 majority pool — a 64³ grid — coded exactly by `volcomp.h`'s mask mode
   (spec §11), and what a reader gets back from `volcomp_decode` is that grid
@@ -73,6 +73,30 @@ They are exported as a second kind of unit, in their own shape:
   below's own stored grid, so the pyramid is built by reading grids, not by pooling
   pixels, and nothing is lost on the way up. A thin sheet does eventually vanish
   under repeated majority pooling; those top rungs are then simply absent.
+- **The mask, exactly, on its own grid** (`--encoding mask-lossless`). Same
+  pyramid, same chunking, but every level is a volcomp **lossless** mask chunk
+  (spec §12): the mask of that level at full resolution, coded with the same
+  12-neighbour context model, so `volcomp_decode` returns 0/255 voxel for voxel
+  and nothing is interpolated. **0.0255 bits per voxel** on the PHercParis4
+  recto — 4.5x the 2x form, still 2.4x smaller than packbits + zstd-19.
+  This encoding defaults to `--no-resample`: level 0 is the published grid
+  itself (scale 1, output shape = source shape), so the export is a bit-exact
+  copy of the source array rather than a resampling of it. The levels are then
+  named by their **true** voxel size, `native_um * 2^L`, printed with up to
+  three decimals and no trailing zeros: an m7 prediction computed on level 2 of
+  a 2.399 um scan is natively 9.596 um and gets `9.596`, `19.192`, `38.384`,
+  ...; a 9.362 um scan gets `9.362`, `18.724`, ...; and the PHercParis4 recto,
+  natively 2.400 um, keeps `2.4`, `4.8`, ... — the same spellings the ladder
+  gave it. The group attributes record `encoding.name = "surface-mask-lossless"`,
+  `resampled: false`, `native_voxel_size_um`, `rung_voxel_size_um` = the finest
+  level's true size, and OME `coordinateTransformations` carrying those sizes.
+  Coarser levels are still the 2x2x2 **majority** pool of the level below
+  (voxels outside the array counting as air), so the pyramid is the same one the
+  2x form builds — it is just stored exactly at every level instead of one level
+  down. `--no-resample` is available to the other encodings too, and
+  `--resample` turns it back off for `mask-lossless`.
+  **`--encoding mask` is unchanged**, ladder and all: the published Paris 4 tree
+  stays valid.
 - **The ramp** (`--encoding ramp`) is the older form, kept for re-exports that ask
   for it. The mask becomes a continuous *signed-distance ramp*: with `s`
   the signed Euclidean distance to the mask boundary in source voxels, positive
@@ -84,7 +108,8 @@ They are exported as a second kind of unit, in their own shape:
   has every offset within ±3, so three min-plus passes with a ±3 window over
   squared distances give the exact Euclidean value. Each output chunk is computed
   with a 3-voxel halo, so the result never depends on the tiling.
-- **The exact ladder.** Every exported array sits on the power-of-two grid
+- **The exact ladder** (resampled encodings only; `--no-resample` skips all of
+  this and keeps the source grid). Every exported array sits on the power-of-two grid
   `rung k = 0.6 * 2^k um`, not on the source's own grid: a prediction native at
   9.362 or 8.640 or 9.596 um is resampled onto exactly 9.6 um, 2.215 onto 2.4,
   and even a 2.399 um scan is resampled onto exactly 2.400 (0.1 % is ~90 voxels
@@ -120,8 +145,9 @@ They are exported as a second kind of unit, in their own shape:
   footprint, so nothing crosses units. Levels 1..3 are exact 2× mean pooling of
   the *exact* ramp, before it is quantised.
 - **Levels above the fourth** are built offline by `coordinator.py pool-levels`,
-  one 128³ shard at a time (`volcomp shard-pool`: for a mask level, the eight
-  stored grids below assembled into the coarser chunk; for a ramp level, 2× mean
+  one 128³ shard at a time (`volcomp shard-pool`: for a 2x mask level, the eight
+  stored grids below assembled into the coarser chunk; for a mask-lossless level,
+  the eight chunks decoded and 2× majority pooled; for a ramp level, 2× mean
   pooling): streaming,
   resumable (an output shard that exists is left alone), and it can read the level
   below from a local tree or over HTTPS from the published one.
@@ -166,13 +192,14 @@ one thread per output chunk:
 ```sh
 volcomp surface-pack SRCDIR OUTDIR --csize=192 --src-shape=4287,3145,3145 \
     --out-shape=4285,3144,3144 --shard=2,1,1 --scale=1.0004168403418091 \
-    --mask [--dmax=3] [--threads=0] [--samples=8]      # or --q=2,1,1,1 for the ramp
+    --mask [--dmax=3] [--threads=0] [--samples=8]      # --mask-lossless, or --q=2,1,1,1 for the ramp
 # ok src_chunks=252 src_nonzero=1 out_voxels=1073741824 compared=11 psnr_min=44.17
 #    max_err=66 t_decode=0.33 t_ramp=4.91 t_encode=0.25 vox_per_s=2.18e+08 ...
 #    present0=489 bytes0=19157548 present1=64 ... bytes=27765986
 ```
 
-`--mask` selects the mask encoding (no argument, no `--q`); `--occupancy=HEX` is
+`--mask` selects the 2x mask encoding and `--mask-lossless` the exact one (no
+argument, no `--q`); `--occupancy=HEX` is
 the unit's 512-bit occupancy mask (128 hex digits) when the prediction has one.
 (It was spelled `--mask=HEX` before the mask encoding existed.) `SRCDIR` holds the raw source chunks the worker downloaded, named
 `<cz>_<cy>_<cx>.blosc` by their absolute source chunk index (a missing file is an
@@ -183,7 +210,8 @@ frame per block; byte unshuffle is implemented but is the identity at typesize 1
 re-tiles source chunks of any size onto the 128³ output grid, resamples, pools,
 encodes, and verifies — every stored chunk is decoded again, and for a sampled
 subset the mask encoding checks its own invariant (every stored block centre comes
-back as the 2×2×2 majority of the source, 0 or 255 exactly) while the ramp encoding
+back as the 2×2×2 majority of the source, 0 or 255 exactly), the lossless mask
+encoding checks that every voxel round trips, while the ramp encoding
 compares against the ramp it came from (`psnr_min`, `max_err`, reported back to the
 coordinator). A unit whose source is nonzero but whose level-0 shard came out empty
 fails.
@@ -260,6 +288,38 @@ The manifest counts **11 424 267 occupied chunks** over the recto's 26 291 non-e
 units, so the four levels the fleet writes come to **14.7 + 3.3 + 0.8 + 0.2 = 19 GB**
 — against the ~700 GB the ramp at q 8 would have cost for level 0 alone.
 
+### What the lossless mask encoding costs (measured, S3, whole unit)
+
+The same PHercMANBp m7 unit [2, 1, 1] again, `--encoding mask-lossless`
+(so `--no-resample`: level 0 is the source's own 9.596 µm grid, 4287³, not the
+9.6 µm rung), 24 threads: 203 of 252 source chunks downloaded in 2.3 s, packed
+in 2.0 s (against 1.8 s / 1.4 s for the 2× form on the same machine), 500 chunks
+out. Levels are named by their true voxel size:
+
+| level | 9.596 µm | 19.192 | 38.384 | 76.768 | total |
+|---|---|---|---|---|---|
+| chunks present | 428 / 512 | 63 / 64 | 8 / 8 | 1 / 1 | 500 |
+| mask-lossless | 1 505 kB | 357 kB | 83.7 kB | 22.7 kB | **1 968 kB** |
+| bytes per occupied chunk | 3 497 | 5 645 | 10 448 | 22 656 | |
+| 2× mask (`--encoding mask`, 9.6 µm rung) | 367 kB | 87 kB | 22.8 kB | 5.3 kB | **482 kB** |
+| ratio | 4.10× | 4.10× | 3.67× | 4.24× | **4.08×** |
+
+**Projection for the other 41 published predictions** (everything except the
+PHercParis4 recto and this PHercMANBp m7). Their occupancy was measured the same
+way the manifest measures it — `volcomp surface-occupancy` over each
+prediction's coarsest published level, which reproduces the recto's 11 424 267
+exactly — giving **7 137 222 occupied level-0 chunks** of 18 260 622 in the grid
+(26 % to 66 % per prediction, median 40 %). At the per-chunk sizes above, and
+with levels 1..3 in the proportion this unit shows:
+
+| | level 0 | levels 1..3 | total |
+|---|---|---|---|
+| mask-lossless | 25.0 GB | 7.7 GB | **32.7 GB** |
+| 2× mask | 6.0 GB | 1.8 GB | 7.8 GB |
+
+The PHercParis4 recto, on the same 4.1–4.5× ratio applied to its measured 19 GB,
+would be **~80 GB** at mask-lossless; all 43 predictions together, **~113 GB**.
+
 ### Run it
 
 ```sh
@@ -281,7 +341,7 @@ Local dry run, exactly as for CT but with `manifest-surfaces`; the offline
 end-to-end test does precisely this against a synthetic bucket:
 
 ```sh
-python3 -m pytest tools/export/test_export.py     # both encodings; needs numpy/scipy/numcodecs, no network
+python3 -m pytest tools/export/test_export.py     # all three encodings; needs numpy/scipy/numcodecs, no network
 ctest --preset release -R 'test_surface|test_mask'  # ramp values, tiling, pooling, blosc, mask chunks
 ```
 

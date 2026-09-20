@@ -104,7 +104,7 @@ endforeach()
 
 # ---- fuzz ----
 if(VOLCOMP_FUZZ)
-  foreach(tgt d_chunk rt_chunk rt_mask)
+  foreach(tgt d_chunk rt_chunk rt_mask rt_mask_ll)
     add_executable(fuzz_${tgt} fuzz/${tgt}.c)
     target_link_libraries(fuzz_${tgt} PRIVATE volcomp)
     target_compile_options(fuzz_${tgt} PRIVATE -fsanitize=fuzzer,address,undefined -g -O1)

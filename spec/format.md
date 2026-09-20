@@ -1,4 +1,4 @@
-# volcomp stream format, version 1 (revision 2)
+# volcomp stream format, version 1 (revision 3)
 
 Normative. A conforming decoder accepts exactly the streams described here and
 rejects everything else with `VOLCOMP_ERR_CORRUPT` (or `VOLCOMP_ERR_VERSION`
@@ -25,7 +25,7 @@ offset  size   field
 0       4      magic  "VOLC"
 4       1      version = 1
 5       1      mode   0 = lossy DCT (this section), 1..3 = lossless (§10),
-                      4 = binary mask (§11)
+                      4 = binary mask (§11), 5 = lossless binary mask (§12)
 6       2      q_raw  u16, quantiser step q = q_raw / 256, 256 <= q_raw <= 65280
 8       T      frequency tables (§4.3), 10 models
 8+T     256    directory: 32 × { u32 tok_n, u32 bypass_n }
@@ -44,10 +44,12 @@ decoder; a mode-0 stream is byte for byte what volcomp 1.0 produced.
 because every stream a revision defines is a stream every earlier decoder
 already rejects: the mode byte is the compatibility mechanism. Revision 1
 (volcomp 1.0.x) defines modes 0..3 and rejects 4..255 with
-`VOLCOMP_ERR_CORRUPT`; revision 2 (volcomp 1.1.0, `VOLCOMP_FORMAT_REVISION`)
-adds mode 4, the binary mask chunk of §11, and changes nothing else. A writer
-must not emit a mask chunk to a consumer that only reads revision 1; that
-consumer will refuse it cleanly rather than misread it.
+`VOLCOMP_ERR_CORRUPT`; revision 2 (volcomp 1.1.0) adds mode 4, the binary mask
+chunk of §11, and changes nothing else; revision 3 (volcomp 1.2.0,
+`VOLCOMP_FORMAT_REVISION`) adds mode 5, the spatially lossless binary mask chunk
+of §12, and changes nothing else. A writer must not emit a mode-4 chunk to a
+consumer that only reads revision 1, nor a mode-5 chunk to one that only reads
+revision 2; that consumer will refuse it cleanly rather than misread it.
 
 ## 3. Encoding pipeline (informative summary; §4–§6 are normative)
 
@@ -374,8 +376,9 @@ exactly — a read past its end, or a byte left over, is `VOLCOMP_ERR_CORRUPT`.
 `volcomp_decode` and `volcomp_decode_block` return the interpolated 128³ chunk,
 so a mask chunk needs no special handling anywhere. `volcomp_is_lossless` is
 false for one (the 2× pool is not the source); `volcomp_stream_q` reports 0,
-since there is no quantiser. `volcomp_mask_info` identifies a mask chunk and
-`volcomp_mask_decode_stored` returns the 64³ grid itself, which is what the
+since there is no quantiser. `volcomp_mask_info` identifies a mask chunk of
+either mode and reports the edge of the grid it stores — 64 here, 128 for §12 —
+and `volcomp_mask_decode_stored` returns that grid itself, which is what the
 next coarser rung of a pyramid is made of.
 
 Measured on a 256³ region of the PHercParis4 recto surface prediction (2.4 µm,
@@ -384,3 +387,70 @@ Measured on a 256³ region of the PHercParis4 recto surface prediction (2.4 µm,
 an ideal 12-neighbour model of the full-resolution mask. Thresholding the
 decoded field at 128 changes 1.7 % of the voxels, each of them a mean of 1.06
 and at most 2 voxels from the published boundary.
+
+
+## 12. Lossless mask chunks (mode 5)
+
+A lossless mask chunk stores a binary volume **spatially exactly**: the whole
+128³ mask, every voxel of it, with no downscale and no interpolation.
+Everything else is §11 — the same header, the same three forms, the same range
+coder, the same 12-neighbour context model and the same adaptation schedule —
+applied to a 128³ grid of bits instead of a 64³ one. There is nothing to
+configure. `q_raw` is 0.
+
+```
+offset  size   field
+0       8      header, mode = 5, q_raw = 0
+8       1      flags: bits 0..1 = form, bits 2..7 = 0 (reserved, must be zero)
+9       P      payload, per form
+```
+
+```
+form 0  CODED  the range-coded grid (§12.2); P >= 5
+form 1  CONST  P = 1, one byte: 0 or 1, the value of every cell
+form 2  RAW    P = 262 144, the grid packed LSB-first, bit i = cell i
+```
+
+Exact accounting is normative: `9 + P` must equal the stream length, and any
+other form value is rejected. The encoder emits CONST for a uniform mask and
+RAW whenever the coded form would not be smaller, so a lossless mask chunk is
+never larger than **262 153 bytes** (`VOLCOMP_MASK_LL_BOUND`) — the packed mask
+plus the nine-byte header.
+
+### 12.1 The stored grid
+
+Grid cell `(z, y, x)`, each in 0..127, has index `i = (z·128 + y)·128 + x` and
+is `1` iff source voxel `i` is nonzero. `volcomp_decode` returns cell `i` as
+`255 · cell`, so the decoded chunk is 0/255 exactly as stored, and
+`volcomp_decode_block` returns the corresponding region of it.
+
+### 12.2 The coded form
+
+The grid's 2 097 152 bits are coded in index order exactly as §11.3 codes its
+262 144: the same binary range coder (32-bit `range` and `low`, renormalisation
+while `range < 2^24`, 12-bit probabilities initialised to 2048), the same
+adaptation shifts `1, 1, 2, 2` then 3 by context age, the same 12 causal
+neighbours (a neighbour outside the **128³** grid counting as 0) forming the
+same 4096 contexts, the same leading zero byte and the same five closing
+shift-low steps. A decoder must consume the payload exactly; a read past its
+end, or a byte left over, is `VOLCOMP_ERR_CORRUPT`.
+
+### 12.3 Notes for readers
+
+`volcomp_decode` and `volcomp_decode_block` return the 0/255 mask, so a lossless
+mask chunk needs no special handling anywhere. `volcomp_is_lossless` is **false**
+for one: the chunk decodes to its source's *support* exactly, but a source voxel
+of 7 comes back as 255, so the stream is not a byte-exact copy of an arbitrary
+u8 chunk. `volcomp_stream_q` reports 0. `volcomp_mask_info` reports a stored
+grid edge of 128, which is how a reader tells mode 5 from mode 4, and
+`volcomp_mask_decode_stored` returns that 128³ grid as 0/255.
+
+Measured on the same 256³ region of the PHercParis4 recto surface prediction
+(2.4 µm, 19.6 % foreground): **0.0255 bits per voxel** (6 682 bytes per 128³
+chunk), against 0.0057 for mode 4's 2× pool of the same data, 0.062 for
+packbits + zstd-19, and 0.022 for an *ideal* (two-pass, non-adaptive)
+12-neighbour model of the same mask — the adaptive coder is within 16 % of what
+this context set can do. Mode 5 is 4.5× the size of mode 4 and codes 8× as many
+bits, so it runs at roughly a fifth of mode 4's throughput: **250–290 M voxels/s
+encode and 230–270 M decode** per core on a Core Ultra 9 275HX, against
+1 350–1 540 M / 760–1 140 M for mode 4 on the same box.

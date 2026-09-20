@@ -65,9 +65,35 @@ def test_mask():
           f"values {sorted(set(dec))}")
 
 
+def test_mask_lossless():
+    """Lossless mask chunks (mode 5): the stored grid IS the 128^3 mask and the
+    decode is 0/255 voxel for voxel."""
+    src = bytearray(vc.CHUNK_VOXELS)
+    i = 0
+    for z in range(128):
+        for y in range(128):
+            for x in range(128):
+                s = math.sin(z * 0.11) * math.cos(y * 0.07) + math.sin((x + y) * 0.05)
+                src[i] = 200 if s > 0 else 0   # any nonzero value is 1
+                i += 1
+    enc = vc.mask_encode_lossless(src)
+    assert len(enc) <= vc.MASK_LL_BOUND
+    assert vc.mask_info(enc) == vc.MASK_LL_DIM, vc.mask_info(enc)
+    assert not vc.is_lossless(enc)     # 0/255, not the u8 source
+    assert vc.stream_q(enc) == 0.0
+    want = bytes(255 if v else 0 for v in src)
+    assert bytes(vc.decode(enc)) == want
+    assert bytes(vc.mask_decode_stored(enc)) == want
+    # a const chunk is nine bytes plus the value
+    assert len(vc.mask_encode_lossless(bytearray(vc.CHUNK_VOXELS))) == 10
+    print(f"mask-lossless: {len(enc)} bytes "
+          f"({8 * len(enc) / vc.CHUNK_VOXELS:.5f} bits/voxel)")
+
+
 def main():
     print("libvolcomp", vc.VERSION, "bound", vc.ENCODE_BOUND)
     test_mask()
+    test_mask_lossless()
     src = synth()
     for q in (2.0, 8.0, 32.0):
         enc = vc.encode(src, q)

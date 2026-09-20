@@ -14,7 +14,8 @@ Runs on every compute VM, one process per N cores:
   A surface-prediction unit (kind = "surface") instead downloads the blosc/zstd
   source chunks covering its footprint plus the halo, hands them to
   `volcomp surface-pack` (which decodes them, resamples the binary mask onto the
-  exact ladder rung, stores it as volcomp mask chunks — or, for a "ramp" unit,
+  exact ladder rung — or keeps the native grid, for a "mask-lossless" unit —
+  stores it as volcomp mask chunks — or, for a "ramp" unit,
   builds the signed-distance ramp at the level's q — pools levels 1..3 and
   writes + verifies all four shard files), and uploads one shard per level. The VMs stay
   stdlib-only: everything numeric happens in C.
@@ -310,7 +311,8 @@ def process_surface_unit(unit, a, pool):
                              "--out-shape={},{},{}".format(*unit["shape"]),
                              "--shard={},{},{}".format(*unit["shard"]),
                              "--scale=%.17g" % unit["scale"],
-                             *( ["--mask"] if unit.get("encoding") == "mask"
+                             *( ["--mask-lossless"] if unit.get("encoding") == "mask-lossless"
+                                else ["--mask"] if unit.get("encoding") == "mask"
                                 else ["--q=" + ",".join("%g" % q for q in unit["q"])] ),
                              f"--dmax={unit.get('dmax', 3)}",
                              *( [f"--occupancy={unit['mask']}"] if unit.get("mask") else [] ),

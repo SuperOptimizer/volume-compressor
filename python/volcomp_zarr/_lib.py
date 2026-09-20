@@ -7,8 +7,10 @@ Q_LOSSLESS = 0.0  # volcomp_encode(..., q=0) is exact
 CHUNK_DIM = 128
 CHUNK_VOXELS = CHUNK_DIM ** 3
 BLOCK_VOXELS = 16 ** 3
-MASK_DIM = 64            # the grid a mask chunk stores: CHUNK_DIM // 2
+MASK_DIM = 64            # the grid a mode-4 mask chunk stores: CHUNK_DIM // 2
 MASK_VOXELS = MASK_DIM ** 3
+MASK_LL_DIM = CHUNK_DIM  # a mode-5 (lossless) mask chunk stores the chunk itself
+MASK_LL_VOXELS = CHUNK_VOXELS
 STATUS = ["OK", "ERR_ARG", "ERR_CORRUPT", "ERR_VERSION", "ERR_NOMEM", "ERR_SHORT_BUF"]
 
 
@@ -57,6 +59,10 @@ _L.volcomp_shim_mask_decode_stored.restype = ctypes.c_int
 _L.volcomp_shim_mask_decode_stored.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
                                                ctypes.c_size_t]
 _L.volcomp_shim_mask_voxels.restype = ctypes.c_size_t
+_L.volcomp_shim_mask_encode_lossless.restype = ctypes.c_int
+_L.volcomp_shim_mask_encode_lossless.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                                                 ctypes.POINTER(ctypes.c_size_t)]
+_L.volcomp_shim_mask_ll_bound.restype = ctypes.c_size_t
 _L.volcomp_shim_is_lossless.restype = ctypes.c_int
 _L.volcomp_shim_is_lossless.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int)]
 _L.volcomp_shim_deblock.restype = None
@@ -64,6 +70,7 @@ _L.volcomp_shim_deblock.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_s
 
 VERSION = _L.volcomp_shim_version().decode()
 ENCODE_BOUND = _L.volcomp_shim_encode_bound()
+MASK_LL_BOUND = _L.volcomp_shim_mask_ll_bound()  # 9 + 128^3/8 = 262 153
 
 
 def _check(st):
@@ -127,8 +134,28 @@ def mask_encode(src):
     return out.raw[: got.value]
 
 
+def mask_encode_lossless(src):
+    """src: 128^3 z-major uint8 bytes-like -> a volcomp LOSSLESS MASK chunk (mode 5).
+
+    Any nonzero source voxel is 1; the whole 128^3 mask is stored exactly with the
+    same context-model range coder mask_encode uses on the 2x pool, and `decode`
+    returns it as 0/255, voxel for voxel. Nothing is configurable.
+    """
+    p, n, keep = _buf(src)
+    if n != CHUNK_VOXELS:
+        raise VolcompError(f"source must be {CHUNK_VOXELS} bytes, got {n}")
+    out = ctypes.create_string_buffer(ENCODE_BOUND)
+    got = ctypes.c_size_t()
+    _check(_L.volcomp_shim_mask_encode_lossless(p, out, ENCODE_BOUND, ctypes.byref(got)))
+    return out.raw[: got.value]
+
+
 def mask_info(enc):
-    """The stored grid edge (64) if `enc` is a mask chunk, else None."""
+    """The stored grid edge if `enc` is a mask chunk, else None.
+
+    64 for the 2x mode (mask_encode), 128 for the lossless one
+    (mask_encode_lossless); that is how the two are told apart.
+    """
     p, n, keep = _buf(enc)
     dim = ctypes.c_uint32()
     st = _L.volcomp_shim_mask_info(p, n, ctypes.byref(dim))
@@ -139,9 +166,13 @@ def mask_info(enc):
 
 
 def mask_decode_stored(enc, out=None):
-    """The STORED 64^3 grid of a mask chunk, as 0/255 (a bytearray, or `out` filled)."""
+    """The STORED grid of a mask chunk, as 0/255: 64^3 for mode 4, 128^3 for mode 5
+    (a bytearray, or `out` filled)."""
     p, n, keep = _buf(enc)
-    dst = out if out is not None else bytearray(MASK_VOXELS)
+    dim = mask_info(enc)
+    if dim is None:
+        raise VolcompError("not a mask chunk")
+    dst = out if out is not None else bytearray(dim ** 3)
     dp, dn, dkeep = _buf(dst)
     _check(_L.volcomp_shim_mask_decode_stored(p, n, dp, dn))
     return dst

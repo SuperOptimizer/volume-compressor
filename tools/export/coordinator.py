@@ -10,13 +10,17 @@ Compute VMs run tools/export/worker.py against the HTTP API below.
       metadata and insert all (volume, level, shard) units. Re-runnable: units
       already present are left alone (progress is never lost).
   coordinator.py manifest-surfaces --db export.db [--volume PREFIX ...]
+                                   [--encoding mask|mask-lossless|ramp] [--no-resample]
       The same for the published surface predictions
       (<Scroll>/representations/predictions/surfaces/*.zarr): resolve each one's
       native voxel size, snap it to the ladder rung, and insert one unit per
       1024^3 output shard. A unit emits the four finest levels at once.
+      --no-resample (the default for --encoding mask-lossless) keeps the source
+      grid exactly instead and names the levels by their true voxel size.
   coordinator.py pool-levels --db export.db --volcomp PATH --src DIR|URL --out DIR
       Build the coarse levels (everything above the four a unit writes) offline
-      by 2x mean pooling, one 128^3 shard at a time. Streaming and resumable:
+      by 2x mean pooling (2x2x2 majority, for a mask level), one 128^3 shard at a
+      time. Streaming and resumable:
       shards that already exist under --out are skipped.
   coordinator.py metadata  --db export.db --out DIR [--q 8]
       Write the zarr v3 group/array metadata (OME-Zarr 0.5 multiscales,
@@ -98,6 +102,15 @@ def rung_um(k):
 def rung_name(k):
     """Directory name of rung k: "0.6", "1.2", ... "1228.8" (exact spellings)."""
     return f"{rung_um(k):.1f}"
+
+
+def native_level_name(um):
+    """Directory name of a level on a NATIVE (unresampled) grid: its TRUE voxel size
+    in micrometres, up to three decimals, no trailing zeros — 2.4 -> "2.4",
+    9.596 -> "9.596", 19.192 -> "19.192", 9.362 -> "9.362". A 2.400 um scan
+    therefore keeps the same spellings the ladder gave it."""
+    t = f"{um:.3f}".rstrip("0").rstrip(".")
+    return t or "0"
 
 
 def rung_of(um):
@@ -289,15 +302,27 @@ def surface_native_level(vol, pred_shape, pred_name):
     return int(m.group(1)) if m else None
 
 
-SURF_ENCODINGS = ("mask", "ramp")
+SURF_ENCODINGS = ("mask", "mask-lossless", "ramp")
 
 
 def surface_encoding(name):
     """The per-level storage of a prediction export, for the group attributes.
 
-    "mask" is what the fleet writes: the published binary mask itself, stored as
-    volcomp MASK chunks. "ramp" is the older signed-distance form, kept for
-    re-exports that ask for it."""
+    "mask" is the 2x form the Paris 4 tree was written with: the published binary
+    mask, stored as volcomp MASK chunks (a 2x2x2 majority pool per chunk).
+    "mask-lossless" stores the mask itself, voxel for voxel, with the same coder.
+    "ramp" is the older signed-distance form, kept for re-exports that ask for it."""
+    if name == "mask-lossless":
+        return {
+            "name": "surface-mask-lossless", "dmax": SURF_DMAX,
+            "storage": "volcomp lossless mask chunk (format revision 3, mode 5): the binary mask "
+                       "of this level at full resolution, coded exactly with the same 12-neighbour "
+                       "context-model range coder the 2x mask mode uses on its pool",
+            "decode": "the mask itself, as u8 0 or 255, voxel for voxel; nothing is interpolated",
+            "pyramid": "each level is the 2x2x2 majority pool (count*2 >= 8) of the level below, "
+                       "voxels outside the array counting as air",
+            "resample": "none: level 0 is the published grid exactly (scale 1)",
+        }
     if name == "mask":
         return {
             "name": "surface-mask", "dmax": SURF_DMAX,
@@ -324,9 +349,16 @@ def surface_encoding(name):
     }
 
 
-def surface_info(name, za0, zattrs, encoding="mask"):
+def surface_info(name, za0, zattrs, encoding="mask", resample=True):
     """Everything the workers and the metadata step need for one prediction.
-    Raises ValueError if the array is not a published binary surface mask."""
+    Raises ValueError if the array is not a published binary surface mask.
+
+    With resample=False the export keeps the SOURCE grid exactly: scale 1, output
+    shape = source shape, and the levels are named by their TRUE voxel size,
+    native_um * 2^L (an m7 prediction read at L2 of a 2.399 um scan is natively
+    9.596 um, so "9.596", "19.192", "38.384", ...). With resample=True (the
+    historical behaviour) the array is resampled onto the 0.6 * 2^k ladder and the
+    levels are named by the rung."""
     scroll = name.split("/")[0] + "/"
     base = name.rstrip("/").split("/")[-1]
     stem = base[:-5] if base.endswith(".zarr") else base
@@ -345,29 +377,49 @@ def surface_info(name, za0, zattrs, encoding="mask"):
     if k is None:
         raise ValueError("cannot tell which level of the source volume this is")
     native_um = um * 2 ** k
-    rk = rung_of(native_um)
-    scale = rung_um(rk) / native_um  # source voxels per output voxel
-    out0 = [int(round(n / scale)) for n in src_shape]
+    native_um = round(native_um, 6)
+    if resample:
+        rk = rung_of(native_um)
+        scale = rung_um(rk) / native_um  # source voxels per output voxel
+        out0 = [int(round(n / scale)) for n in src_shape]
+        n_levels = LADDER_TOP - rk + 1
+        level_um = lambda j: rung_um(rk + j)          # noqa: E731
+        level_path = lambda j: rung_name(rk + j)      # noqa: E731
+        level_rung = lambda j: rk + j                 # noqa: E731
+        rung_size = rung_um(rk)
+    else:
+        # the source grid, untouched: no scale, no snapping, and the levels are named
+        # by the voxel size they really have
+        rk, scale, out0 = None, 1.0, list(src_shape)
+        # as many levels as the ladder would have given this voxel size, so the two
+        # encodings produce the same depth of pyramid for the same data
+        n_levels = LADDER_TOP - rung_of(native_um) + 1
+        level_um = lambda j: round(native_um * 2 ** j, 6)          # noqa: E731
+        level_path = lambda j: native_level_name(native_um * 2 ** j)  # noqa: E731
+        level_rung = lambda j: rung_of(native_um * 2 ** j)         # noqa: E731
+        rung_size = native_um
     levels = []
     shape = out0
-    for j in range(LADDER_TOP - rk + 1):
+    for j in range(n_levels):
         # The ladder's q applies to every level the fleet writes and to every coarse level
         # bigger than a single chunk. The last rungs
         # of a prediction fit in one 128^3 chunk and hold a handful of small values, which a
         # dead-zone quantiser at q = 1 can wipe out entirely; there lossless costs a few
         # hundred bytes, so the top of the ladder is stored exactly.
-        # a mask level has no quantiser at all: the mask is stored exactly at half
-        # the rung's resolution and interpolated on the way out, so q is recorded as 0
-        q = 0.0 if encoding == "mask" else (
-            0.0 if j >= SURF_LEVELS and max(shape) <= CHUNK else rung_q(rk + j))
-        levels.append({"path": rung_name(rk + j), "um": rung_um(rk + j), "shape": list(shape),
+        # a mask level has no quantiser at all: the mask is stored exactly (mask-lossless)
+        # or at half the level's resolution and interpolated on the way out (mask), so q
+        # is recorded as 0
+        q = 0.0 if encoding in ("mask", "mask-lossless") else (
+            0.0 if j >= SURF_LEVELS and max(shape) <= CHUNK else rung_q(level_rung(j)))
+        levels.append({"path": level_path(j), "um": level_um(j), "shape": list(shape),
                        "q": q, "encoding": encoding,
                        "shard": SHARD >> j if j < SURF_LEVELS else CHUNK})
         shape = [math.ceil(n / 2) for n in shape]
     th = re.search(r"-th([0-9]*\.?[0-9]+)", stem)
     return {
         "source": BUCKET + "/" + name, "source_volume": vol, "source_level": k,
-        "volume_um": um, "native_um": round(native_um, 6), "rung": rk, "rung_um": rung_um(rk),
+        "volume_um": um, "native_um": native_um, "rung": rk, "rung_um": rung_size,
+        "resampled": bool(resample),
         "scale": scale, "csize": int(za0["chunks"][0]), "src_shape": src_shape, "out_shape": out0,
         "threshold": float(th.group(1)) if th else None, "levels": levels,
         "encoding": surface_encoding(encoding),
@@ -521,6 +573,8 @@ def surface_occupancy(db, pred, info, a):
 
 def cmd_manifest_surfaces(a):
     db = open_db(a.db)
+    # --no-resample / --resample; mask-lossless keeps the native grid unless told otherwise
+    no_resample = a.resample is False if a.resample is not None else a.encoding == "mask-lossless"
     if a.volume:
         preds = [v if v.endswith("/") else v + "/" for v in a.volume]
     else:
@@ -536,7 +590,8 @@ def cmd_manifest_surfaces(a):
             print(f"skip {p}: no level 0", file=sys.stderr)
             continue
         try:
-            info = surface_info(p, za0, read_json(p + ".zattrs") or {}, a.encoding)
+            info = surface_info(p, za0, read_json(p + ".zattrs") or {}, a.encoding,
+                                resample=not no_resample)
         except ValueError as e:
             print(f"skip {p}: {e}", file=sys.stderr)
             continue
@@ -547,8 +602,10 @@ def cmd_manifest_surfaces(a):
         rows = [(p, 0, z, y, x) for z in range(gz) for y in range(gy) for x in range(gx)]
         cur = db.executemany("INSERT OR IGNORE INTO unit(volume, level, sz, sy, sx) VALUES (?,?,?,?,?)", rows)
         n_new += max(0, cur.rowcount)
-        print(f"{p}: native {info['native_um']:.4f}um -> rung {info['rung_um']}um "
-              f"(scale {info['scale']:.5f}), {info['src_shape']} -> {info['out_shape']}, "
+        grid = (f"rung {info['rung_um']}um (scale {info['scale']:.5f})" if info["resampled"]
+                else "native grid, not resampled")
+        print(f"{p}: native {info['native_um']:.4f}um -> {grid}, "
+              f"{info['src_shape']} -> {info['out_shape']}, "
               f"chunks {info['csize']}, levels {[lv['path'] for lv in info['levels']]}, {len(rows)} units",
               flush=True)
         if not a.no_occupancy:
@@ -609,9 +666,10 @@ def surface_array_metadata(level, info):
     """zarr v3 array metadata for one rung of a prediction: shard 1024/512/256 for the
     three finest levels and 128 for everything from the fourth up, 128^3 volcomp chunks."""
     md = array_metadata(level["shape"], level["q"])
-    if level.get("encoding") == "mask":
+    enc = level.get("encoding")
+    if enc in ("mask", "mask-lossless"):
         md["codecs"][0]["configuration"]["codecs"] = [
-            {"name": "volcomp", "configuration": {"mode": "mask", "q": 0}}]
+            {"name": "volcomp", "configuration": {"mode": enc, "q": 0}}]
     sh = int(level["shard"])
     md["chunk_grid"]["configuration"]["chunk_shape"] = [sh, sh, sh]
     md["attributes"] = {"volcomp": {"q": level["q"], "voxel_size_um": level["um"],
@@ -620,25 +678,35 @@ def surface_array_metadata(level, info):
 
 
 def surface_group_metadata(name, info):
-    """OME-Zarr 0.5 multiscales on the exact ladder: dataset paths are the voxel size in
-    micrometres and the coordinate transforms state that size."""
+    """OME-Zarr 0.5 multiscales: dataset paths are the voxel size in micrometres and
+    the coordinate transforms state that size. Resampled exports sit on the exact
+    0.6 * 2^k ladder; an unresampled one keeps the source grid and its levels carry
+    their TRUE sizes (native_um * 2^L)."""
     datasets = [{"path": lv["path"],
                  "coordinateTransformations": [{"type": "scale", "scale": [lv["um"]] * 3}]}
                 for lv in info["levels"]]
+    # the 2x "mask" and "ramp" trees keep the wording they were written with;
+    # mask-lossless says what it really does
+    lossless = info["encoding"].get("name") == "surface-mask-lossless"
+    pyramid_note = ("2x2x2 majority pooling of the level below"
+                    if lossless else "2x mean pooling of the level below")
+    if not info.get("resampled", True):
+        pyramid_note += "; level 0 is the published grid, unresampled"
     ms = {
         "version": "0.5",
         "name": name.rstrip("/").split("/")[-1],
         "axes": [{"name": n, "type": "space", "unit": "micrometer"} for n in "zyx"],
         "datasets": datasets,
-        "type": "mean",
+        "type": "majority" if lossless else "mean",
         "metadata": {"source": info["source"], "codec": "volcomp",
-                     "description": "2x mean pooling of the level below"},
+                     "description": pyramid_note},
     }
     export = {
         "source": info["source"], "source_volume": BUCKET + "/" + info["source_volume"],
         "source_level": info["source_level"], "source_chunk": info["csize"],
         "threshold": info["threshold"], "encoding": info["encoding"],
         "native_voxel_size_um": info["native_um"], "rung_voxel_size_um": info["rung_um"],
+        "resampled": info.get("resampled", True),
         "resample_scale": info["scale"], "source_shape": info["src_shape"],
         "shape": info["out_shape"],
         "levels": [{"path": lv["path"], "voxel_size_um": lv["um"], "shape": lv["shape"],
@@ -987,7 +1055,9 @@ def cmd_pool_levels(a):
                             if not got:
                                 continue  # nothing below: a missing shard is the fill value
                             tmp_out = os.path.join(work, "out.shard")
-                            flag = "--mask" if here.get("encoding") == "mask" else f"--q={here['q']:g}"
+                            enc = here.get("encoding")
+                            flag = ("--mask-lossless" if enc == "mask-lossless" else
+                                    "--mask" if enc == "mask" else f"--q={here['q']:g}")
                             r = subprocess.run([a.volcomp, "shard-pool", tmp_out, flag,
                                                 "--shape={},{},{}".format(*below["shape"]),
                                                 f"--pos={sz},{sy},{sx}"] + ins, capture_output=True, text=True)
@@ -1026,8 +1096,15 @@ def main():
     p.add_argument("--occupancy-samples", type=int, default=6,
                    help="coarse chunks compared with the level below before trusting the pyramid")
     p.add_argument("--encoding", choices=SURF_ENCODINGS, default="mask",
-                   help="mask (default): store the binary mask as volcomp mask chunks; "
-                        "ramp: the older signed-distance ramp at the ladder's q")
+                   help="mask (default): the binary mask as 2x volcomp mask chunks, resampled onto "
+                        "the 0.6*2^k ladder; mask-lossless: the mask stored exactly, on its native "
+                        "grid (implies --no-resample); ramp: the older signed-distance ramp at the "
+                        "ladder's q")
+    p.add_argument("--no-resample", dest="resample", action="store_false", default=None,
+                   help="keep the source grid exactly (scale 1, out shape = source shape) and name "
+                        "the levels by their true voxel size; the default for --encoding mask-lossless")
+    p.add_argument("--resample", dest="resample", action="store_true", default=None,
+                   help="resample onto the 0.6*2^k ladder (the default for --encoding mask and ramp)")
     p.set_defaults(fn=cmd_manifest_surfaces)
     p = sub.add_parser("pool-levels", help="build the coarse levels of the predictions offline")
     p.add_argument("--db", required=True)

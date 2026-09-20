@@ -11,11 +11,12 @@
  *       dilated by D voxels, is nonzero); --shards emits 64-byte per-shard chunk bitmasks.
  *       Used on a downsampled level to know which chunks of finer levels hold data.
  *   volcomp surface-pack SRCDIR OUTDIR --csize=C --src-shape=Z,Y,X --out-shape=Z,Y,X --shard=SZ,SY,SX
- *       [--scale=S] [--mask | --q=Q0,Q1,Q2,Q3] [--occupancy=HEX] [--threads=N] [--samples=N] [--dmax=3]
+ *       [--scale=S] [--mask | --mask-lossless | --q=Q0,Q1,Q2,Q3] [--occupancy=HEX] [--threads=N] [--samples=N] [--dmax=3]
  *       one export unit of a surface-prediction volume: blosc/zstd source chunks ->
- *       (--mask: the binary mask itself, as volcomp mask chunks | otherwise: the
+ *       (--mask: the binary mask itself, as volcomp mask chunks; --mask-lossless: the
+ *       same pyramid stored exactly, spec §12 | otherwise: the
  *       signed-distance ramp at --q) -> exact-ladder resample -> levels 0..3 shard files
- *   volcomp shard-pool out.shard [--mask | --q=Q] --shape=Z,Y,X --pos=SZ,SY,SX in0 .. in7
+ *   volcomp shard-pool out.shard [--mask | --mask-lossless | --q=Q] --shape=Z,Y,X --pos=SZ,SY,SX in0 .. in7
  *       one coarser 128^3 shard from the 8 that cover it (2x mean pooling); the
  *       offline part of the prediction pyramid, driven by coordinator.py pool-levels
  *   volcomp label-encode DIR out.voll --q=Q   (DIR/<cls>.u8 class probability planes -> label chunk)
@@ -303,7 +304,8 @@ static int surface_cli(int argc, char **argv) {
   cfg.samples = (int)parse_opt(argc, argv, "--samples=", 8);
   cfg.dmax = (int)parse_opt(argc, argv, "--dmax=", SURF_DMAX);
   cfg.scale = parse_double(argc, argv, "--scale=", 1.0);
-  cfg.mask_mode = has_any_flag(argc, argv, "--mask");
+  cfg.mask_lossless = has_any_flag(argc, argv, "--mask-lossless");
+  cfg.mask_mode = cfg.mask_lossless || has_any_flag(argc, argv, "--mask");
   for (int i = 2; i < argc; i++)
     if (!strncmp(argv[i], "--mask=", 7)) {  /* the old spelling of --occupancy=HEX */
       fprintf(stderr, "--mask takes no argument (it selects the mask encoding); the occupancy "
@@ -411,10 +413,13 @@ static int surface_occupancy_cli(int argc, char **argv) {
 }
 static int surface_pool_cli(int argc, char **argv) {
   /* volcomp shard-pool out.shard [--mask | --q=Q] --shape=Z,Y,X --pos=SZ,SY,SX in0 .. in7 ("-" = absent) */
-  float q = has_any_flag(argc, argv, "--mask") ? 0.0f : parse_q(argc, argv);
+  bool ll = has_any_flag(argc, argv, "--mask-lossless");
+  bool mask = ll || has_any_flag(argc, argv, "--mask");
+  float q = mask ? 0.0f : parse_q(argc, argv);
   int64_t shape[3], pos[3];
   if (q < 0 || !parse_i64_3(argc, argv, "--shape=", shape) || !parse_i64_3(argc, argv, "--pos=", pos)) {
-    fprintf(stderr, "shard-pool needs --mask or --q=Q, --shape=Z,Y,X, --pos=SZ,SY,SX and 8 input shards\n");
+    fprintf(stderr, "shard-pool needs --mask, --mask-lossless or --q=Q, --shape=Z,Y,X, "
+                    "--pos=SZ,SY,SX and 8 input shards\n");
     return 1;
   }
   const char *in[8] = {0};
@@ -429,8 +434,7 @@ static int surface_pool_cli(int argc, char **argv) {
   }
   unsigned present = 0;
   uint64_t bytes = 0;
-  int rc = surface_pool_shard(in, argv[2], q, shape, pos, has_any_flag(argc, argv, "--mask"), &present,
-                              &bytes);
+  int rc = surface_pool_shard(in, argv[2], q, shape, pos, mask, ll, &present, &bytes);
   if (rc) return rc;
   printf("ok present=%u bytes=%llu\n", present, (unsigned long long)bytes);
   return 0;
@@ -440,10 +444,10 @@ static int usage(void) {
                   "  volcomp verify in.volc ref.u8\n  volcomp shard-pack DIR out.shard --q=Q\n"
                   "  volcomp shard-verify in.shard DIR [--samples=N]\n"
                   "  volcomp occupancy in.u8|DIR out.bin [--shape=Z,Y,X] [--factor=F] [--dilate=D] [--grid=GZ,GY,GX] [--shards] [--chunks]\n"
-                  "  volcomp surface-pack SRCDIR OUTDIR --csize=C --src-shape=Z,Y,X --out-shape=Z,Y,X --shard=SZ,SY,SX [--scale=S] [--mask | --q=Q0,Q1,Q2,Q3] [--occupancy=HEX] [--threads=N] [--samples=N]\n"
+                  "  volcomp surface-pack SRCDIR OUTDIR --csize=C --src-shape=Z,Y,X --out-shape=Z,Y,X --shard=SZ,SY,SX [--scale=S] [--mask | --mask-lossless | --q=Q0,Q1,Q2,Q3] [--occupancy=HEX] [--threads=N] [--samples=N]\n"
                   "  volcomp surface-maxpool-check coarse.blosc f000 .. f111 --csize=C\n"
                   "  volcomp surface-occupancy DIR out.bin --csize=C --coarse-shape=Z,Y,X --factor=F --out-shape=Z,Y,X [--scale=S] [--dilate=1]\n"
-                  "  volcomp shard-pool out.shard [--mask | --q=Q] --shape=Z,Y,X --pos=SZ,SY,SX in0 .. in7\n"
+                  "  volcomp shard-pool out.shard [--mask | --mask-lossless | --q=Q] --shape=Z,Y,X --pos=SZ,SY,SX in0 .. in7\n"
                   "  volcomp label-encode DIR out.voll --q=Q [--q-plane=CLS=Q ...]\n"
                   "  volcomp label-decode in.voll DIR\n  volcomp label-verify in.voll DIR\n"
                   "\nQ is 0 for the lossless mode (exact) or 1..255 for the lossy DCT codec.\n");

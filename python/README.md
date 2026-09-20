@@ -5,11 +5,14 @@
   `decode(bytes) -> bytearray`, `decode_block(bytes, bz, by, bx)`,
   `stream_q(bytes) -> float`, `is_lossless(bytes) -> bool`,
   `deblock(buf, nz, ny, nx, q)`, and for binary masks
-  `mask_encode(bytes) -> bytes`, `mask_info(bytes) -> 64 | None`,
-  `mask_decode_stored(bytes) -> bytearray` (the 64³ grid).
+  `mask_encode(bytes) -> bytes`, `mask_encode_lossless(bytes) -> bytes`,
+  `mask_info(bytes) -> 64 | 128 | None`,
+  `mask_decode_stored(bytes) -> bytearray` (the stored grid: 64³ for the 2×
+  mode, 128³ for the lossless one).
 - `volcomp_zarr.VolcompCodec`: zarr ≥ 3 array→bytes codec registered as `"volcomp"`
   (`{"name": "volcomp", "configuration": {"q": 8}}`, or
-  `{"mode": "mask"}` for the mask mode), uint8, 128³ inner chunks;
+  `{"mode": "mask"}` / `{"mode": "mask-lossless"}` for the two mask modes),
+  uint8, 128³ inner chunks;
   all-zero chunks are stored as missing when the array's fill value is 0.
   Needs `zarr>=3` and `numpy`.
 

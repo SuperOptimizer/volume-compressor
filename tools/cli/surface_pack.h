@@ -32,6 +32,13 @@
  * are its successive 2x majority pools, each stored the same way. That is what
  * the fleet writes; the ramp above stays available for the old flags.
  *
+ * With surf_cfg.mask_lossless (`--mask-lossless`) the pyramid is the same — the
+ * same resample, the same 2x majority pools — but every level is stored with
+ * volcomp's LOSSLESS mask chunk (spec §12): level 0 is the published mask voxel
+ * for voxel, not its 2x pool, and decodes back to 0/255 exactly. Paired with the
+ * coordinator's --no-resample (scale 1, out shape = source shape) that makes the
+ * export a bit-exact copy of the published mask at its own grid.
+ *
  * Memory: the source mask region of one unit (~(1024 * scale + 8)^3 bytes, 1.1-1.3
  * GB) plus ~15 MB of scratch per thread plus the level-1 block (134 MB); no float
  * volume is ever materialised.
@@ -72,6 +79,8 @@ typedef struct {
   bool mask_mode;       /* store binary MASK chunks (volcomp.h §11) instead of the ramp: level 0
                          * is the published mask itself, levels 1..3 its 2x majority pools, and
                          * every level is encoded with volcomp_mask_encode (q is unused) */
+  bool mask_lossless;   /* with mask_mode: encode every level with volcomp_mask_encode_lossless
+                         * (§12) instead, so a level decodes to its own 0/255 mask exactly */
   int dmax, threads, samples;
 } surf_cfg;
 
@@ -733,9 +742,11 @@ static void surf_encode_chunk(surf_state *S, int level, unsigned idx, const uint
   }
   surf_scratch *sc = &S->sc[tid];
   size_t en = 0;
-  volcomp_status est = S->cfg->mask_mode
-                           ? volcomp_mask_encode(chunk, sc->enc, VOLCOMP_ENCODE_BOUND, &en)
-                           : volcomp_encode(chunk, S->cfg->q[level], sc->enc, VOLCOMP_ENCODE_BOUND, &en);
+  volcomp_status est =
+      S->cfg->mask_mode
+          ? (S->cfg->mask_lossless ? volcomp_mask_encode_lossless(chunk, sc->enc, VOLCOMP_ENCODE_BOUND, &en)
+                                   : volcomp_mask_encode(chunk, sc->enc, VOLCOMP_ENCODE_BOUND, &en))
+          : volcomp_encode(chunk, S->cfg->q[level], sc->enc, VOLCOMP_ENCODE_BOUND, &en);
   if (est != VOLCOMP_OK) {
     fprintf(stderr, "surface-pack: encode failed at level %d chunk %u\n", level, idx);
     S->error = 1;
@@ -753,7 +764,17 @@ static void surf_encode_chunk(surf_state *S, int level, unsigned idx, const uint
   double psnr = -1;
   unsigned mx = 0;
   if ((long)idx % S->stride == 0) {
-    if (S->cfg->mask_mode) {
+    if (S->cfg->mask_lossless) {
+      /* A lossless mask chunk must come back voxel for voxel. */
+      unsigned bad = 0;
+      for (size_t k = 0; k < VOLCOMP_CHUNK_VOXELS; k++) bad += sc->dec[k] != (chunk[k] ? 255u : 0u);
+      if (bad) {
+        fprintf(stderr, "surface-pack: level %d chunk %u: %u voxels do not round trip\n", level, idx, bad);
+        S->error = 1;
+        return;
+      }
+      psnr = 999.0;
+    } else if (S->cfg->mask_mode) {
       /* A mask chunk decodes to the interpolated field, so PSNR against the mask
        * says nothing. What must hold is the invariant: every stored block centre
        * (even coordinates) comes back as the 2x2x2 MAJORITY of the source, 0 or
@@ -1373,13 +1394,17 @@ static inline int surface_occupancy(const char *dir, const char *out_path, int64
  * that a partial edge block averages only over the voxels that exist. */
 static int surface_pool_shard(const char *const in[8], const char *out_path, float q,
                               const int64_t shape[3], const int64_t pos[3], bool mask_mode,
-                              unsigned *present, uint64_t *bytes) {
+                              bool mask_lossless, unsigned *present, uint64_t *bytes) {
   const int64_t C = SURF_CHUNK, G = VOLCOMP_MASK_DIM;
-  /* In MASK mode the coarser level IS the level below's stored grid: a mask
-   * chunk stores the 2x2x2 majority pool of its own mask, which is exactly the
-   * next rung's mask. So the eight 64^3 grids assemble the 128^3 chunk directly
-   * — no pooling arithmetic, and nothing is lost on the way up. */
-  uint8_t *big = mask_mode ? NULL : calloc(1, (size_t)(8 * C * C * C)); /* 256^3 */
+  /* In the 2x MASK mode the coarser level IS the level below's stored grid: a
+   * mask chunk stores the 2x2x2 majority pool of its own mask, which is exactly
+   * the next rung's mask. So the eight 64^3 grids assemble the 128^3 chunk
+   * directly — no pooling arithmetic, and nothing is lost on the way up. A
+   * mask-lossless chunk stores the mask itself, so there is no shortcut: the
+   * eight chunks are decoded into a 256^3 block and majority pooled, like the
+   * ramp path but with the majority rule. */
+  const bool grid_trick = mask_mode && !mask_lossless;
+  uint8_t *big = grid_trick ? NULL : calloc(1, (size_t)(8 * C * C * C)); /* 256^3 */
   uint8_t *chunk = calloc(1, VOLCOMP_CHUNK_VOXELS);
   uint8_t *dec = malloc(VOLCOMP_CHUNK_VOXELS);
   int rc = 0;
@@ -1407,12 +1432,12 @@ static int surface_pool_shard(const char *const in[8], const char *out_path, flo
       volcomp_status st =
           off + nb > n - idxn
               ? VOLCOMP_ERR_CORRUPT
-              : mask_mode ? volcomp_mask_decode_stored(img + off, (size_t)nb, dec, VOLCOMP_MASK_VOXELS)
-                          : volcomp_decode(img + off, (size_t)nb, dec, VOLCOMP_CHUNK_VOXELS);
+              : grid_trick ? volcomp_mask_decode_stored(img + off, (size_t)nb, dec, VOLCOMP_MASK_VOXELS)
+                           : volcomp_decode(img + off, (size_t)nb, dec, VOLCOMP_CHUNK_VOXELS);
       if (st != VOLCOMP_OK) {
         fprintf(stderr, "shard-pool: %s: chunk does not decode\n", in[i]);
         rc = 3;
-      } else if (mask_mode) {
+      } else if (grid_trick) {
         int64_t o[3] = {(i >> 2) * G, ((i >> 1) & 1) * G, (i & 1) * G};
         for (int64_t z = 0; z < G; z++)
           for (int64_t y = 0; y < G; y++)
@@ -1427,7 +1452,7 @@ static int surface_pool_shard(const char *const in[8], const char *out_path, flo
     free(img);
   }
   bool any = false;
-  if (mask_mode) {
+  if (grid_trick) {
     for (size_t k = 0; k < VOLCOMP_CHUNK_VOXELS && !any; k++) any = chunk[k] != 0;
   } else {
     int64_t ext[3];
@@ -1446,7 +1471,10 @@ static int surface_pool_shard(const char *const in[8], const char *out_path, flo
                 sum += big[(((2 * z + dz) * 2 * C + 2 * y + dy) * 2 * C) + 2 * x + dx];
                 cnt++;
               }
-          uint8_t v = (uint8_t)((sum + cnt / 2) / cnt);
+          /* mask-lossless: the 2x2x2 MAJORITY, voxels outside the array counting
+           * as air, exactly the rule surf_pool_job applies inside a unit */
+          uint8_t v = mask_mode ? (uint8_t)(sum >= 4u * 255u ? 255u : 0u)
+                                : (uint8_t)((sum + cnt / 2) / cnt);
           chunk[(z * C + y) * C + x] = v;
           any |= v != 0;
         }
@@ -1455,7 +1483,9 @@ static int surface_pool_shard(const char *const in[8], const char *out_path, flo
   size_t en = 0;
   if (rc == 0 && any) {
     enc = malloc(VOLCOMP_ENCODE_BOUND);
-    volcomp_status st = mask_mode ? volcomp_mask_encode(chunk, enc, VOLCOMP_ENCODE_BOUND, &en)
+    volcomp_status st =
+        mask_lossless ? volcomp_mask_encode_lossless(chunk, enc, VOLCOMP_ENCODE_BOUND, &en)
+                      : mask_mode ? volcomp_mask_encode(chunk, enc, VOLCOMP_ENCODE_BOUND, &en)
                                   : volcomp_encode(chunk, q, enc, VOLCOMP_ENCODE_BOUND, &en);
     if (st != VOLCOMP_OK) rc = 3;
   }

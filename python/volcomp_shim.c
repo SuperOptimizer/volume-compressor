@@ -28,6 +28,10 @@ VOLCOMP_EXPORT int volcomp_shim_mask_decode_stored(const void *enc, size_t n, ui
   return (int)volcomp_mask_decode_stored(enc, n, dst, cap);
 }
 VOLCOMP_EXPORT size_t volcomp_shim_mask_voxels(void) { return VOLCOMP_MASK_VOXELS; }
+VOLCOMP_EXPORT int volcomp_shim_mask_encode_lossless(const uint8_t *src, void *dst, size_t cap, size_t *out_n) {
+  return (int)volcomp_mask_encode_lossless(src, dst, cap, out_n);
+}
+VOLCOMP_EXPORT size_t volcomp_shim_mask_ll_bound(void) { return VOLCOMP_MASK_LL_BOUND; }
 VOLCOMP_EXPORT int volcomp_shim_is_lossless(const void *enc, size_t n, int *out) {
   bool b = false;
   int st = (int)volcomp_is_lossless(enc, n, &b);

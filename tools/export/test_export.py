@@ -5,8 +5,9 @@ A synthetic zarr v2 prediction (blosc/zstd, exactly like the bucket's) is served
 from a local directory by a tiny S3-listing HTTP server; the real coordinator and
 the real worker then run against it and write the zarr v3 + volcomp tree, which is
 decoded back through python/volcomp_zarr and compared with a reference computed
-with numpy/scipy. Both encodings are exercised: "mask" (the default: the binary
-mask stored as volcomp mask chunks) and "ramp" (the older signed-distance form).
+with numpy/scipy. All three encodings are exercised: "mask" (the binary mask as
+2x volcomp mask chunks, resampled onto the ladder), "mask-lossless" (the mask
+stored exactly, on its native grid) and "ramp" (the older signed-distance form).
 
     pytest tools/export/test_export.py          # or: python3 tools/export/test_export.py
 
@@ -48,7 +49,12 @@ SCROLL = "PHercTest"
 STAMP = "20260101000000"
 PRED = f"{STAMP}-surface-20260101000001-surface-m7-L0-th0.2.zarr"
 PRED_KEY = f"{SCROLL}/representations/predictions/surfaces/{PRED}/"
-VOL_KEY = f"{SCROLL}/volumes/{STAMP}-2.400um-0.2m-78keV-masked.zarr/"
+VOL_UM = "2.400"
+VOL_KEY = f"{SCROLL}/volumes/{STAMP}-{VOL_UM}um-0.2m-78keV-masked.zarr/"
+
+
+def vol_key(um=VOL_UM):
+    return f"{SCROLL}/volumes/{STAMP}-{um}um-0.2m-78keV-masked.zarr/"
 SHAPE = (200, 180, 160)
 CSIZE = 64
 
@@ -167,7 +173,7 @@ def serve(root):
     return srv, f"http://127.0.0.1:{srv.server_address[1]}"
 
 
-def write_source(root, mask):
+def write_source(root, mask, um=VOL_UM):
     """The synthetic prediction, byte for byte in the bucket's layout."""
     d = os.path.join(root, PRED_KEY)
     os.makedirs(os.path.join(d, "0"), exist_ok=True)
@@ -195,7 +201,7 @@ def write_source(root, mask):
                 os.makedirs(p, exist_ok=True)
                 open(os.path.join(p, str(cx)), "wb").write(codec.encode(blk.tobytes()))
     # the CT volume the prediction was made from: only its level-0 .zarray is read
-    v = os.path.join(root, VOL_KEY, "0")
+    v = os.path.join(root, vol_key(um), "0")
     os.makedirs(v, exist_ok=True)
     json.dump({"chunks": [128] * 3, "compressor": None, "dtype": "|u1", "fill_value": 0,
                "filters": None, "order": "C", "shape": list(mask.shape), "zarr_format": 2,
@@ -230,11 +236,11 @@ def assemble(shards, shape, shard_dim):
     return vol
 
 
-def run_export(tmp, encoding):
+def run_export(tmp, encoding, um=VOL_UM):
     """Run the whole pipeline once: manifest -> metadata -> serve -> worker -> pool-levels."""
     src_root, out, meta = str(tmp / "bucket"), str(tmp / "out"), str(tmp / "meta")
     mask = synthetic_mask()
-    write_source(src_root, mask)
+    write_source(src_root, mask, um)
     srv, url = serve(src_root)
     env = dict(os.environ, VOLCOMP_S3_ENDPOINT=url)
     db = str(tmp / "e.db")
@@ -277,6 +283,18 @@ def run_export(tmp, encoding):
 @pytest.fixture(scope="module")
 def export(tmp_path_factory):
     return run_export(tmp_path_factory.mktemp("export_mask"), "mask")
+
+
+@pytest.fixture(scope="module")
+def export_lossless(tmp_path_factory):
+    return run_export(tmp_path_factory.mktemp("export_ll"), "mask-lossless")
+
+
+@pytest.fixture(scope="module")
+def export_lossless_native(tmp_path_factory):
+    """The same tree from a scan whose voxel size is NOT on the ladder, so the level
+    names are the true sizes rather than a rung's."""
+    return run_export(tmp_path_factory.mktemp("export_ll_native"), "mask-lossless", um="2.399")
 
 
 @pytest.fixture(scope="module")
@@ -356,6 +374,88 @@ def test_mask_pool_levels_and_size(export):
     # a mask level is far smaller than the ramp it replaces
     n = os.path.getsize(os.path.join(root, "2.4", "c", "0", "0", "0"))
     assert n < 0.05 * export["mask"].size, n
+
+
+# ------------------------------------------------- the mask-lossless encoding
+
+
+def test_mask_lossless_tree_and_metadata(export_lossless):
+    root = os.path.join(export_lossless["out"], PRED_KEY.rstrip("/"))
+    group = json.load(open(os.path.join(root, "zarr.json")))
+    ex = group["attributes"]["volcomp"]
+    assert ex["encoding"]["name"] == "surface-mask-lossless"
+    assert ex["resampled"] is False
+    assert ex["resample_scale"] == 1.0
+    assert ex["native_voxel_size_um"] == 2.4
+    assert ex["rung_voxel_size_um"] == 2.4          # the finest level's TRUE size
+    assert ex["shape"] == list(SHAPE)               # the source grid, untouched
+    assert all(lv["encoding"] == "mask-lossless" and lv["q"] == 0 for lv in ex["levels"])
+    # a 2.400 um source lands on the ladder's spellings anyway
+    assert [lv["path"] for lv in ex["levels"]][:4] == ["2.4", "4.8", "9.6", "19.2"]
+    ms = group["attributes"]["ome"]["multiscales"][0]
+    assert ms["type"] == "majority"
+    for lv, ds in zip(ex["levels"], ms["datasets"]):
+        assert ds["path"] == lv["path"]
+        assert ds["coordinateTransformations"][0]["scale"] == [lv["voxel_size_um"]] * 3
+    for lv in ex["levels"]:
+        md = json.load(open(os.path.join(root, lv["path"], "zarr.json")))
+        assert md["codecs"][0]["configuration"]["codecs"][0] == {
+            "name": "volcomp", "configuration": {"mode": "mask-lossless", "q": 0}}
+        assert md["attributes"]["volcomp"]["encoding"] == "mask-lossless"
+
+
+def test_mask_lossless_level_names_off_the_ladder(export_lossless_native):
+    """A 2.399 um scan keeps its own sizes: 2.399, 4.798, 9.596, 19.192, ... — no
+    snapping to 2.4 / 4.8 / 9.6, and no trailing zeros."""
+    root = os.path.join(export_lossless_native["out"], PRED_KEY.rstrip("/"))
+    group = json.load(open(os.path.join(root, "zarr.json")))
+    ex = group["attributes"]["volcomp"]
+    assert ex["native_voxel_size_um"] == 2.399 and ex["rung_voxel_size_um"] == 2.399
+    names = [lv["path"] for lv in ex["levels"]]
+    assert names[:4] == ["2.399", "4.798", "9.596", "19.192"]
+    assert [lv["voxel_size_um"] for lv in ex["levels"]][:4] == [2.399, 4.798, 9.596, 19.192]
+    for name in names:
+        assert os.path.isdir(os.path.join(root, name)), name
+
+
+def test_mask_lossless_level0_is_the_source_mask_exactly(export_lossless):
+    """Decoding level 0 gives the published mask back, voxel for voxel — including
+    one raw level-0 chunk decoded on its own."""
+    root = os.path.join(export_lossless["out"], PRED_KEY.rstrip("/"))
+    got = assemble(decode_shard(os.path.join(root, "2.4", "c", "0", "0", "0"), 512), SHAPE, 1024)
+    assert np.array_equal(got, export_lossless["mask"])
+    assert set(np.unique(got)) <= {0, 255}
+    # and one chunk straight out of the shard, compared with the same region of the source
+    chunks = decode_shard(os.path.join(root, "2.4", "c", "0", "0", "0"), 512)
+    ref = np.zeros((128, 128, 128), np.uint8)
+    sub = export_lossless["mask"][0:128, 0:128, 0:128]
+    ref[: sub.shape[0], : sub.shape[1], : sub.shape[2]] = sub
+    assert np.array_equal(chunks[(0, 0, 0)], ref)
+
+
+def test_mask_lossless_pyramid_is_majority_pooling(export_lossless):
+    """Every level is the 2x2x2 majority pool of the level below, stored exactly."""
+    root = os.path.join(export_lossless["out"], PRED_KEY.rstrip("/"))
+    shape = list(SHAPE)
+    ref = export_lossless["mask"]
+    for path, shard in (("2.4", 1024), ("4.8", 512), ("9.6", 256), ("19.2", 128)):
+        count = (shard // 128) ** 3
+        got = assemble(decode_shard(os.path.join(root, path, "c", "0", "0", "0"), count), shape, shard)
+        assert np.array_equal(got, ref), path
+        grid = majority_pool(ref, chunk_grid_shape(shape))
+        shape = [(n + 1) // 2 for n in shape]
+        ref = grid[: shape[0], : shape[1], : shape[2]]
+
+
+def test_mask_lossless_pool_levels_and_size(export_lossless, export):
+    root = os.path.join(export_lossless["out"], PRED_KEY.rstrip("/"))
+    assert os.path.exists(os.path.join(root, "38.4", "c", "0", "0", "0"))
+    assert os.path.exists(os.path.join(root, "307.2", "c", "0", "0", "0"))
+    n = os.path.getsize(os.path.join(root, "2.4", "c", "0", "0", "0"))
+    # exact, so bigger than the 2x form, but still a small fraction of the raw mask
+    m = os.path.getsize(os.path.join(export["out"], PRED_KEY.rstrip("/"), "2.4", "c", "0", "0", "0"))
+    assert n > m
+    assert n < 0.2 * export_lossless["mask"].size, n
 
 
 # ----------------------------------------------------------- the ramp encoding
