@@ -120,6 +120,46 @@ def main():
     print(f"{'mask-lossless':>14}: {len(enc):9d} bytes ({raw / len(enc):9.1f}x)  "
           f"{8 * len(enc) / raw:.5f} bits/voxel")
 
+    print("\n-- sharded zarr v3 array (1024^3 shards of 128^3 chunks), codec chain [volcomp(mode=surface)] --")
+    # a smooth probability field with sheets: the kind of volume the surface mode is for
+    zz, yy, xx = np.ogrid[:256, :256, :384]
+    sd = 9.0 * np.sin(0.045 * xx + 0.02 * zz) + 0.33 * yy - 20.0
+    sd = np.mod(sd + 400.0, 22.0) - 11.0
+    prob = np.clip(np.rint(255.0 / (1.0 + np.exp(-(3.5 - np.abs(sd)) / 1.2))), 0, 255).astype(np.uint8)
+    prob[:, :, 300:] = 0  # an empty strip: its chunks are stored as missing
+    for q, thr in ((16.0, 128), (32.0, 100)):
+        store = zarr.storage.MemoryStore()
+        z = zarr.create_array(store, shape=prob.shape, chunks=(D, D, D), shards=(1024, 1024, 1024),
+                              dtype="uint8", serializer=VolcompCodec(mode="surface", q=q, threshold=thr),
+                              compressors=None, fill_value=0)
+        z[:] = prob
+        meta = zarr.open_array(store, mode="r").metadata.to_dict()
+        inner = meta["codecs"][0]["configuration"]["codecs"]
+        assert meta["codecs"][0]["name"] == "sharding_indexed" and len(inner) == 1, meta["codecs"]
+        assert inner[0]["name"] == "volcomp" and inner[0]["configuration"]["mode"] == "surface", inner
+        got = zarr.open_array(store, mode="r")[:]
+        wrong = int(((got >= thr) != (prob >= thr)).sum())
+        band = (prob > 32) & (prob < 224)
+        mae = float(np.abs(got.astype(int) - prob)[band].mean())
+        nbytes = sum(len(v) for k, v in store._store_dict.items() if not k.endswith("zarr.json"))
+        enc = vz.surface_encode(np.ascontiguousarray(prob[:D, :D, :D]).tobytes(), q, thr)
+        assert vz.surface_info(enc)[0] == thr and vz.stream_q(enc) == q and not vz.is_lossless(enc)
+        assert vz.surface_info(vz.encode(prob[:D, :D, :D].tobytes(), q)) is None
+        print(f"{'surface q%g t%d' % (q, thr):>14}: {nbytes:9d} bytes for {prob.size} voxels "
+              f"({8 * nbytes / prob.size:.4f} bits/voxel), wrong-side voxels {wrong}, band MAE {mae:.2f}")
+        fails += wrong != 0
+        assert mae < 0.3 * q + 2
+    assert (VolcompCodec.from_dict(VolcompCodec(mode="surface", q=16).to_dict())
+            == VolcompCodec(mode="surface", q=16))
+    assert (VolcompCodec.from_dict(VolcompCodec(mode="surface", q=16, threshold=90).to_dict())
+            == VolcompCodec(mode="surface", q=16, threshold=90))
+    for kw in ({"q": 0.0}, {"q": 16, "threshold": 0}, {"q": 16, "threshold": 256}):
+        try:
+            VolcompCodec(mode="surface", **kw)
+            raise SystemExit(f"expected surface {kw} to be rejected")
+        except ValueError:
+            pass
+
     # the codec's own metadata round trip and validation
     assert VolcompCodec.from_dict(VolcompCodec(q=0.0).to_dict()) == VolcompCodec(q=0.0)
     assert VolcompCodec.from_dict(VolcompCodec(mode="mask").to_dict()) == VolcompCodec(mode="mask")

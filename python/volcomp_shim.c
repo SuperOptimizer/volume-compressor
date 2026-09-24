@@ -32,6 +32,14 @@ VOLCOMP_EXPORT int volcomp_shim_mask_encode_lossless(const uint8_t *src, void *d
   return (int)volcomp_mask_encode_lossless(src, dst, cap, out_n);
 }
 VOLCOMP_EXPORT size_t volcomp_shim_mask_ll_bound(void) { return VOLCOMP_MASK_LL_BOUND; }
+VOLCOMP_EXPORT size_t volcomp_shim_surface_bound(void) { return VOLCOMP_SURFACE_ENCODE_BOUND; }
+VOLCOMP_EXPORT int volcomp_shim_surface_encode(const uint8_t *src, float q, unsigned thr, void *dst, size_t cap,
+                                               size_t *out_n) {
+  return (int)volcomp_surface_encode(src, q, thr, dst, cap, out_n);
+}
+VOLCOMP_EXPORT int volcomp_shim_surface_info(const void *enc, size_t n, uint32_t *thr, uint32_t *margin) {
+  return (int)volcomp_surface_info(enc, n, thr, margin);
+}
 VOLCOMP_EXPORT int volcomp_shim_is_lossless(const void *enc, size_t n, int *out) {
   bool b = false;
   int st = (int)volcomp_is_lossless(enc, n, &b);

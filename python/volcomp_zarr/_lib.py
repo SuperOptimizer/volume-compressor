@@ -63,6 +63,13 @@ _L.volcomp_shim_mask_encode_lossless.restype = ctypes.c_int
 _L.volcomp_shim_mask_encode_lossless.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
                                                  ctypes.POINTER(ctypes.c_size_t)]
 _L.volcomp_shim_mask_ll_bound.restype = ctypes.c_size_t
+_L.volcomp_shim_surface_bound.restype = ctypes.c_size_t
+_L.volcomp_shim_surface_encode.restype = ctypes.c_int
+_L.volcomp_shim_surface_encode.argtypes = [ctypes.c_void_p, ctypes.c_float, ctypes.c_uint, ctypes.c_void_p,
+                                           ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+_L.volcomp_shim_surface_info.restype = ctypes.c_int
+_L.volcomp_shim_surface_info.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint32),
+                                         ctypes.POINTER(ctypes.c_uint32)]
 _L.volcomp_shim_is_lossless.restype = ctypes.c_int
 _L.volcomp_shim_is_lossless.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int)]
 _L.volcomp_shim_deblock.restype = None
@@ -71,6 +78,8 @@ _L.volcomp_shim_deblock.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_s
 VERSION = _L.volcomp_shim_version().decode()
 ENCODE_BOUND = _L.volcomp_shim_encode_bound()
 MASK_LL_BOUND = _L.volcomp_shim_mask_ll_bound()  # 9 + 128^3/8 = 262 153
+SURFACE_BOUND = _L.volcomp_shim_surface_bound()
+SURFACE_THRESHOLD = 128  # the default exact threshold of a surface chunk: u8 >= 128 is p >= 0.5
 
 
 def _check(st):
@@ -148,6 +157,34 @@ def mask_encode_lossless(src):
     got = ctypes.c_size_t()
     _check(_L.volcomp_shim_mask_encode_lossless(p, out, ENCODE_BOUND, ctypes.byref(got)))
     return out.raw[: got.value]
+
+
+def surface_encode(src, q, threshold=SURFACE_THRESHOLD):
+    """src: 128^3 z-major uint8 bytes-like -> a volcomp SURFACE chunk (mode 6).
+
+    For smooth probability fields that consumers threshold: the DCT codec at step
+    q plus a refinement layer that makes `decoded >= threshold` equal
+    `src >= threshold` for every voxel (the mask is exact; the soft values carry
+    the DCT error at q). `decode` reads it like any other chunk.
+    """
+    p, n, keep = _buf(src)
+    if n != CHUNK_VOXELS:
+        raise VolcompError(f"source must be {CHUNK_VOXELS} bytes, got {n}")
+    out = ctypes.create_string_buffer(SURFACE_BOUND)
+    got = ctypes.c_size_t()
+    _check(_L.volcomp_shim_surface_encode(p, q, threshold, out, SURFACE_BOUND, ctypes.byref(got)))
+    return out.raw[: got.value]
+
+
+def surface_info(enc):
+    """(threshold, margin) if `enc` is a surface chunk, else None (margin 0: no refinement was needed)."""
+    p, n, keep = _buf(enc)
+    thr, margin = ctypes.c_uint32(), ctypes.c_uint32()
+    st = _L.volcomp_shim_surface_info(p, n, ctypes.byref(thr), ctypes.byref(margin))
+    if st == 1:  # ERR_ARG: a well-formed stream that is not a surface chunk
+        return None
+    _check(st)
+    return thr.value, margin.value
 
 
 def mask_info(enc):
