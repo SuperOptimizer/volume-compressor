@@ -14,7 +14,10 @@ no dependencies beyond libc/libm.
 and there are two further modes for **binary masks** (below):
 `volcomp_mask_encode`, where half the spatial resolution costs 30× less than
 storing the mask exactly, and `volcomp_mask_encode_lossless`, which stores the
-mask itself, voxel for voxel, for 4× that.
+mask itself, voxel for voxel, for 4× that. A **surface** mode,
+`volcomp_surface_encode`, is for probability maps that consumers threshold: the
+DCT codec plus a refinement that keeps the 0.5 threshold exact for every voxel
+(below and [`docs/surface_mode.md`](docs/surface_mode.md)).
 
 Both modes share the geometry, the entropy coder, the API and the stream
 header, so a reader does not need to know which one produced a chunk;
@@ -109,6 +112,41 @@ lossless path is plain C on every target — it has no float math, so its
 streams are identical on every build. Define `VOLCOMP_MALLOC` / `VOLCOMP_FREE`
 to override the one scratch allocation in `volcomp_encode`.
 
+## Surface predictions (mode 6)
+
+```c
+st = volcomp_surface_encode(prob /* 128^3, u8 = 255 p */, 64.0f /* q */, 128 /* thr */,
+                            enc, VOLCOMP_SURFACE_ENCODE_BOUND, &n);
+st = volcomp_decode(enc, n, dst, VOLCOMP_CHUNK_VOXELS);   /* the same call as any other chunk */
+st = volcomp_surface_info(enc, n, &thr, &margin);         /* OK iff a surface chunk */
+```
+
+For smooth probability volumes: the recto and m7 surface-teacher predictions.
+The chunk has two parts:
+
+- A DCT base with a **flat** step law, where every AC step is q. It is
+  reconstructed bit-exactly on every build by strict IEEE kernels, with no FMA
+  and the same result from AVX2 and C.
+- One context-coded bit for each voxel near the threshold, saying whether the
+  base put it on the wrong side.
+
+`(source >= thr) == (decoded >= thr)` holds for every voxel. The thresholded
+mask, its skeleton and its distance field are therefore exactly the source's;
+only the soft values carry the DCT error.
+
+Measured on 201 M voxels of fresh float predictions per teacher from PHercParis4:
+
+- **Surface q64** is 0.78× (recto) and 0.71× (m7) the size of plain q8. Its mask
+  is exact, where q8 flips 0.66 % / 0.18 % of voxels and has a skeleton F1 of
+  0.52 / 0.64. Its band MAE is 3.5/255, against 2.2-2.6 at q8.
+- **Surface q32** matches q8's soft error at 1.0-1.17× q8's size.
+- **Decode** runs at 0.96-1.5 GB/s single-thread, against 3.5-4.2 GB/s for q8.
+
+q is the flat-law step, from 2 to 255; surface q48 is about the size of mode-0
+q16. Details and the full candidate study: [`docs/surface_mode.md`](docs/surface_mode.md).
+Format: [`spec/format.md`](spec/format.md) §13. A revision-3 reader refuses these
+chunks cleanly.
+
 ## Label volumes (`volcomp_label.h`)
 
 Companion header for multi-class probability arrays: a 128³ label chunk holds
@@ -146,6 +184,7 @@ MAE 0.5, P99 6, PSNR 43.7 dB.
 ```sh
 cmake --preset release && cmake --build --preset release && ctest --preset release
 ./build/release/volcomp encode chunk.u8 chunk.volc --q=8      # --q=0 for lossless
+./build/release/volcomp encode prob.u8 prob.volc --q=64 --surface   # surface chunk, threshold 128
 ./build/release/volcomp verify chunk.volc chunk.u8
 ./build/release/volcomp shard-pack chunks/ shard.bin --q=8     # chunks/z_y_x.u8
 ./build/release/volcomp label-encode labels/ chunk.voll --q=8 --q-plane=12=0

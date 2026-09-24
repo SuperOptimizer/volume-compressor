@@ -8,7 +8,8 @@
   `mask_encode(bytes) -> bytes`, `mask_encode_lossless(bytes) -> bytes`,
   `mask_info(bytes) -> 64 | 128 | None`,
   `mask_decode_stored(bytes) -> bytearray` (the stored grid: 64³ for the 2×
-  mode, 128³ for the lossless one).
+  mode, 128³ for the lossless one), and for probability maps
+  `surface_encode(bytes, q, threshold=128) -> bytes`, `surface_info(bytes)`.
 - `volcomp_zarr.VolcompCodec`: zarr ≥ 3 array→bytes codec registered as `"volcomp"`
   (`{"name": "volcomp", "configuration": {"q": 8}}`, or
   `{"mode": "mask"}` / `{"mode": "mask-lossless"}` for the two mask modes),
@@ -55,6 +56,18 @@ z = zarr.create_array(store, shape=(256, 512, 512), chunks=(128, 128, 128),
                       dtype="uint8", serializer=VolcompCodec(mode="mask"), fill_value=0)
 z[:] = surface_mask                      # 0/255
 field = z[0:128, 0:128, 0:128]           # 0..255, 255 at the mask's block centres
+```
+
+**Surface mode** (`VolcompCodec(mode="surface", q=64)`, optional
+`threshold=128`) is for probability maps: the DCT codec plus a refinement that
+keeps `value >= threshold` exact for every voxel (spec §13,
+`docs/surface_mode.md`). `surface_encode(bytes, q, threshold=128)` and
+`surface_info(bytes) -> (threshold, margin) | None` are the bytes-level calls; q is
+in 2..255 and uses a flat step law, so surface q 48 is about the size of `q=16`.
+
+```python
+z = zarr.create_array(store, shape=shape, chunks=(128,) * 3, shards=(1024,) * 3, dtype="uint8",
+                      serializer=VolcompCodec(mode="surface", q=64), compressors=None, fill_value=0)
 ```
 
 `python/test_zarr_roundtrip.py` exercises the codec class itself (zarr ≥ 3 and
