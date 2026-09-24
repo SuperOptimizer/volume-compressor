@@ -116,9 +116,35 @@ static inline volcomp_status volcomp_decode_block(const void *restrict enc, size
  * faces and chunk faces receive identical treatment; the volume's own outer
  * faces are not filtered. q must be the q the chunks were encoded with (the
  * gate strength scales with it). Not part of the format; the caller chooses
- * whether to run it. Measured on scroll data: +0.15 dB (q8) to +0.4 dB (q32)
+ * whether to run it. Exact zeros (masked air) are never filtered into
+ * (VOLCOMP_DEBLOCK_ZERO_GUARD, below). Measured on scroll data: +0.15 dB (q8) to +0.4 dB (q32)
  * PSNR, blocking amplification 1.5x -> ~1.1x, ~5% of decode time. */
 static inline void volcomp_deblock(uint8_t *vol, size_t nz, size_t ny, size_t nx, float q);
+/* volcomp_deblock with options. VOLCOMP_DEBLOCK_ZERO_GUARD: leave every face
+ * position alone where one of the four voxels it reads is exactly 0 — masked CT
+ * stores air as 0, and a mask edge that falls on a 16-plane is a real edge, not a
+ * seam. volcomp_deblock itself now always applies the guard: without it the filter
+ * blurred masked CT's chunk-aligned air edges at q >= 16 (edge error +54 %, chunk
+ * faces 2.8x rougher than unfiltered); with it no chunk is ever worse than no
+ * filter on the measured CT, and nothing else changes (docs/deblocking.md).
+ * flags = 0 is the old, unguarded filter. */
+#define VOLCOMP_DEBLOCK_ZERO_GUARD 1u
+/* volcomp_decode_smooth: smooth with the gated face filter instead of a Gaussian
+ * seam blur (strength then scales the filter's q) */
+#define VOLCOMP_SMOOTH_GATED 2u
+/* Optional decode-side deblocking of one chunk (not part of the format; the
+ * stream is untouched, only this reader's reconstruction differs): decode, smooth
+ * the voxels next to interior block faces (a Gaussian of `strength` voxels, or
+ * with VOLCOMP_SMOOTH_GATED the gated face filter at `strength` x q), then project
+ * every block back onto the quantisation cells its coefficients were decoded from,
+ * so the output is still a reconstruction the stream allows. Lossy (mode 0) and
+ * surface chunks only (a surface chunk keeps its exact threshold); any other chunk
+ * decodes exactly as volcomp_decode. Chunk faces are left as decoded; run
+ * volcomp_deblock_ex on an assembled region for those. VOLCOMP_DEBLOCK_ZERO_GUARD
+ * keeps exact zeros (masked air) and the faces touching them untouched. */
+static inline volcomp_status volcomp_decode_smooth(const void *restrict enc, size_t enc_n, uint8_t *restrict dst_zyx,
+                                                   size_t dst_cap, float strength, unsigned flags);
+static inline void volcomp_deblock_ex(uint8_t *vol, size_t nz, size_t ny, size_t nx, float q, unsigned flags);
 /* True if the stream decodes exactly (was encoded with VOLCOMP_Q_LOSSLESS).
  * False for a mask chunk, which stores a 2x downscale of its source.
  * Also validates the magic/version/mode bytes. */
@@ -3646,6 +3672,214 @@ static inline volcomp_status volcomp_decode_block(const void *restrict enc, size
 }
 
 
+/* ---- optional decode-side deblocking by projection (not part of the format) ----
+ * volcomp_decode_smooth: decode the chunk, blur (Gaussian, sigma) the voxels
+ * within two of every block face, then project each 16^3 block back onto the
+ * quantisation cells its coefficients were decoded from (one POCS step): the
+ * result is the smoothest-looking chunk the stream is still consistent with.
+ * Works inside one chunk (chunk faces are smoothed from their own side only),
+ * so it needs nothing but the chunk's stream. docs/deblocking.md has the numbers. */
+
+/* the signed level of every coefficient of the 16 blocks of substream s, natural order */
+static volcomp_status vf_decode_levels_sub(const vf_parsed *restrict p, uint32_t s, int32_t *restrict lv) {
+  const uint8_t *rb = p->payload + p->off[s];
+  vf_rdec rd;
+  if (!vf_rdec_init(&rd, rb, p->tok_n[s])) return VOLCOMP_ERR_CORRUPT;
+  vf_bitr br;
+  vf_br_init(&br, rb + p->tok_n[s], p->byp_n[s]);
+  int64_t prev_dc = 0;
+  for (uint32_t k = 0; k < VF_BLOCKS_PER_SUB; k++) {
+    int32_t *b = lv + (size_t)k * VF_BLKV;
+    memset(b, 0, VF_BLKV * sizeof *b);
+    int t = vf_rdec_get(&rd, &p->models[VF_DC_CTX]);
+    if (t < 0 || (uint32_t)t > VF_TOKMAX_DC) return VOLCOMP_ERR_CORRUPT;
+    uint32_t u;
+    if (!vf_hyb_read(&br, (uint32_t)t, &u)) return VOLCOMP_ERR_CORRUPT;
+    int64_t dc = prev_dc + vf_unzigzag(u);
+    if (dc < -VF_DC_ABS_MAX || dc > VF_DC_ABS_MAX) return VOLCOMP_ERR_CORRUPT;
+    prev_dc = dc;
+    b[0] = (int32_t)dc;
+    uint32_t pos = 1;
+    for (;;) {
+      t = vf_rdec_get(&rd, &p->models[vf_run_ctx(pos)]);
+      if (t < 0) return VOLCOMP_ERR_CORRUPT;
+      if ((uint32_t)t == VF_TOK_EOB) break;
+      if ((uint32_t)t > VF_TOKMAX_RUN) return VOLCOMP_ERR_CORRUPT;
+      uint32_t run;
+      if (!vf_hyb_read(&br, (uint32_t)t, &run)) return VOLCOMP_ERR_CORRUPT;
+      pos += run;
+      if (pos >= VF_BLKV) return VOLCOMP_ERR_CORRUPT;
+      int lt = vf_rdec_get(&rd, &p->models[vf_level_ctx(pos, run)]);
+      if (lt < 0 || (uint32_t)lt > VF_TOKMAX_LVL) return VOLCOMP_ERR_CORRUPT;
+      uint32_t mag1, sign;
+      if (!vf_hyb_read(&br, (uint32_t)lt, &mag1) || !vf_br_get(&br, 1, &sign)) return VOLCOMP_ERR_CORRUPT;
+      if (mag1 + 1u > VF_AC_MAG_MAX) return VOLCOMP_ERR_CORRUPT;
+      b[VF_SCAN16[pos]] = sign ? -(int32_t)(mag1 + 1u) : (int32_t)(mag1 + 1u);
+      pos++;
+    }
+  }
+  if (!vf_rdec_finished(&rd) || !vf_br_finished(&br)) return VOLCOMP_ERR_CORRUPT;
+  return VOLCOMP_OK;
+}
+
+/* separable Gaussian blur of the whole chunk (edge-replicating), radius
+ * floor(4 sigma + 0.5) <= 8, applied in place to f (C^3 floats) */
+static void vf_blur_chunk(float *f, float sigma, float *line) {
+  const uint32_t C = VOLCOMP_CHUNK_DIM;
+  int rad = (int)(4.0f * sigma + 0.5f);
+  if (rad > 8) rad = 8;
+  float w[17], sum = 0;
+  for (int k = -rad; k <= rad; k++) sum += w[k + rad] = expf(-0.5f * (float)(k * k) / (sigma * sigma));
+  for (int k = 0; k <= 2 * rad; k++) w[k] /= sum;
+  const size_t stride[3] = {1, C, (size_t)C * C};
+  for (int ax = 0; ax < 3; ax++) {
+    const size_t st = stride[ax];
+    const size_t o1 = ax == 0 ? C : 1, o2 = ax == 2 ? C : (size_t)C * C;
+    for (uint32_t a = 0; a < C; a++)
+      for (uint32_t b = 0; b < C; b++) {
+        float *base = f + (ax == 0 ? (size_t)a * C * C + (size_t)b * C : ax == 1 ? (size_t)a * C * C + b : (size_t)a * C + b);
+        (void)o1;
+        (void)o2;
+        for (uint32_t i = 0; i < C; i++) line[i] = base[i * st];
+        for (int i = 0; i < (int)C; i++) {
+          float acc = 0;
+          for (int k = -rad; k <= rad; k++) {
+            int j = i + k;
+            j = j < 0 ? 0 : (j >= (int)C ? (int)C - 1 : j);
+            acc += w[k + rad] * line[j];
+          }
+          base[(size_t)i * st] = acc;
+        }
+      }
+  }
+}
+
+static inline volcomp_status volcomp_decode_smooth(const void *restrict enc, size_t enc_n, uint8_t *restrict dst_zyx,
+                                                   size_t dst_cap, float sigma, unsigned flags) {
+  const bool zg = (flags & VOLCOMP_DEBLOCK_ZERO_GUARD) != 0;
+  if (!enc || !dst_zyx) return VOLCOMP_ERR_ARG;
+  if (dst_cap < VOLCOMP_CHUNK_VOXELS) return VOLCOMP_ERR_SHORT_BUF;
+  volcomp_status st = volcomp_decode(enc, enc_n, dst_zyx, dst_cap);
+  if (st != VOLCOMP_OK || !(sigma > 0.0f)) return st;
+  uint32_t mode;
+  st = vll_chunk_mode(enc, enc_n, &mode);
+  if (st != VOLCOMP_OK) return st;
+  if (mode != VLL_MODE_LOSSY && mode != VLL_MODE_SURFACE) return VOLCOMP_OK; /* nothing to project onto */
+  if (sigma > 4.0f) sigma = 4.0f;
+  vf_parsed p;
+  uint32_t thr = 0;
+  if (mode == VLL_MODE_SURFACE) {
+    vsf_parsed sp;
+    st = vsf_parse(enc, enc_n, &sp);
+    if (st == VOLCOMP_OK) st = vf_parse_body(sp.base, sp.base + sp.base_n, sp.qraw, true, true, &p);
+    thr = sp.thr;
+  } else {
+    st = vf_parse(enc, enc_n, &p);
+  }
+  if (st != VOLCOMP_OK) return st;
+  const size_t NV = VOLCOMP_CHUNK_VOXELS;
+  float *f = (float *)VOLCOMP_MALLOC(NV * sizeof(float) + VF_BLOCKS_PER_SUB * VF_BLKV * sizeof(int32_t) +
+                                     2u * VF_BLKV * sizeof(float) + VOLCOMP_CHUNK_DIM * sizeof(float));
+  if (!f) return VOLCOMP_ERR_NOMEM;
+  int32_t *lv = (int32_t *)(void *)(f + NV);
+  float *blk = (float *)(void *)(lv + VF_BLOCKS_PER_SUB * VF_BLKV), *vox = blk + VF_BLKV, *line = vox + VF_BLKV;
+  if (flags & VOLCOMP_SMOOTH_GATED) {
+    /* the smoothing step is volcomp_deblock's gated face filter (strength = its q
+     * multiplier) on this chunk alone: it only touches block faces whose step is
+     * small against q, so real edges and fine texture are left to the projection */
+    uint8_t *tmp = (uint8_t *)VOLCOMP_MALLOC(NV);
+    if (!tmp) {
+      VOLCOMP_FREE(f);
+      return VOLCOMP_ERR_NOMEM;
+    }
+    memcpy(tmp, dst_zyx, NV);
+    volcomp_deblock_ex(tmp, VOLCOMP_CHUNK_DIM, VOLCOMP_CHUNK_DIM, VOLCOMP_CHUNK_DIM, p.q * sigma, flags);
+    for (size_t i = 0; i < NV; i++) f[i] = (float)tmp[i];
+    VOLCOMP_FREE(tmp);
+  } else if (zg) { /* normalised blur over the nonzero voxels only: masked air neither spreads nor receives */
+    float *wgt = (float *)VOLCOMP_MALLOC(NV * sizeof(float));
+    if (!wgt) {
+      VOLCOMP_FREE(f);
+      return VOLCOMP_ERR_NOMEM;
+    }
+    for (size_t i = 0; i < NV; i++) {
+      f[i] = (float)dst_zyx[i];
+      wgt[i] = dst_zyx[i] ? 1.0f : 0.0f;
+    }
+    vf_blur_chunk(f, sigma, line);
+    vf_blur_chunk(wgt, sigma, line);
+    for (size_t i = 0; i < NV; i++) f[i] = dst_zyx[i] && wgt[i] > 0.0f ? f[i] / wgt[i] : (float)dst_zyx[i];
+    VOLCOMP_FREE(wgt);
+  } else {
+    for (size_t i = 0; i < NV; i++) f[i] = (float)dst_zyx[i];
+    vf_blur_chunk(f, sigma, line);
+  }
+  /* cell bounds (orthonormal domain, units of step): L == 0 -> |X| < 1 - dz; else |X| in [|L| - dz, |L| + 1 - dz] */
+  for (uint32_t s = 0; s < VF_NSUB && st == VOLCOMP_OK; s++) {
+    st = vf_decode_levels_sub(&p, s, lv);
+    for (uint32_t k = 0; k < VF_BLOCKS_PER_SUB && st == VOLCOMP_OK; k++) {
+      const uint32_t bi = s * VF_BLOCKS_PER_SUB + k, bz = bi >> 6, by = (bi >> 3) & 7u, bx = bi & 7u;
+      const int32_t *L = lv + (size_t)k * VF_BLKV;
+      /* the seam-blurred block: blurred values within two voxels of an interior
+       * block face, decoded ones elsewhere (a chunk face is seen from one side
+       * only, so it is left as decoded) */
+#define VF_SEAM(b, u) (((u) <= 1u && (b) > 0u) || ((u) >= 14u && (b) < 7u))
+      uint64_t zeros = 0;
+      for (uint32_t z = 0; z < 16; z++)
+        for (uint32_t y = 0; y < 16; y++) {
+          const size_t off = vf_row_off(bz, by, bx, z, y);
+          const bool zy = VF_SEAM(bz, z) || VF_SEAM(by, y);
+          for (uint32_t x = 0; x < 16; x++) {
+            const bool seam = zy || VF_SEAM(bx, x);
+            const uint8_t d0 = dst_zyx[off + x];
+            zeros += d0 == 0;
+            blk[(z * 16 + y) * 16 + x] = (seam && !(zg && !d0) ? f[off + x] : (float)d0) - 128.0f;
+          }
+        }
+#undef VF_SEAM
+      vf_dct16_fwd(blk);
+      for (uint32_t c = 0; c < VF_BLKV; c++) {
+        const float sc = vf_dct_scale(c), stp = p.step[vf_radius(c)];
+        const float dz = c ? VF_DZ_Q : VF_DZ_Q_DC;
+        float x = blk[c] * sc / stp; /* orthonormal coefficient in steps */
+        const int32_t l = L[c];
+        if (l == 0) {
+          const float h = 1.0f - dz;
+          x = x < -h ? -h : (x > h ? h : x);
+        } else {
+          const float a = (float)(l < 0 ? -l : l), sg = l < 0 ? -1.0f : 1.0f;
+          float m = x * sg; /* magnitude on the level's side; the other side counts as 0 */
+          m = m < a - dz ? a - dz : (m > a + 1.0f - dz ? a + 1.0f - dz : m);
+          x = sg * m;
+        }
+        blk[c] = x * stp * sc; /* back to the inverse transform's input scale */
+      }
+      vf_dct16_inv(blk, 0xFFFFu, 0xFFFFu, vox);
+      if (zg && zeros) { /* masked air stays exactly 0 */
+        for (uint32_t z = 0; z < 16; z++)
+          for (uint32_t y = 0; y < 16; y++) {
+            const size_t off = vf_row_off(bz, by, bx, z, y);
+            for (uint32_t x = 0; x < 16; x++)
+              if (!dst_zyx[off + x]) vox[(z * 16 + y) * 16 + x] = -128.5f;
+          }
+      }
+      vf_scatter_block(dst_zyx + vf_row_off(bz, by, bx, 0, 0), (size_t)VOLCOMP_CHUNK_DIM * VOLCOMP_CHUNK_DIM,
+                       VOLCOMP_CHUNK_DIM, vox);
+    }
+  }
+  if (st == VOLCOMP_OK && mode == VLL_MODE_SURFACE) {
+    /* keep every voxel on the side the refinement put it: the threshold stays exact */
+    uint8_t *ref = (uint8_t *)(void *)f; /* reuse: the refined chunk, re-decoded */
+    st = volcomp_decode(enc, enc_n, ref, NV);
+    for (size_t i = 0; st == VOLCOMP_OK && i < NV; i++) {
+      if (ref[i] >= thr && dst_zyx[i] < thr) dst_zyx[i] = (uint8_t)thr;
+      if (ref[i] < thr && dst_zyx[i] >= thr) dst_zyx[i] = (uint8_t)(thr - 1u);
+    }
+  }
+  VOLCOMP_FREE(f);
+  return st;
+}
+
 /* ---- optional post-decode deblock (c5d's normative face filter, generalised
  * to every 16-plane of an assembled volume) ----
  * For voxel pairs p1 p0 | q0 q1 straddling a plane, with c = clamp(0.8q+1,1,24):
@@ -3654,8 +3888,9 @@ static inline volcomp_status volcomp_decode_block(const void *restrict enc, size
 /* one face position: p0/q0 straddle the face, P1/Q1 one step further out.
  * delta is bounded by |Q0-P0| and moves each side toward the other, so the
  * results stay within [P0, Q0] and need no clamp. */
-__attribute__((always_inline)) static inline void vf_deblock_1(uint8_t *p0, uint8_t *q0, ptrdiff_t s, int c) {
+__attribute__((always_inline)) static inline void vf_deblock_1(uint8_t *p0, uint8_t *q0, ptrdiff_t s, int c, int zg) {
   int P1 = p0[-s], P0 = *p0, Q0 = *q0, Q1 = q0[s];
+  if (zg && !(P1 && P0 && Q0 && Q1)) return; /* an exact zero: masked air, never filtered into */
   int d = Q0 - P0, ad = d < 0 ? -d : d;
   if (ad == 0 || ad >= 4 * c) return;
   int dp = P1 - P0, dq = Q1 - Q0;
@@ -3667,7 +3902,7 @@ __attribute__((always_inline)) static inline void vf_deblock_1(uint8_t *p0, uint
 }
 #if VF_HAVE_AVX2
 /* 16 contiguous face positions at once (lines adjacent in memory) */
-__attribute__((always_inline)) VF_TARGET_AVX2 static inline void vf_deblock_16(uint8_t *p0, uint8_t *q0, ptrdiff_t s, int c) {
+__attribute__((always_inline)) VF_TARGET_AVX2 static inline void vf_deblock_16(uint8_t *p0, uint8_t *q0, ptrdiff_t s, int c, int zg) {
   const __m256i P1 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(p0 - s)));
   const __m256i P0 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)p0));
   const __m256i Q0 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)q0));
@@ -3680,6 +3915,11 @@ __attribute__((always_inline)) VF_TARGET_AVX2 static inline void vf_deblock_16(u
   skip = _mm256_or_si256(skip, _mm256_cmpgt_epi16(ad, _mm256_sub_epi16(c4, _mm256_set1_epi16(1))));
   skip = _mm256_or_si256(skip, _mm256_cmpgt_epi16(adp, _mm256_sub_epi16(cc, _mm256_set1_epi16(1))));
   skip = _mm256_or_si256(skip, _mm256_cmpgt_epi16(adq, _mm256_sub_epi16(cc, _mm256_set1_epi16(1))));
+  if (zg) {
+    const __m256i z0 = _mm256_setzero_si256();
+    skip = _mm256_or_si256(skip, _mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi16(P1, z0), _mm256_cmpeq_epi16(P0, z0)),
+                                                 _mm256_or_si256(_mm256_cmpeq_epi16(Q0, z0), _mm256_cmpeq_epi16(Q1, z0))));
+  }
   __m256i delta = _mm256_srai_epi16(_mm256_add_epi16(_mm256_mullo_epi16(ad, _mm256_set1_epi16(3)), _mm256_set1_epi16(4)), 3);
   delta = _mm256_sign_epi16(delta, d); /* negate where d < 0 (d == 0 already skipped) */
   delta = _mm256_andnot_si256(skip, delta);
@@ -3689,7 +3929,7 @@ __attribute__((always_inline)) VF_TARGET_AVX2 static inline void vf_deblock_16(u
   _mm_storeu_si128((__m128i *)q0, _mm256_extracti128_si256(pk, 1));
 }
 VF_TARGET_AVX2 static void vf_deblock_axis_avx2(uint8_t *vol, size_t n_outer, size_t n_mid, size_t n_in,
-                                                size_t s_outer, size_t s_mid, size_t s_in, int c) {
+                                                size_t s_outer, size_t s_mid, size_t s_in, int c, int zg) {
   /* filters planes along the "in" axis; (outer, mid) enumerate the lines */
   for (size_t f = 16; f < n_in; f += 16)
     for (size_t o = 0; o < n_outer; o++) {
@@ -3697,36 +3937,40 @@ VF_TARGET_AVX2 static void vf_deblock_axis_avx2(uint8_t *vol, size_t n_outer, si
       size_t m = 0;
       if (s_mid == 1)
         for (; m + 16 <= n_mid; m += 16)
-          vf_deblock_16(base + m - s_in, base + m, (ptrdiff_t)s_in, c);
+          vf_deblock_16(base + m - s_in, base + m, (ptrdiff_t)s_in, c, zg);
       for (; m < n_mid; m++)
-        vf_deblock_1(base + m * s_mid - s_in, base + m * s_mid, (ptrdiff_t)s_in, c);
+        vf_deblock_1(base + m * s_mid - s_in, base + m * s_mid, (ptrdiff_t)s_in, c, zg);
     }
 }
 #endif /* VF_HAVE_AVX2 */
 static void vf_deblock_axis_c(uint8_t *vol, size_t n_outer, size_t n_mid, size_t n_in,
-                              size_t s_outer, size_t s_mid, size_t s_in, int c) {
+                              size_t s_outer, size_t s_mid, size_t s_in, int c, int zg) {
   for (size_t f = 16; f < n_in; f += 16)
     for (size_t o = 0; o < n_outer; o++) {
       uint8_t *base = vol + o * s_outer + f * s_in;
       for (size_t m = 0; m < n_mid; m++)
-        vf_deblock_1(base + m * s_mid - s_in, base + m * s_mid, (ptrdiff_t)s_in, c);
+        vf_deblock_1(base + m * s_mid - s_in, base + m * s_mid, (ptrdiff_t)s_in, c, zg);
     }
 }
 static inline void vf_deblock_axis(uint8_t *vol, size_t n_outer, size_t n_mid, size_t n_in,
-                                   size_t s_outer, size_t s_mid, size_t s_in, int c) {
+                                   size_t s_outer, size_t s_mid, size_t s_in, int c, int zg) {
 #if VF_HAVE_AVX2
-  if (vf_use_avx2()) { vf_deblock_axis_avx2(vol, n_outer, n_mid, n_in, s_outer, s_mid, s_in, c); return; }
+  if (vf_use_avx2()) { vf_deblock_axis_avx2(vol, n_outer, n_mid, n_in, s_outer, s_mid, s_in, c, zg); return; }
 #endif
-  vf_deblock_axis_c(vol, n_outer, n_mid, n_in, s_outer, s_mid, s_in, c);
+  vf_deblock_axis_c(vol, n_outer, n_mid, n_in, s_outer, s_mid, s_in, c, zg);
 }
-static inline void volcomp_deblock(uint8_t *vol, size_t nz, size_t ny, size_t nx, float q) {
+static inline void volcomp_deblock_ex(uint8_t *vol, size_t nz, size_t ny, size_t nx, float q, unsigned flags) {
   if (!vol || nz < 2 || ny < 2 || nx < 2) return;
+  const int zg = (flags & VOLCOMP_DEBLOCK_ZERO_GUARD) != 0;
   float cf = 0.8f * q + 1.0f;
   int c = (int)(cf < 1.0f ? 1.0f : (cf > 24.0f ? 24.0f : cf));
   const size_t sy = nx, sz = nx * ny;
-  vf_deblock_axis(vol, nz, ny, nx, sz, sy, 1, c);  /* x planes */
-  vf_deblock_axis(vol, nz, nx, ny, sz, 1, sy, c);  /* y planes */
-  vf_deblock_axis(vol, ny, nx, nz, sy, 1, sz, c);  /* z planes */
+  vf_deblock_axis(vol, nz, ny, nx, sz, sy, 1, c, zg);  /* x planes */
+  vf_deblock_axis(vol, nz, nx, ny, sz, 1, sy, c, zg);  /* y planes */
+  vf_deblock_axis(vol, ny, nx, nz, sy, 1, sz, c, zg);  /* z planes */
+}
+static inline void volcomp_deblock(uint8_t *vol, size_t nz, size_t ny, size_t nx, float q) {
+  volcomp_deblock_ex(vol, nz, ny, nx, q, VOLCOMP_DEBLOCK_ZERO_GUARD);
 }
 
 static inline const char *volcomp_status_string(volcomp_status s) {
