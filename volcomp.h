@@ -3723,35 +3723,53 @@ static volcomp_status vf_decode_levels_sub(const vf_parsed *restrict p, uint32_t
 }
 
 /* separable Gaussian blur of the whole chunk (edge-replicating), radius
- * floor(4 sigma + 0.5) <= 8, applied in place to f (C^3 floats) */
-static void vf_blur_chunk(float *f, float sigma, float *line) {
+ * floor(4 sigma + 0.5) <= 8, in place on f (C^3 floats). `tmp` holds C^3 + 2 C^2
+ * floats. Every pass runs along contiguous x rows, so it vectorises and stays in
+ * cache: x taps inside a row, y taps across rows of one plane, z taps across planes. */
+static void vf_blur_chunk(float *f, float sigma, float *tmp) {
   const uint32_t C = VOLCOMP_CHUNK_DIM;
+  const size_t PL = (size_t)C * C;
   int rad = (int)(4.0f * sigma + 0.5f);
   if (rad > 8) rad = 8;
   float w[17], sum = 0;
   for (int k = -rad; k <= rad; k++) sum += w[k + rad] = expf(-0.5f * (float)(k * k) / (sigma * sigma));
   for (int k = 0; k <= 2 * rad; k++) w[k] /= sum;
-  const size_t stride[3] = {1, C, (size_t)C * C};
-  for (int ax = 0; ax < 3; ax++) {
-    const size_t st = stride[ax];
-    const size_t o1 = ax == 0 ? C : 1, o2 = ax == 2 ? C : (size_t)C * C;
-    for (uint32_t a = 0; a < C; a++)
-      for (uint32_t b = 0; b < C; b++) {
-        float *base = f + (ax == 0 ? (size_t)a * C * C + (size_t)b * C : ax == 1 ? (size_t)a * C * C + b : (size_t)a * C + b);
-        (void)o1;
-        (void)o2;
-        for (uint32_t i = 0; i < C; i++) line[i] = base[i * st];
-        for (int i = 0; i < (int)C; i++) {
-          float acc = 0;
-          for (int k = -rad; k <= rad; k++) {
-            int j = i + k;
-            j = j < 0 ? 0 : (j >= (int)C ? (int)C - 1 : j);
-            acc += w[k + rad] * line[j];
-          }
-          base[(size_t)i * st] = acc;
-        }
-      }
+  float *g = tmp, *line = tmp + C * PL; /* g: the z pass's output; line: one padded row */
+  for (size_t r = 0; r < PL; r++) { /* x */
+    float *row = f + r * C;
+    for (int i = 0; i < rad; i++) line[i] = row[0], line[rad + (int)C + i] = row[C - 1];
+    memcpy(line + rad, row, C * sizeof(float));
+    for (uint32_t x = 0; x < C; x++) {
+      float acc = 0;
+      for (int k = 0; k <= 2 * rad; k++) acc += w[k] * line[x + (uint32_t)k];
+      row[x] = acc;
+    }
   }
+  for (uint32_t z = 0; z < C; z++) { /* y, one plane at a time through g */
+    float *pl = f + z * PL, *o = g;
+    memcpy(o, pl, PL * sizeof(float));
+    for (uint32_t y = 0; y < C; y++) {
+      float *dst = pl + (size_t)y * C;
+      for (uint32_t x = 0; x < C; x++) dst[x] = 0;
+      for (int k = -rad; k <= rad; k++) {
+        int yy = (int)y + k;
+        yy = yy < 0 ? 0 : (yy >= (int)C ? (int)C - 1 : yy);
+        const float *src = o + (size_t)yy * C, wk = w[k + rad];
+        for (uint32_t x = 0; x < C; x++) dst[x] += wk * src[x];
+      }
+    }
+  }
+  for (uint32_t z = 0; z < C; z++) { /* z, into g */
+    float *dst = g + z * PL;
+    for (size_t i = 0; i < PL; i++) dst[i] = 0;
+    for (int k = -rad; k <= rad; k++) {
+      int zz = (int)z + k;
+      zz = zz < 0 ? 0 : (zz >= (int)C ? (int)C - 1 : zz);
+      const float *src = f + (size_t)zz * PL, wk = w[k + rad];
+      for (size_t i = 0; i < PL; i++) dst[i] += wk * src[i];
+    }
+  }
+  memcpy(f, g, (size_t)C * PL * sizeof(float));
 }
 
 static inline volcomp_status volcomp_decode_smooth(const void *restrict enc, size_t enc_n, uint8_t *restrict dst_zyx,
@@ -3765,6 +3783,10 @@ static inline volcomp_status volcomp_decode_smooth(const void *restrict enc, siz
   st = vll_chunk_mode(enc, enc_n, &mode);
   if (st != VOLCOMP_OK) return st;
   if (mode != VLL_MODE_LOSSY && mode != VLL_MODE_SURFACE) return VOLCOMP_OK; /* nothing to project onto */
+  /* below mode-0 q 4 the seams are within the voxel noise of CT: the gated
+   * filter has nothing to fix there and was measured to lose 0.00-0.03 dB */
+  if ((flags & VOLCOMP_SMOOTH_GATED) && mode == VLL_MODE_LOSSY && vf_rd_u16((const uint8_t *)enc + 6) < 4u * 256u)
+    return VOLCOMP_OK;
   if (sigma > 4.0f) sigma = 4.0f;
   vf_parsed p;
   uint32_t thr = 0;
@@ -3778,11 +3800,14 @@ static inline volcomp_status volcomp_decode_smooth(const void *restrict enc, siz
   }
   if (st != VOLCOMP_OK) return st;
   const size_t NV = VOLCOMP_CHUNK_VOXELS;
+  const bool gauss = !(flags & VOLCOMP_SMOOTH_GATED);
+  const size_t blur_n = gauss ? NV + 2u * (size_t)VOLCOMP_CHUNK_DIM * VOLCOMP_CHUNK_DIM : 0u;
   float *f = (float *)VOLCOMP_MALLOC(NV * sizeof(float) + VF_BLOCKS_PER_SUB * VF_BLKV * sizeof(int32_t) +
-                                     2u * VF_BLKV * sizeof(float) + VOLCOMP_CHUNK_DIM * sizeof(float));
+                                     2u * VF_BLKV * sizeof(float) + blur_n * sizeof(float));
   if (!f) return VOLCOMP_ERR_NOMEM;
   int32_t *lv = (int32_t *)(void *)(f + NV);
   float *blk = (float *)(void *)(lv + VF_BLOCKS_PER_SUB * VF_BLKV), *vox = blk + VF_BLKV, *line = vox + VF_BLKV;
+  /* line: the blur's scratch (gauss only) */
   if (flags & VOLCOMP_SMOOTH_GATED) {
     /* the smoothing step is volcomp_deblock's gated face filter (strength = its q
      * multiplier) on this chunk alone: it only touches block faces whose step is
