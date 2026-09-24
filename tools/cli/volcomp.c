@@ -440,7 +440,7 @@ static int surface_pool_cli(int argc, char **argv) {
   return 0;
 }
 static int usage(void) {
-  fprintf(stderr, "usage:\n  volcomp encode in.u8 out.volc --q=Q\n  volcomp decode in.volc out.u8\n"
+  fprintf(stderr, "usage:\n  volcomp encode in.u8 out.volc --q=Q [--surface[=THR]]\n  volcomp decode in.volc out.u8\n"
                   "  volcomp verify in.volc ref.u8\n  volcomp shard-pack DIR out.shard --q=Q\n"
                   "  volcomp shard-verify in.shard DIR [--samples=N]\n"
                   "  volcomp occupancy in.u8|DIR out.bin [--shape=Z,Y,X] [--factor=F] [--dilate=D] [--grid=GZ,GY,GX] [--shards] [--chunks]\n"
@@ -467,9 +467,12 @@ int main(int argc, char **argv) {
       fprintf(stderr, "%s: need exactly %u bytes\n", argv[2], VOLCOMP_CHUNK_VOXELS);
       return 2;
     }
-    uint8_t *enc = malloc(VOLCOMP_ENCODE_BOUND);
+    uint8_t *enc = malloc(VOLCOMP_SURFACE_ENCODE_BOUND);
     size_t en;
-    volcomp_status st = volcomp_encode(src, q, enc, VOLCOMP_ENCODE_BOUND, &en);
+    /* --surface[=THR]: a surface chunk (mode 6) with the threshold exact; q is its flat-law step */
+    int thr = has_any_flag(argc, argv, "--surface") ? 128 : (int)parse_opt(argc, argv, "--surface=", 0);
+    volcomp_status st = thr ? volcomp_surface_encode(src, q, (uint32_t)thr, enc, VOLCOMP_SURFACE_ENCODE_BOUND, &en)
+                            : volcomp_encode(src, q, enc, VOLCOMP_ENCODE_BOUND, &en);
     if (st) {
       fprintf(stderr, "encode: %s\n", volcomp_status_string(st));
       return 3;
