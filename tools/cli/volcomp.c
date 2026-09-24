@@ -440,7 +440,7 @@ static int surface_pool_cli(int argc, char **argv) {
   return 0;
 }
 static int usage(void) {
-  fprintf(stderr, "usage:\n  volcomp encode in.u8 out.volc --q=Q [--surface[=THR]]\n  volcomp decode in.volc out.u8\n"
+  fprintf(stderr, "usage:\n  volcomp encode in.u8 out.volc --q=Q [--surface[=THR]]\n  volcomp decode in.volc out.u8 [--smooth[=S]]\n"
                   "  volcomp verify in.volc ref.u8\n  volcomp shard-pack DIR out.shard --q=Q\n"
                   "  volcomp shard-verify in.shard DIR [--samples=N]\n"
                   "  volcomp occupancy in.u8|DIR out.bin [--shape=Z,Y,X] [--factor=F] [--dilate=D] [--grid=GZ,GY,GX] [--shards] [--chunks]\n"
@@ -486,7 +486,14 @@ int main(int argc, char **argv) {
     uint8_t *enc = read_file(argv[2], &n);
     if (!enc) return 2;
     uint8_t *dec = malloc(VOLCOMP_CHUNK_VOXELS);
-    volcomp_status st = volcomp_decode(enc, n, dec, VOLCOMP_CHUNK_VOXELS);
+    /* --smooth[=S]: the optional decode-side deblocking (gated face filter at S x q,
+     * default 2, projected onto the stream's quantisation cells, exact zeros kept) */
+    long sm10 = has_any_flag(argc, argv, "--smooth") ? 20 : 0;
+    for (int i = 4; i < argc; i++)
+      if (!strncmp(argv[i], "--smooth=", 9)) sm10 = (long)(10.0 * atof(argv[i] + 9) + 0.5);
+    volcomp_status st = sm10 > 0 ? volcomp_decode_smooth(enc, n, dec, VOLCOMP_CHUNK_VOXELS, (float)sm10 / 10.0f,
+                                                         VOLCOMP_SMOOTH_GATED | VOLCOMP_DEBLOCK_ZERO_GUARD)
+                                 : volcomp_decode(enc, n, dec, VOLCOMP_CHUNK_VOXELS);
     if (st) {
       fprintf(stderr, "decode: %s\n", volcomp_status_string(st));
       return 3;

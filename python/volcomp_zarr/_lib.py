@@ -45,6 +45,13 @@ _L.volcomp_shim_encode.argtypes = [ctypes.c_void_p, ctypes.c_float, ctypes.c_voi
                                    ctypes.POINTER(ctypes.c_size_t)]
 _L.volcomp_shim_decode.restype = ctypes.c_int
 _L.volcomp_shim_decode.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
+_L.volcomp_shim_decode_smooth.restype = ctypes.c_int
+_L.volcomp_shim_decode_smooth.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t,
+                                          ctypes.c_float, ctypes.c_uint]
+_L.volcomp_shim_deblock_ex.restype = None
+_L.volcomp_shim_deblock_ex.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_float,
+                                       ctypes.c_uint]
+DEBLOCK_ZERO_GUARD = 1  # leave exact zeros (masked air) and the faces touching them alone
 _L.volcomp_shim_decode_block.restype = ctypes.c_int
 _L.volcomp_shim_decode_block.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint, ctypes.c_uint,
                                          ctypes.c_uint, ctypes.c_void_p, ctypes.c_size_t]
@@ -124,6 +131,23 @@ def decode(enc, out=None):
     dst = out if out is not None else bytearray(CHUNK_VOXELS)
     dp, dn, dkeep = _buf(dst)
     _check(_L.volcomp_shim_decode(p, n, dp, dn))
+    return dst
+
+
+SMOOTH_GATED = 2  # smooth with the gated face filter (strength x q) rather than a Gaussian
+
+
+def decode_smooth(enc, sigma=0.6, out=None, zero_guard=False, gated=False):
+    """Like `decode`, plus the optional decode-side deblocking: the voxels within two of
+    every block face are blurred (Gaussian sigma) and each block is projected back onto
+    the quantisation cells of its coefficients (lossy and surface chunks; any other chunk
+    decodes as `decode`). A surface chunk keeps its exact threshold. Not part of the
+    format: the stream is the same, only the reader's reconstruction differs."""
+    p, n, keep = _buf(enc)
+    dst = out if out is not None else bytearray(CHUNK_VOXELS)
+    dp, dn, dkeep = _buf(dst)
+    flags = (DEBLOCK_ZERO_GUARD if zero_guard else 0) | (SMOOTH_GATED if gated else 0)
+    _check(_L.volcomp_shim_decode_smooth(p, n, dp, dn, sigma, flags))
     return dst
 
 
@@ -239,9 +263,9 @@ def decode_block(enc, bz, by, bx):
     return dst
 
 
-def deblock(vol, nz, ny, nx, q):
+def deblock(vol, nz, ny, nx, q, zero_guard=True):
     """In-place post-filter of a z-major uint8 volume (writable bytes-like of nz*ny*nx bytes)."""
     p, n, keep = _buf(vol)
     if n != nz * ny * nx:
         raise VolcompError("volume size does not match nz*ny*nx")
-    _L.volcomp_shim_deblock(p, nz, ny, nx, q)
+    _L.volcomp_shim_deblock_ex(p, nz, ny, nx, q, DEBLOCK_ZERO_GUARD if zero_guard else 0)

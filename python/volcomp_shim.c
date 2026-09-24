@@ -14,6 +14,13 @@ VOLCOMP_EXPORT int volcomp_shim_encode(const uint8_t *src, float q, void *dst, s
 VOLCOMP_EXPORT int volcomp_shim_decode(const void *enc, size_t n, uint8_t *dst, size_t cap) {
   return (int)volcomp_decode(enc, n, dst, cap);
 }
+VOLCOMP_EXPORT int volcomp_shim_decode_smooth(const void *enc, size_t n, uint8_t *dst, size_t cap, float sigma,
+                                               unsigned flags) {
+  return (int)volcomp_decode_smooth(enc, n, dst, cap, sigma, flags);
+}
+VOLCOMP_EXPORT void volcomp_shim_deblock_ex(uint8_t *vol, size_t nz, size_t ny, size_t nx, float q, unsigned flags) {
+  volcomp_deblock_ex(vol, nz, ny, nx, q, flags);
+}
 VOLCOMP_EXPORT int volcomp_shim_decode_block(const void *enc, size_t n, unsigned bz, unsigned by, unsigned bx,
                                              uint8_t *dst, size_t cap) {
   return (int)volcomp_decode_block(enc, n, bz, by, bx, dst, cap);

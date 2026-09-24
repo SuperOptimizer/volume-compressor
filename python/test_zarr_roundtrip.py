@@ -160,6 +160,25 @@ def main():
         except ValueError:
             pass
 
+    print("\n-- reader-side deblocking (set_read_smoothing): same stored bytes, smoother reconstruction --")
+    ct = smooth_sdf().astype(np.int16) + np.random.default_rng(3).integers(-3, 4, (D, D, D))
+    ct = np.clip(ct, 1, 255).astype(np.uint8)
+    ct[:, :, 80:] = 0  # masked air on a block face
+    store = zarr.storage.MemoryStore()
+    z = zarr.create_array(store, shape=ct.shape, chunks=(D, D, D), dtype="uint8",
+                          serializer=VolcompCodec(q=16.0), compressors=None, fill_value=0)
+    z[:] = ct
+    plain = zarr.open_array(store, mode="r")[:]
+    prev = vz.set_read_smoothing(2.0)
+    try:
+        smooth = zarr.open_array(store, mode="r")[:]
+    finally:
+        vz.set_read_smoothing(prev)
+    e0 = float(np.mean((plain.astype(float) - ct) ** 2)); e1 = float(np.mean((smooth.astype(float) - ct) ** 2))
+    print(f"{'q16 smooth=2':>14}: MSE {e0:.3f} -> {e1:.3f}, masked air kept at 0: {bool((smooth[ct == 0] == 0).all())}")
+    assert (smooth[plain == 0] == 0).all() and e1 <= e0 * 1.02
+    assert "smooth" not in str(zarr.open_array(store, mode="r").metadata.to_dict())
+
     # the codec's own metadata round trip and validation
     assert VolcompCodec.from_dict(VolcompCodec(q=0.0).to_dict()) == VolcompCodec(q=0.0)
     assert VolcompCodec.from_dict(VolcompCodec(mode="mask").to_dict()) == VolcompCodec(mode="mask")

@@ -9,15 +9,33 @@ needs zarr >= 3 and numpy and is skipped if they are not installed.
 """
 from ._lib import (BLOCK_VOXELS, CHUNK_DIM, CHUNK_VOXELS, ENCODE_BOUND, MASK_DIM, MASK_LL_BOUND,
                    MASK_LL_DIM, MASK_LL_VOXELS, MASK_VOXELS, Q_LOSSLESS, SURFACE_BOUND, SURFACE_THRESHOLD,
-                   VERSION, VolcompError, deblock, decode, decode_block, encode, is_lossless,
+                   VERSION, VolcompError, deblock, decode, decode_block, decode_smooth, encode, is_lossless,
                    mask_decode_stored, mask_encode, mask_encode_lossless, mask_info, stream_q,
                    surface_encode, surface_info)
 
-__all__ = ["encode", "decode", "decode_block", "deblock", "stream_q", "is_lossless", "mask_encode",
+__all__ = ["set_read_smoothing", "encode", "decode", "decode_block", "decode_smooth", "deblock", "stream_q", "is_lossless", "mask_encode",
            "mask_encode_lossless", "mask_info", "mask_decode_stored", "VolcompError", "VERSION",
            "ENCODE_BOUND", "Q_LOSSLESS", "CHUNK_DIM", "CHUNK_VOXELS", "BLOCK_VOXELS", "MASK_DIM",
            "MASK_VOXELS", "MASK_LL_DIM", "MASK_LL_VOXELS", "MASK_LL_BOUND", "VolcompCodec",
            "surface_encode", "surface_info", "SURFACE_BOUND", "SURFACE_THRESHOLD"]
+
+import os as _os
+
+# Reader-side deblocking (decode_smooth), off by default. It is a property of the
+# reader, not of the array, so it never goes into the stored codec metadata:
+# set_read_smoothing(2.0) or VOLCOMP_SMOOTH=2 in the environment turns it on for
+# every volcomp array this process reads (lossy and surface chunks; exact zeros kept).
+_READ_SMOOTH = float(_os.environ.get("VOLCOMP_SMOOTH", "0") or 0)
+
+
+def set_read_smoothing(strength=2.0):
+    """Decode lossy/surface chunks with volcomp_decode_smooth at this strength (the
+    gated face filter at strength x q, projected onto the stream's quantisation cells,
+    masked-air zeros kept); None or 0 turns it off. Returns the previous setting."""
+    global _READ_SMOOTH
+    prev, _READ_SMOOTH = _READ_SMOOTH, float(strength or 0)
+    return prev
+
 
 try:  # zarr v3 codec registration (optional dependency)
     from dataclasses import dataclass, replace
@@ -114,7 +132,11 @@ try:  # zarr v3 codec registration (optional dependency)
 
         async def _decode_single(self, chunk_bytes: Buffer, chunk_spec: ArraySpec) -> NDBuffer:
             out = np.empty((CHUNK_DIM,) * 3, dtype=np.uint8)
-            decode(chunk_bytes.as_numpy_array().tobytes(), out.reshape(-1).view(np.uint8))
+            raw = chunk_bytes.as_numpy_array().tobytes()
+            if _READ_SMOOTH > 0:
+                decode_smooth(raw, _READ_SMOOTH, out.reshape(-1).view(np.uint8), zero_guard=True, gated=True)
+            else:
+                decode(raw, out.reshape(-1).view(np.uint8))
             return chunk_spec.prototype.nd_buffer.from_numpy_array(out)
 
     register_codec("volcomp", VolcompCodec)
