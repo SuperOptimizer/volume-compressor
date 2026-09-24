@@ -147,6 +147,35 @@ q16. Details and the full candidate study: [`docs/surface_mode.md`](docs/surface
 Format: [`spec/format.md`](spec/format.md) §13. A revision-3 reader refuses these
 chunks cleanly.
 
+## Decode-side deblocking (optional, any existing stream)
+
+```c
+volcomp_decode_smooth(enc, n, dst, VOLCOMP_CHUNK_VOXELS, 2.0f,
+                      VOLCOMP_SMOOTH_GATED | VOLCOMP_DEBLOCK_ZERO_GUARD);   /* CT, q >= 4 */
+volcomp_decode_smooth(enc, n, dst, VOLCOMP_CHUNK_VOXELS, 0.6f, VOLCOMP_DEBLOCK_ZERO_GUARD);  /* probability maps */
+```
+
+How it works:
+
+1. Smooth the chunk's interior block faces.
+2. Project every block back onto the quantisation cells its coefficients were
+   decoded from.
+
+The result is still a reconstruction the stream allows. Exact zeros (masked air)
+stay 0 with the guard, and a surface chunk keeps its exact threshold.
+
+- **Masked CT, q ≥ 4:** +0.1 to +0.6 dB PSNR, with no chunk worse than no filter.
+  Cost: about 5 ms per chunk.
+- **m7 q16:** the iso-surface shift drops from 0.095 to 0.075 voxel.
+
+`volcomp_deblock` (region-level) now skips any face position that touches an
+exact zero. The old filter blurred masked CT's chunk-aligned air edges at q ≥ 16.
+
+The stream and `volcomp_decode` are unchanged. Readers opt in:
+`volcomp_zarr.set_read_smoothing(2)`, or `volcomp decode --smooth`. Numbers and
+the encoder-side alternatives that were rejected:
+[`docs/deblocking.md`](docs/deblocking.md).
+
 ## Label volumes (`volcomp_label.h`)
 
 Companion header for multi-class probability arrays: a 128³ label chunk holds
