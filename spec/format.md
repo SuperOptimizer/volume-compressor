@@ -1,4 +1,4 @@
-# volcomp stream format, version 1 (revision 3)
+# volcomp stream format, version 1 (revision 4)
 
 Normative. A conforming decoder accepts exactly the streams described here and
 rejects everything else with `VOLCOMP_ERR_CORRUPT` (or `VOLCOMP_ERR_VERSION`
@@ -25,7 +25,8 @@ offset  size   field
 0       4      magic  "VOLC"
 4       1      version = 1
 5       1      mode   0 = lossy DCT (this section), 1..3 = lossless (§10),
-                      4 = binary mask (§11), 5 = lossless binary mask (§12)
+                      4 = binary mask (§11), 5 = lossless binary mask (§12),
+                      6 = surface chunk (§13)
 6       2      q_raw  u16, quantiser step q = q_raw / 256, 256 <= q_raw <= 65280
 8       T      frequency tables (§4.3), 10 models
 8+T     256    directory: 32 × { u32 tok_n, u32 bypass_n }
@@ -45,11 +46,13 @@ because every stream a revision defines is a stream every earlier decoder
 already rejects: the mode byte is the compatibility mechanism. Revision 1
 (volcomp 1.0.x) defines modes 0..3 and rejects 4..255 with
 `VOLCOMP_ERR_CORRUPT`; revision 2 (volcomp 1.1.0) adds mode 4, the binary mask
-chunk of §11, and changes nothing else; revision 3 (volcomp 1.2.0,
-`VOLCOMP_FORMAT_REVISION`) adds mode 5, the spatially lossless binary mask chunk
-of §12, and changes nothing else. A writer must not emit a mode-4 chunk to a
-consumer that only reads revision 1, nor a mode-5 chunk to one that only reads
-revision 2; that consumer will refuse it cleanly rather than misread it.
+chunk of §11, and changes nothing else; revision 3 (volcomp 1.2.0) adds mode 5,
+the spatially lossless binary mask chunk of §12, and changes nothing else;
+revision 4 (volcomp 1.3.0, `VOLCOMP_FORMAT_REVISION`) adds mode 6, the surface
+chunk of §13, and changes nothing else. A writer must not emit a mode-4 chunk to a
+consumer that only reads revision 1, a mode-5 chunk to one that only reads
+revision 2, nor a mode-6 chunk to one that only reads revision 3; that consumer
+will refuse it cleanly rather than misread it.
 
 ## 3. Encoding pipeline (informative summary; §4–§6 are normative)
 
@@ -454,3 +457,117 @@ this context set can do. Mode 5 is 4.5× the size of mode 4 and codes 8× as man
 bits, so it runs at roughly a fifth of mode 4's throughput: **250–290 M voxels/s
 encode and 230–270 M decode** per core on a Core Ultra 9 275HX, against
 1 350–1 540 M / 760–1 140 M for mode 4 on the same box.
+
+## 13. Surface chunks (mode 6)
+
+A surface chunk stores a smooth probability field — a surface prediction,
+`u8 = round(255 p)` — whose consumers threshold it. It is a DCT stream (the
+**base**) plus a **refinement** that makes the threshold exact: for every voxel,
+
+```
+(source >= thr)  ==  (decoded >= thr)
+```
+
+so the thresholded mask, its skeleton and its distance field are exactly those
+of the source, while the soft values carry the base's quantisation error. `thr`
+is stored in the chunk (128, i.e. p >= 0.5, is the encoder's default).
+
+```
+offset  size    field
+0       8       header: magic, version 1, mode = 6, q_raw = the base's step, 512 <= q_raw <= 65280
+8       1       thr     1..255
+9       1       law     the base's step law; 1 (flat, §13.1) is the only value defined
+10      2       M       u16 refinement margin: 0, or odd and <= 509
+12      4       base_n  u32 length of the base
+16      base_n  base    frequency tables, directory and payload of a DCT stream
+                        (the layout §2 gives from offset 8 on)
+16+base_n  R    refinement payload (§13.3); R = 0 iff M = 0, else R >= 5
+```
+
+Exact accounting is normative: `16 + base_n + R` is the stream length. Any other
+`law`, a `thr` of 0, an even or oversized `M`, a refinement payload with `M = 0`
+or a missing one with `M > 0` is `VOLCOMP_ERR_CORRUPT`.
+
+### 13.1 The base
+
+The base is parsed as §2 parses the bytes after a mode-0 header, with the
+exact-accounting rule applied to `base_n`, and decoded as §4 and §5 decode a
+mode-0 stream at `q = q_raw / 256`, with two differences:
+
+- **Step law (flat).** `step(0) = q · 0.125` as in §5, and `step(r) = q` for every
+  `r >= 1` — no `(1 + r)^0.65` growth. A smooth probability field has no
+  perceptual reason to quantise its high frequencies harder; at equal size the
+  flat law gives a lower error near the threshold (measured,
+  `docs/surface_mode.md`). With a flat AC step the largest level of a full-swing
+  block is `8192 / q`, which the §4.2 cap `|level| <= 5220` bounds to `q >= 2`,
+  hence `q_raw >= 512`.
+- **Bit-exact reconstruction (§13.2).**
+
+### 13.2 Bit-exact reconstruction
+
+The refinement's contexts read the base's reconstruction, so every conforming
+decoder must produce it to the last bit (the ±1 tolerance of §5 does not apply).
+Reconstruction is §5 evaluated in IEEE-754 binary32 with round-to-nearest-even,
+**no fused multiply-add and no reassociation**:
+
+- dequantisation `X' = ((|level| + d) · step) · s` for AC and
+  `X' = (|level| · step) · 0.015625` for DC, where `s` is the orthonormal scale
+  by the number of zero frequency indices (3: 0.015625, 2: 0.0220970869,
+  1: 0.03125, 0: 0.0441941738, as binary32 literals) and `step` is the binary32
+  product `q · 1.0f` (AC) or `q · 0.125f` (DC);
+- the inverse transform is the reference 16-point factorisation
+  (`VF_DCT16_INV_BODY` in `volcomp.h`; its operation sequence and its decimal
+  constants, read as binary32, are normative for this mode), applied along x (to
+  the planes that hold a nonzero coefficient, and to their upper eight x lines
+  only if one of those does), then y (the same planes), then z (every line);
+  lines not transformed are zero;
+- a block with no nonzero AC coefficient is the constant of §5, and the rounding
+  (`+ 128.5`, clamp to [0, 255], truncation) is that of §5.
+
+`volcomp.h` implements this with plain C and AVX2 kernels that run the same scalar
+operation sequence (`vf_dct16_inv_strict_c` / `_avx2`); `tests/test_surfchunk.c`
+checks that both decode the golden stream `tests/golden/surf_q16.volc` to the
+same hash, and it has been checked under clang and GCC.
+
+### 13.3 Refinement
+
+Let `v` be the base's reconstruction, `T2 = 2·thr − 1` and, for a voxel,
+`dd = |2v − T2|` (odd; the voxel's distance from the threshold in half steps).
+The encoder sets `M` to the largest `dd` of a voxel on the wrong side
+(`(source >= thr) != (v >= thr)`), or 0 if there is none. With `M > 0` the decoder
+visits the voxels in index order and, for each voxel with `dd <= M` (a
+**candidate**), decodes one bit `f` — 1 iff the voxel is on the wrong side — and,
+if `f = 1`, sets it to `thr − 1` if `v >= thr`, else to `thr`. Non-candidates are
+not coded and keep their base value.
+
+The bit is coded with §11.3's binary range coder (same arithmetic, leading zero
+byte, five closing shift-low steps, exact consumption of the payload) under a
+context `c` with its own adaptive probability of a zero bit:
+
+```
+c = ((dcls · 64 + pat) · 4 + b) · 2 + s                    3072 contexts
+s    = (v >= thr)                         this voxel's base side
+dcls = 0 if dd <= 1, 1 if <= 3, 2 if <= 7, 3 if <= 15, 4 if <= 31, else 5
+pat  = bit j set iff causal neighbour j is on the other side than s:
+       j  0 (0,0,-1)  1 (0,-1,0)  2 (-1,0,0)  3 (0,-1,-1)  4 (-1,0,-1)  5 (-1,-1,0)   [(dz,dy,dx)]
+b    = how many of (0,0,+1), (0,+1,0), (+1,0,0) are on the other side than s
+```
+
+A neighbour's side is read from the chunk as it stands when the voxel is visited:
+the final side of an earlier voxel (after its own refinement), the base side of a
+later one. A neighbour coordinate outside the chunk is replaced by the voxel's own
+coordinate on that axis (so it counts as agreeing).
+
+Probabilities are 12-bit, start at 2048 and adapt by `p += (4096 − p) >> k` on a
+zero bit and `p −= p >> k` on a one, with `k = 1 + a / 2` for a context that has
+coded `a` bits before (`a` saturating at 6: `k = 1, 1, 2, 2, 3, 3, 4, …`), and are
+then clamped to [16, 4080].
+
+### 13.4 Notes for readers
+
+`volcomp_decode` returns the refined chunk; `volcomp_decode_block` returns its
+block (it decodes the whole chunk, since the refinement is one adaptive pass).
+`volcomp_stream_q` reports the base's `q` (a flat-law step, so a surface chunk at
+`q` is finer than a mode-0 chunk at the same `q`: surface q 48 is about the size
+of mode-0 q 16); `volcomp_is_lossless` is false; `volcomp_surface_info` returns
+`thr` and `M`. Measurements: `docs/surface_mode.md`.
