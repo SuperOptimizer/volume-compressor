@@ -91,9 +91,9 @@ foreach(src ${VOLCOMP_TESTS})
   set_tests_properties(${name} PROPERTIES TIMEOUT 1200)
 endforeach()
 
-# C-kernel variants of the golden and codec tests (VOLCOMP_NO_AVX2), so a
+# C-kernel variants of the golden, codec and surface-chunk tests (VOLCOMP_NO_AVX2), so a
 # normal x86-64 build also exercises the portable path.
-foreach(name test_golden test_codec)
+foreach(name test_golden test_codec test_surfchunk)
   add_executable(${name}_c tests/${name}.c tools/bench/metrics.c)
   target_include_directories(${name}_c PRIVATE tools/bench tools/cli)
   target_link_libraries(${name}_c PRIVATE volcomp volcomp_surface_deps)
