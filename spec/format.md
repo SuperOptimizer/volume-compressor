@@ -534,18 +534,32 @@ same hash, and it has been checked under clang and GCC.
 Let `v` be the base's reconstruction, `T2 = 2·thr − 1` and, for a voxel,
 `dd = |2v − T2|` (odd; the voxel's distance from the threshold in half steps).
 The encoder sets `M` to the largest `dd` of a voxel on the wrong side
-(`(source >= thr) != (v >= thr)`), or 0 if there is none. With `M > 0` the decoder
-visits the voxels in index order and, for each voxel with `dd <= M` (a
-**candidate**), decodes one bit `f` — 1 iff the voxel is on the wrong side — and,
-if `f = 1`, sets it to `thr − 1` if `v >= thr`, else to `thr`. Non-candidates are
-not coded and keep their base value.
+(`(source >= thr) != (v >= thr)`), or 0 if there is none. A voxel with
+`dd <= min(M, 31)` is a **near candidate**; one with `31 < dd <= M` is a **far
+candidate**. Far candidates are numerous and rarely wrong, so they are gated by
+8³ blocks (block `(bz, by, bx)`, each 0..15, holds voxels `8bz..8bz+7` etc.).
+
+With `M > 0` the decoder then:
+
+1. if `M > 31`, visits the 4096 blocks in raster order (`bx` fastest) and, for each
+   block that holds at least one far candidate, decodes a **flag** — 1 iff one of
+   its far candidates is on the wrong side — under context
+   `3072 + F(bz−1) + 2·F(by−1) + 4·F(bx−1)`, `F` being the flag of that
+   neighbouring block (0 if it is outside the chunk, holds no far candidate or is
+   not flagged). A block without a flag counts as unflagged;
+2. visits the voxels in index order and, for each near candidate and each far
+   candidate in a flagged block, decodes one bit `f` — 1 iff the voxel is on the
+   wrong side — and, if `f = 1`, sets it to `thr − 1` if `v >= thr`, else to
+   `thr`. Every other voxel keeps its base value.
+
+Candidacy and blocks are read from the base values `v` before step 2 changes any.
 
 The bit is coded with §11.3's binary range coder (same arithmetic, leading zero
 byte, five closing shift-low steps, exact consumption of the payload) under a
 context `c` with its own adaptive probability of a zero bit:
 
 ```
-c = ((dcls · 64 + pat) · 4 + b) · 2 + s                    3072 contexts
+c = ((dcls · 64 + pat) · 4 + b) · 2 + s                    3072 voxel contexts (+ 8 flag contexts)
 s    = (v >= thr)                         this voxel's base side
 dcls = 0 if dd <= 1, 1 if <= 3, 2 if <= 7, 3 if <= 15, 4 if <= 31, else 5
 pat  = bit j set iff causal neighbour j is on the other side than s:

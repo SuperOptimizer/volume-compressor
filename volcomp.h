@@ -3176,19 +3176,21 @@ out:
 #define VSF_HDR_BYTES 16u
 #define VSF_LAW_FLAT 1u /* header byte 9: the base's step law; revision 4 defines only 1, flat */
 #define VSF_DCLS 6u
-#define VSF_NCTX (VSF_DCLS * 64u * 4u * 2u)
+#define VSF_NCTX (VSF_DCLS * 64u * 4u * 2u) /* voxel contexts; the far flags use 8 more */
+#define VSF_NEAR 31u     /* candidates with dd <= 31 are always coded */
+#define VSF_FAR_BLOCK 8u /* the rest only inside flagged 8^3 blocks */
 #define VSF_PMIN 16u
 #define VSF_PMAX (VMK_PROB_ONE - 16u)
 #define VSF_AGE_MAX 6u /* shift = 1 + age / 2: 1, 1, 2, 2, 3, 3, then 4 */
 #define VSF_M_MAX 509u /* |2d - (2thr - 1)| <= 2*255 - 1 */
 
 typedef struct vsf_model {
-  uint16_t p[VSF_NCTX];
-  uint8_t age[VSF_NCTX];
+  uint16_t p[VSF_NCTX + 8u];
+  uint8_t age[VSF_NCTX + 8u];
 } vsf_model;
 
 static inline void vsf_model_init(vsf_model *m) {
-  for (uint32_t i = 0; i < VSF_NCTX; i++) m->p[i] = VMK_PROB_INIT;
+  for (uint32_t i = 0; i < VSF_NCTX + 8u; i++) m->p[i] = VMK_PROB_INIT;
   memset(m->age, 0, sizeof m->age);
 }
 static inline uint32_t vsf_shift(vsf_model *m, uint32_t c) {
@@ -3239,44 +3241,128 @@ static inline uint32_t vsf_dcls(uint32_t dd) {
   return dd <= 1u ? 0u : dd <= 3u ? 1u : dd <= 7u ? 2u : dd <= 15u ? 3u : dd <= 31u ? 4u : 5u;
 }
 
+/* bit x of out[x >> 6] set iff lo <= row[x] <= hi, for a 128-voxel row
+ * (the candidate scan; integer, so both versions agree exactly) */
+static inline void vsf_rowmask_c(const uint8_t *row, uint32_t lo, uint32_t hi, uint64_t out[2]) {
+  const uint32_t w = hi - lo;
+  for (uint32_t h = 0; h < 2; h++) {
+    uint64_t m = 0;
+    for (uint32_t x = 0; x < 64; x++) m |= (uint64_t)((uint32_t)(uint8_t)(row[h * 64 + x] - lo) <= w) << x;
+    out[h] = m;
+  }
+}
+#if VF_HAVE_AVX2
+VF_TARGET_AVX2 static inline void vsf_rowmask_avx2(const uint8_t *row, uint32_t lo, uint32_t hi, uint64_t out[2]) {
+  const __m256i l = _mm256_set1_epi8((char)lo), w = _mm256_set1_epi8((char)(hi - lo));
+  for (uint32_t h = 0; h < 2; h++) {
+    uint64_t m = 0;
+    for (uint32_t k = 0; k < 2; k++) {
+      __m256i d = _mm256_sub_epi8(_mm256_loadu_si256((const __m256i *)(const void *)(row + h * 64 + k * 32)), l);
+      __m256i in = _mm256_cmpeq_epi8(_mm256_min_epu8(d, w), d);
+      m |= (uint64_t)(uint32_t)_mm256_movemask_epi8(in) << (32 * k);
+    }
+    out[h] = m;
+  }
+}
+#endif
+static inline void vsf_rowmask(const uint8_t *row, uint32_t lo, uint32_t hi, uint64_t out[2]) {
+#if VF_HAVE_AVX2
+  if (vf_use_avx2()) {
+    vsf_rowmask_avx2(row, lo, hi, out);
+    return;
+  }
+#endif
+  vsf_rowmask_c(row, lo, hi, out);
+}
+
 /* The refinement pass over `v` (the base reconstruction, updated in place: a
  * flipped voxel becomes thr or thr - 1, so v[j] >= thr is the FINAL side of an
  * already visited voxel j and the BASE side of a later one). Encodes when e is
  * set (src gives the truth), decodes otherwise. Neighbours outside the chunk
- * are the voxel itself, i.e. agree with it. */
+ * are the voxel itself, i.e. agree with it.
+ *
+ * Candidates with dd <= VSF_NEAR are always coded. Those further out (dd up to
+ * M) rarely flip but are most of the candidates, so they are coded only inside
+ * the 8^3 blocks whose flag — coded first, one per block holding such a
+ * candidate — says the block has a far flip: 2.3-3.3x fewer coded bits for 2-4 %
+ * fewer bytes than coding every candidate (docs/surface_mode.md). */
 static void vsf_refine(uint8_t *restrict v, const uint8_t *restrict src, uint32_t thr, uint32_t M,
                        vmk_rc_enc *e, vmk_rc_dec *d, vsf_model *restrict m) {
-  const uint32_t C = VOLCOMP_CHUNK_DIM, T2 = 2u * thr - 1u;
+  const uint32_t C = VOLCOMP_CHUNK_DIM, T2 = 2u * thr - 1u, NB = C / VSF_FAR_BLOCK;
   const size_t PL = (size_t)C * C;
+  uint8_t kind[256], dcl[256]; /* per base value: 0 not a candidate, 1 near, 2 far; distance class */
+  for (uint32_t val = 0; val < 256; val++) {
+    const uint32_t dd = 2u * val > T2 ? 2u * val - T2 : T2 - 2u * val;
+    kind[val] = (uint8_t)(dd > M ? 0u : dd <= VSF_NEAR ? 1u : 2u);
+    dcl[val] = (uint8_t)vsf_dcls(dd);
+  }
   vsf_model_init(m);
+  uint8_t flag[(VOLCOMP_CHUNK_DIM / VSF_FAR_BLOCK) * (VOLCOMP_CHUNK_DIM / VSF_FAR_BLOCK) *
+               (VOLCOMP_CHUNK_DIM / VSF_FAR_BLOCK)];
+  memset(flag, 0, sizeof flag);
+  if (M > VSF_NEAR) /* the far flags, block raster order, before any voxel */
+    for (uint32_t bz = 0; bz < NB; bz++)
+      for (uint32_t by = 0; by < NB; by++)
+        for (uint32_t bx = 0; bx < NB; bx++) {
+          uint32_t any = 0, hit = 0;
+          for (uint32_t z = bz * VSF_FAR_BLOCK; z < (bz + 1) * VSF_FAR_BLOCK; z++)
+            for (uint32_t y = by * VSF_FAR_BLOCK; y < (by + 1) * VSF_FAR_BLOCK; y++) {
+              const size_t row = ((size_t)z * C + y) * C + bx * VSF_FAR_BLOCK;
+              for (uint32_t x = 0; x < VSF_FAR_BLOCK; x++)
+                if (kind[v[row + x]] == 2u) {
+                  any = 1;
+                  if (src && (src[row + x] >= thr) != (v[row + x] >= thr)) hit = 1;
+                }
+            }
+          if (!any) continue;
+          const size_t bi = ((size_t)bz * NB + by) * NB + bx;
+          const uint32_t c = VSF_NCTX + (uint32_t)(bz ? flag[bi - NB * NB] : 0) +
+                             2u * (uint32_t)(by ? flag[bi - NB] : 0) + 4u * (uint32_t)(bx ? flag[bi - 1] : 0);
+          if (e)
+            vsf_enc_bit(e, m, c, hit);
+          else
+            hit = vsf_dec_bit(d, m, c);
+          flag[bi] = (uint8_t)hit;
+        }
+  /* candidates: dd <= M is v in [lo, hi]; near ones (dd <= VSF_NEAR) v in [nlo, nhi] */
+  const uint32_t Mn = M < VSF_NEAR ? M : VSF_NEAR;
+  const uint32_t lo = T2 > M ? (T2 - M) / 2u : 0u, hi = (T2 + M) / 2u > 255u ? 255u : (T2 + M) / 2u;
+  const uint32_t nlo = T2 > Mn ? (T2 - Mn) / 2u : 0u, nhi = (T2 + Mn) / 2u > 255u ? 255u : (T2 + Mn) / 2u;
   for (uint32_t z = 0; z < C; z++)
     for (uint32_t y = 0; y < C; y++) {
       const size_t row = ((size_t)z * C + y) * C;
+      uint64_t all[2], near[2], far[2] = {0, 0};
+      vsf_rowmask(v + row, lo, hi, all);
+      if (!(all[0] | all[1])) continue;
+      vsf_rowmask(v + row, nlo, nhi, near);
+      const uint8_t *fr = flag + ((size_t)(z / VSF_FAR_BLOCK) * NB + y / VSF_FAR_BLOCK) * NB;
+      for (uint32_t g = 0; g < NB; g++)
+        if (fr[g]) far[g / 8u] |= (uint64_t)0xFFu << (8u * (g % 8u));
       const ptrdiff_t dz = z ? -(ptrdiff_t)PL : 0, dy = y ? -(ptrdiff_t)C : 0;
       const ptrdiff_t pz = z + 1 < C ? (ptrdiff_t)PL : 0, py = y + 1 < C ? (ptrdiff_t)C : 0;
-      for (uint32_t x = 0; x < C; x++) {
-        const size_t i = row + x;
-        const uint32_t dv = v[i];
-        const uint32_t dd = 2u * dv > T2 ? 2u * dv - T2 : T2 - 2u * dv;
-        if (dd > M) continue;
-        const uint32_t s = dv >= thr;
-        const ptrdiff_t dx = x ? -1 : 0, px = x + 1 < C ? 1 : 0;
-        const uint8_t *q = v + i;
-        const uint32_t pat = (uint32_t)((q[dx] >= thr) != s) | (uint32_t)((q[dy] >= thr) != s) << 1 |
-                             (uint32_t)((q[dz] >= thr) != s) << 2 | (uint32_t)((q[dy + dx] >= thr) != s) << 3 |
-                             (uint32_t)((q[dz + dx] >= thr) != s) << 4 | (uint32_t)((q[dz + dy] >= thr) != s) << 5;
-        const uint32_t b = (uint32_t)((q[px] >= thr) != s) + (uint32_t)((q[py] >= thr) != s) +
-                           (uint32_t)((q[pz] >= thr) != s);
-        const uint32_t c = ((vsf_dcls(dd) * 64u + pat) * 4u + b) * 2u + s;
-        uint32_t f;
-        if (e) {
-          f = (uint32_t)(src[i] >= thr) != s;
-          vsf_enc_bit(e, m, c, f);
-        } else {
-          f = vsf_dec_bit(d, m, c);
+      for (uint32_t h = 0; h < 2; h++)
+        for (uint64_t bits = all[h] & (near[h] | far[h]); bits; bits &= bits - 1u) {
+          const uint32_t x = h * 64u + (uint32_t)__builtin_ctzll(bits);
+          const size_t i = row + x;
+          const uint32_t dv = v[i];
+          const uint32_t s = dv >= thr;
+          const ptrdiff_t dx = x ? -1 : 0, px = x + 1 < C ? 1 : 0;
+          const uint8_t *q = v + i;
+          const uint32_t pat = (uint32_t)((q[dx] >= thr) != s) | (uint32_t)((q[dy] >= thr) != s) << 1 |
+                               (uint32_t)((q[dz] >= thr) != s) << 2 | (uint32_t)((q[dy + dx] >= thr) != s) << 3 |
+                               (uint32_t)((q[dz + dx] >= thr) != s) << 4 | (uint32_t)((q[dz + dy] >= thr) != s) << 5;
+          const uint32_t b = (uint32_t)((q[px] >= thr) != s) + (uint32_t)((q[py] >= thr) != s) +
+                             (uint32_t)((q[pz] >= thr) != s);
+          const uint32_t c = (((uint32_t)dcl[dv] * 64u + pat) * 4u + b) * 2u + s;
+          uint32_t f;
+          if (e) {
+            f = (uint32_t)(src[i] >= thr) != s;
+            vsf_enc_bit(e, m, c, f);
+          } else {
+            f = vsf_dec_bit(d, m, c);
+          }
+          if (f) v[i] = (uint8_t)(s ? thr - 1u : thr);
         }
-        if (f) v[i] = (uint8_t)(s ? thr - 1u : thr);
-      }
       if (e ? e->full : d->over) return;
     }
 }
