@@ -208,6 +208,15 @@ Measured on the PHercParis4 ink-3d prediction (24 planes of 128³) at q = 8:
 9.5 KB per plane (220×, 35× smaller than the blosc-zstd chunks it ships in),
 MAE 0.5, P99 6, PSNR 43.7 dB.
 
+## Browser viewer
+
+[`web/dist/volcomp_viewer.html`](web/dist/volcomp_viewer.html) is one self-contained
+page (the decoder compiled to WebAssembly and inlined). Double-click it to browse
+the volcomp mirror at <https://dl.ash2txt.org/community-uploads/forrest/volcomp/>:
+sharded Range streaming, three orthogonal slices, prediction overlays and
+`decode_smooth` deblocking. It needs no server. Build and details are in
+[`web/README.md`](web/README.md).
+
 ## Build the tools and tests
 
 ```sh

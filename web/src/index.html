@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>volcomp viewer</title>
+<style>
+:root {
+  --bg: #0d1016; --panel: #151a22; --panel2: #1c2230; --line: #2a3242; --text: #d7dde8;
+  --muted: #8791a3; --accent: #4da3ff; --warn: #ffb347; --err: #ff6b6b;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+  font: 13px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+body { display: flex; flex-direction: column; overflow: hidden; }
+header { background: var(--panel); border-bottom: 1px solid var(--line); padding: 6px 10px;
+  display: flex; flex-direction: column; gap: 5px; }
+.row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
+.grp { display: flex; align-items: center; gap: 5px; }
+.grp > span.k { color: var(--muted); }
+h1 { font-size: 14px; margin: 0 6px 0 0; font-weight: 650; letter-spacing: .02em; }
+h1 b { color: var(--accent); }
+select, input[type=text], input[type=number], button {
+  background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 4px;
+  padding: 3px 6px; font: inherit; }
+select { max-width: 300px; }
+input[type=text] { width: 230px; }
+#paste-url { width: 300px; }
+input[type=number] { width: 52px; }
+input[type=range] { width: 100px; accent-color: var(--accent); }
+button { cursor: pointer; }
+button:hover, select:hover { border-color: var(--accent); }
+.val { min-width: 2.2em; display: inline-block; color: var(--muted); font-variant-numeric: tabular-nums; }
+main { flex: 1; display: flex; min-height: 0; }
+#views { flex: 1; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 2px;
+  background: var(--line); min-width: 0; }
+.view { position: relative; background: #07090c; min-width: 0; min-height: 0; overflow: hidden; }
+.view canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; touch-action: none; }
+.view.active { outline: 1px solid var(--accent); outline-offset: -1px; }
+.vlabel { position: absolute; left: 6px; top: 4px; pointer-events: none; font-size: 12px;
+  color: #e6ebf3; text-shadow: 0 0 3px #000, 0 0 3px #000; font-variant-numeric: tabular-nums; }
+.vtag { position: absolute; right: 6px; top: 4px; pointer-events: none; font-weight: 700; font-size: 12px; }
+#view0 .vtag { color: #4da3ff; } #view1 .vtag { color: #5bd16b; } #view2 .vtag { color: #ffb347; }
+#views.max { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+#views.max .view:not(.maxed), #views.max #side { display: none; }
+#side { background: var(--panel); padding: 8px; display: flex; flex-direction: column; gap: 8px;
+  overflow: auto; min-width: 0; }
+#minimap { width: 100%; max-width: 320px; aspect-ratio: 1; background: #07090c; border: 1px solid var(--line);
+  cursor: pointer; align-self: center; touch-action: none; }
+#minimap-label { color: var(--muted); font-size: 12px; text-align: center; }
+.info { white-space: pre-wrap; word-break: break-all; font-size: 12px; color: var(--muted); }
+.info b { color: var(--text); font-weight: 600; }
+#info-hover { color: var(--text); font-variant-numeric: tabular-nums; }
+footer { background: var(--panel); border-top: 1px solid var(--line); padding: 3px 10px; font-size: 12px;
+  display: flex; gap: 16px; align-items: center; min-height: 22px; }
+#status-main { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0;
+  font-variant-numeric: tabular-nums; }
+#status-warn { color: var(--warn); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; }
+#status-warn.err { color: var(--err); }
+#help { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 10;
+  align-items: center; justify-content: center; }
+#help.open { display: flex; }
+#help .box { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 18px;
+  max-width: 640px; width: calc(100% - 32px); max-height: calc(100% - 32px); overflow: auto; }
+#help table { border-collapse: collapse; width: 100%; }
+#help td { padding: 2px 8px 2px 0; vertical-align: top; }
+#help td:first-child { white-space: nowrap; color: var(--accent); font-family: ui-monospace, monospace; }
+.legend { display: inline-block; width: 10px; height: 10px; vertical-align: middle; border: 1px solid var(--line); }
+@media (max-width: 800px) {
+  #views { grid-template-columns: 1fr; grid-template-rows: repeat(3, minmax(200px, 1fr)) auto; overflow: auto; }
+  input[type=text] { width: 100%; }
+  select { max-width: 100%; }
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <h1><b>volcomp</b> viewer</h1>
+    <div class="grp"><span class="k">mirror</span><input id="base-url" type="text" spellcheck="false"><button id="base-go" title="Reload the sample list from this mirror">list</button></div>
+    <div class="grp"><span class="k">sample</span><select id="sample"></select></div>
+    <div class="grp"><span class="k">volume</span><select id="volume"><option value="">—</option></select></div>
+    <div class="grp"><span class="k">level</span><select id="level"><option value="auto">auto</option></select></div>
+    <div class="grp"><input id="paste-url" type="text" placeholder="paste a URL: mirror, sample, volume .zarr or prediction .zarr" spellcheck="false"><button id="paste-go">open</button></div>
+  </div>
+  <div class="row">
+    <div class="grp"><span class="k">overlay</span><select id="pred"><option value="">none</option></select>
+      <select id="pred-level" title="overlay level (auto = closest pitch to the CT level shown)"><option value="auto">auto</option></select></div>
+    <label class="grp"><input id="ov-on" type="checkbox" checked>show</label>
+    <label class="grp" title="draw p >= 0.5 as a solid mask instead of alpha = p"><input id="ov-thresh" type="checkbox">mask p≥0.5</label>
+    <div class="grp"><span class="k">opacity</span><input id="ov-opacity" type="range" min="0" max="100" value="70"></div>
+    <div class="grp"><span class="k">window</span><input id="win" type="range" min="1" max="255" value="255"><span id="win-val" class="val"></span>
+      <span class="k">level</span><input id="lev" type="range" min="0" max="255" value="128"><span id="lev-val" class="val"></span>
+      <button id="wl-auto" title="window/level from the active view's histogram (L)">auto</button><button id="wl-reset">reset</button></div>
+    <label class="grp" title="volcomp_decode_smooth: gated face filter for CT, Gaussian seam blur for predictions (D)"><input id="smooth" type="checkbox">deblock (smooth)</label>
+    <div class="grp"><span class="k">CT</span><input id="smooth-ct-s" type="number" min="0.1" max="4" step="0.1" value="2" title="CT strength (gated, x q)">
+      <label class="grp"><input id="smooth-pred" type="checkbox" checked>pred</label><input id="smooth-pr-s" type="number" min="0.1" max="4" step="0.1" value="0.6" title="prediction strength (Gaussian sigma)"></div>
+    <div class="grp"><span class="k">cache</span><select id="cache-cap">
+      <option value="512">512 MB</option><option value="1024">1 GB</option><option value="1536" selected>1.5 GB</option><option value="2048">2 GB</option></select>
+      <button id="clear-cache" title="drop cached chunks and shard indices (also retries failed reads)">clear</button></div>
+    <button id="fit" title="fit all views (R)">fit</button>
+    <button id="help-btn" title="keyboard and mouse (?)">?</button>
+  </div>
+</header>
+<main>
+  <div id="views">
+    <div class="view active" id="view0"><canvas></canvas><div class="vlabel"></div><div class="vtag">Z</div></div>
+    <div class="view" id="view1"><canvas></canvas><div class="vlabel"></div><div class="vtag">Y</div></div>
+    <div class="view" id="view2"><canvas></canvas><div class="vlabel"></div><div class="vtag">X</div></div>
+    <div id="side">
+      <canvas id="minimap" width="320" height="320"></canvas>
+      <div id="minimap-label"></div>
+      <div id="info-hover" class="info"></div>
+      <div id="info-vol" class="info"></div>
+      <div id="info-pred" class="info"></div>
+      <div class="info"><span class="legend" style="background:#1a1e28"></span> not loaded yet &nbsp; <span class="legend" style="background:#461212"></span> read/decode error &nbsp; <span class="legend" style="background:#000"></span> air (0 / missing chunk)</div>
+      <div id="info-wasm" class="info"></div>
+    </div>
+  </div>
+</main>
+<footer><div id="status-main">starting…</div><div id="status-warn"></div></footer>
+<div id="help"><div class="box">
+  <h3 style="margin-top:0">Keyboard and mouse</h3>
+  <table>
+    <tr><td>wheel</td><td>step the slice of the view under the mouse (shift: ×10)</td></tr>
+    <tr><td>ctrl/alt + wheel, pinch</td><td>zoom about the mouse</td></tr>
+    <tr><td>drag</td><td>pan · click sets the cursor (the other views' slices)</td></tr>
+    <tr><td>right-drag, shift-drag</td><td>window (left/right) and level (up/down)</td></tr>
+    <tr><td>double-click, F</td><td>maximise / restore the view</td></tr>
+    <tr><td>W / S, ↑ / ↓, PgUp / PgDn</td><td>slice ±1 (shift or PgUp/PgDn: ±10) in the active view</td></tr>
+    <tr><td>← / →</td><td>pan the active view</td></tr>
+    <tr><td>+ / −</td><td>zoom the active view</td></tr>
+    <tr><td>1 2 3</td><td>make the z / y / x view active</td></tr>
+    <tr><td>R, 0</td><td>fit all views</td></tr>
+    <tr><td>, / .</td><td>coarser / finer CT level · A: back to auto</td></tr>
+    <tr><td>L</td><td>auto window/level from the active view (ignores air)</td></tr>
+    <tr><td>D</td><td>deblock (volcomp_decode_smooth) on/off</td></tr>
+    <tr><td>O · T · [ ]</td><td>overlay on/off · threshold mask at p ≥ 0.5 · opacity −/+</td></tr>
+    <tr><td>C</td><td>crosshair on/off</td></tr>
+    <tr><td>? H · Esc</td><td>this help · close / restore</td></tr>
+  </table>
+  <p class="info">Minimap: the active view's slice at a coarse level; click or drag it to move that view. The URL hash keeps the volume, overlay and cursor, so a copied link reopens the same place.</p>
+  <button id="help-close">close</button>
+</div></div>
+<script type="text/plain" id="worker-src">/*@WORKER@*/</script>
+<script type="application/octet-stream" id="wasm-b64">/*@WASM_B64@*/</script>
+<script>
+/*@MAIN@*/
+</script>
+</body>
+</html>
