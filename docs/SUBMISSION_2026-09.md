@@ -152,8 +152,22 @@ Each strip below shows raw, then q 1, 2, 4, 8, 16 and 32, on the centre z plane 
 |---|---|
 | ![](comparison/PHercParis4_2.40um/diff_zmid_q8.png) | ![](comparison/PHerc0191_9.36um/diff_zmid_q8.png) |
 
-*Raw in grey; red opacity = min(1, 4·|error|/255); 2x magnified.* All 9 views × 13 versions per cube, plus
-72 error overlays: [docs/comparison/](comparison/README.md).
+*Raw in grey; red opacity = min(1, 4·|error|/255); 2x magnified.*
+
+| pitch µm | scroll | q 8 | q strip (raw, q 1-32) | q 8 error |
+|--:|---|--:|---|---|
+| 0.55 | PHerc0500P2 | 145.7x, 41.6 dB | [![](comparison/thumbs/PHerc0500P2_0.55um__zmid_all.png)](comparison/PHerc0500P2_0.55um/zmid_all.png) | [![](comparison/thumbs/PHerc0500P2_0.55um__diff_zmid_q8.png)](comparison/PHerc0500P2_0.55um/diff_zmid_q8.png) |
+| 1.13 | PHerc0139 | 177.3x, 44.1 dB | [![](comparison/thumbs/PHerc0139_1.13um__zmid_all.png)](comparison/PHerc0139_1.13um/zmid_all.png) | [![](comparison/thumbs/PHerc0139_1.13um__diff_zmid_q8.png)](comparison/PHerc0139_1.13um/diff_zmid_q8.png) |
+| 1.13 | PHerc1667 | 131.7x, 42.7 dB | [![](comparison/thumbs/PHerc1667_1.13um__zmid_all.png)](comparison/PHerc1667_1.13um/zmid_all.png) | [![](comparison/thumbs/PHerc1667_1.13um__diff_zmid_q8.png)](comparison/PHerc1667_1.13um/diff_zmid_q8.png) |
+| 2.21 | PHerc0343P | 76.1x, 37.8 dB | [![](comparison/thumbs/PHerc0343P_2.21um__zmid_all.png)](comparison/PHerc0343P_2.21um/zmid_all.png) | [![](comparison/thumbs/PHerc0343P_2.21um__diff_zmid_q8.png)](comparison/PHerc0343P_2.21um/diff_zmid_q8.png) |
+| 2.40 | PHercParis4 | 52.3x, 36.6 dB | [![](comparison/thumbs/PHercParis4_2.40um__zmid_all.png)](comparison/PHercParis4_2.40um/zmid_all.png) | [![](comparison/thumbs/PHercParis4_2.40um__diff_zmid_q8.png)](comparison/PHercParis4_2.40um/diff_zmid_q8.png) |
+| 4.32 | PHerc0500P2 | 78.9x, 38.6 dB | [![](comparison/thumbs/PHerc0500P2_4.32um__zmid_all.png)](comparison/PHerc0500P2_4.32um/zmid_all.png) | [![](comparison/thumbs/PHerc0500P2_4.32um__diff_zmid_q8.png)](comparison/PHerc0500P2_4.32um/diff_zmid_q8.png) |
+| 8.64 | PHerc0800 | 40.3x, 34.1 dB | [![](comparison/thumbs/PHerc0800_8.64um__zmid_all.png)](comparison/PHerc0800_8.64um/zmid_all.png) | [![](comparison/thumbs/PHerc0800_8.64um__diff_zmid_q8.png)](comparison/PHerc0800_8.64um/diff_zmid_q8.png) |
+| 9.36 | PHerc0191 | 31.0x, 33.4 dB | [![](comparison/thumbs/PHerc0191_9.36um__zmid_all.png)](comparison/PHerc0191_9.36um/zmid_all.png) | [![](comparison/thumbs/PHerc0191_9.36um__diff_zmid_q8.png)](comparison/PHerc0191_9.36um/diff_zmid_q8.png) |
+
+*All eight 512³ cubes, centre z plane; thumbnails link to the full lossless PNGs.*
+
+Every image, with thumbnails: [docs/comparison/GALLERY.md](comparison/GALLERY.md). Tables per cube: [docs/comparison/README.md](comparison/README.md).
 
 ## 5. Comparison with other codecs
 
@@ -220,7 +234,21 @@ Surface mode makes the thresholded mask exact at 0.71-0.78x the size of q 8. Sur
 | box dice p >= 0.5 / p >= 0.2 | 0.637 / 0.736 | 0.655 / 0.744 |
 | box precision / recall p >= 0.5 | 0.877 / 0.501 | 0.859 / 0.530 |
 | whole-volume dice p >= 0.5 / p >= 0.2 | 0.459 / 0.603 | 0.686 / 0.758 |
-| published surface voxels in masked air | 80 % | 71 % |
+| published surface voxels in masked air | 81 % | 71 % |
+
+| scroll | level (pitch) | published L0 | ours L0 | ratio | stride | dice p>=0.2 box / whole | dice p>=0.5 box / whole | published in masked air |
+|---|---|--:|--:|--:|--:|---|---|--:|
+| [PHerc0343P](comparison/surfaces/PHerc0343P/README.md) | 2 (8.86 µm) | 370 MiB | 158 MiB | 2.34x | 128 | 0.735 / 0.603 | 0.637 / 0.459 | 81 % |
+| [PHerc0009B](comparison/surfaces/PHerc0009B/README.md) | 2 (9.604 µm) | 999 MiB | 613 MiB | 1.63x | 128 | 0.744 / 0.757 | 0.655 / 0.686 | 71 % |
+| PHerc0800 | 0 | [pending] | | | | | | |
+| PHerc1218 | 0 | [pending] | | | | | | |
+| PHerc0175A | 0 | [pending] | | | | | | |
+| PHerc0268 | 0 | [pending] | | | | | | |
+| PHerc1447 | 0 | [pending] | | | | | | |
+| PHerc0125 | 0 | [pending] | | | | | | |
+| **2 with numbers** | | **1.34 GiB** | **771 MiB** | **1.78x** | | | | |
+
+*Eight scrolls with a published m7 mask at the same level (docs/comparison/surfaces/README.md). The six level-0 rows were still being scored when this was written; their images are final.*
 
 | compression only: our q 8 vs the same run's fp32 output (0343P 8.64 µm box) | MAE /255 | dice p >= 0.5 | dice p >= 0.2 |
 |---|--:|--:|--:|
@@ -232,6 +260,27 @@ Our stores hold 255 probability levels in less space than the published stores u
 gap to published (about 0.33) is mostly not compression. The two are separate inference runs, and m7's
 mask moves with window placement (stride 128 vs 96 on the same input: dice 0.946). The thresholds differ,
 and the published masks mark blocks of masked air (excluded above). Compression alone costs about 0.02 dice.
+
+| scroll | diff (red published only, blue ours only, grey both) | zoom (CT, published, ours, ours smoothed, diff) |
+|---|---|---|
+| PHerc0343P z1493 | [![](comparison/thumbs/surfaces__PHerc0343P__z1493_diff.png)](comparison/surfaces/PHerc0343P/z1493_diff.png) | [![](comparison/thumbs/surfaces__PHerc0343P__z1493_zoom.png)](comparison/surfaces/PHerc0343P/z1493_zoom.png) |
+| PHerc0009B z2709 | [![](comparison/thumbs/surfaces__PHerc0009B__z2709_diff.png)](comparison/surfaces/PHerc0009B/z2709_diff.png) | [![](comparison/thumbs/surfaces__PHerc0009B__z2709_zoom.png)](comparison/surfaces/PHerc0009B/z2709_zoom.png) |
+| PHerc0800 z6613 | [![](comparison/thumbs/surfaces__PHerc0800__z6613_diff.png)](comparison/surfaces/PHerc0800/z6613_diff.png) | [![](comparison/thumbs/surfaces__PHerc0800__z6613_zoom.png)](comparison/surfaces/PHerc0800/z6613_zoom.png) |
+| PHerc1218 z6421 | [![](comparison/thumbs/surfaces__PHerc1218__z6421_diff.png)](comparison/surfaces/PHerc1218/z6421_diff.png) | [![](comparison/thumbs/surfaces__PHerc1218__z6421_zoom.png)](comparison/surfaces/PHerc1218/z6421_zoom.png) |
+| PHerc0175A z9877 | [![](comparison/thumbs/surfaces__PHerc0175A__z9877_diff.png)](comparison/surfaces/PHerc0175A/z9877_diff.png) | [![](comparison/thumbs/surfaces__PHerc0175A__z9877_zoom.png)](comparison/surfaces/PHerc0175A/z9877_zoom.png) |
+| PHerc0268 z9109 | [![](comparison/thumbs/surfaces__PHerc0268__z9109_diff.png)](comparison/surfaces/PHerc0268/z9109_diff.png) | [![](comparison/thumbs/surfaces__PHerc0268__z9109_zoom.png)](comparison/surfaces/PHerc0268/z9109_zoom.png) |
+| PHerc1447 z17813 | [![](comparison/thumbs/surfaces__PHerc1447__z17813_diff.png)](comparison/surfaces/PHerc1447/z17813_diff.png) | [![](comparison/thumbs/surfaces__PHerc1447__z17813_zoom.png)](comparison/surfaces/PHerc1447/z17813_zoom.png) |
+| PHerc0125 z3285 | [![](comparison/thumbs/surfaces__PHerc0125__z3285_diff.png)](comparison/surfaces/PHerc0125/z3285_diff.png) | [![](comparison/thumbs/surfaces__PHerc0125__z3285_zoom.png)](comparison/surfaces/PHerc0125/z3285_zoom.png) |
+
+*One fixed slice per scroll; thumbnails link to full resolution.*
+
+| published mask as volcomp mask chunks | panel (published, mode 4 ramp, mode 5 exact, mode 4 vs published) | zoom | bits/voxel |
+|---|---|---|---|
+| PHerc0800 z6613 | [![](comparison/thumbs/masks__PHerc0800__mask_z6613_all.png)](comparison/masks/PHerc0800/mask_z6613_all.png) | [![](comparison/thumbs/masks__PHerc0800__mask_z6613_zoom.png)](comparison/masks/PHerc0800/mask_z6613_zoom.png) | [pending] |
+| PHerc1218 z6421 | [![](comparison/thumbs/masks__PHerc1218__mask_z6421_all.png)](comparison/masks/PHerc1218/mask_z6421_all.png) | [![](comparison/thumbs/masks__PHerc1218__mask_z6421_zoom.png)](comparison/masks/PHerc1218/mask_z6421_zoom.png) | [pending] |
+| PHerc0125 z3285 | [![](comparison/thumbs/masks__PHerc0125__mask_z3285_all.png)](comparison/masks/PHerc0125/mask_z3285_all.png) | [![](comparison/thumbs/masks__PHerc0125__mask_z3285_zoom.png)](comparison/masks/PHerc0125/mask_z3285_zoom.png) | [pending] |
+
+*Mode 4 stores the 2x majority pool (0.0057 bits/voxel on the Paris 4 recto), mode 5 the exact mask (0.0255); per-scroll numbers pending in docs/comparison/masks/README.md.*
 
 Panels: CT, published (solid amber), ours plain (amber at 0.6·p), ours smoothed, diff (red = published only,
 blue = ours only, grey = both). Slices sit at fixed box positions and were not picked.
@@ -326,6 +375,7 @@ https://dl.ash2txt.org/community-uploads/forrest/volcomp/<Sample>/representation
 | deblocking, teacher dice | docs/deblocking.md | `tools/surface_study/dbk*.py`, `downstream.py` (069a4bd, 1f618bd, f31b0e2) |
 | surface mode, probability-map costs | docs/surface_mode.md | `tools/surface_study/` (18a711e, 7c14567) |
 | m7 vs published masks | docs/comparison/surfaces/ READMEs + report.json | `tools/surface_compare.py` (49c29e6) |
+| all comparison images, thumbnails | docs/comparison/GALLERY.md, masks/README.md | `tools/gallery.py` (c7be1e3) |
 | m7 release scope and pipeline | surfaces READMEs; fact sheet section 5 | rvsm `tools/m7_wholevol.py` (090eaa0) |
 | viewer | web/README.md | `web/test/` (3e549a3, b4bbc3e) |
 | export pipeline, modes, API | tools/export/README.md, docs/api.md, spec/format.md | `tools/export/`, `tests/`, `fuzz/` |
