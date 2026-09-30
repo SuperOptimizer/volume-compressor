@@ -171,9 +171,58 @@ Every image, with thumbnails: [docs/comparison/GALLERY.md](comparison/GALLERY.md
 
 ## 5. Comparison with other codecs
 
-> **[pending: docs/bench/README.md and docs/bench/*.png]** Benchmark on the same 512³ cubes: zstd, blosc,
-> per-slice JPEG / JPEG 2000 / JPEG XL / WebP / AVIF, x264 / x265 / AV1 with z as time, ZFP, JP3D;
-> rate-distortion plots and the ratio at 30 / 35 / 40 dB. No claim against these codecs is made until it lands.
+> **Interim: contended-machine timings, quiet single-thread pass pending.** Numbers from
+> [docs/bench/interim/](bench/interim/operating_points.md) (`tools/bench_codecs.py`). PHerc1667 1.13 µm and
+> PHerc0191 9.36 µm are not finished, and PHerc0500P2 0.55 µm lacks the x265, SVT-AV1, JPEG XL and AVIF runs.
+> Final numbers replace this section when docs/bench/README.md lands.
+
+![rate-distortion, PSNR vs bits per voxel](bench/interim/rd_psnr.png)
+*PSNR against bits per voxel, one thread, same 512³ cubes as section 4; volcomp thick. SSIM version:
+[rd_ssim.png](bench/interim/rd_ssim.png).*
+
+![random access, one 128³ chunk](bench/interim/random_access_PHercParis4_2.40um.png)
+*Bytes read and decode time for one 128³ chunk at the cube centre, PHercParis4 2.4 µm, each codec at its
+setting nearest 35 dB. Storage model: per-slice codecs store 2-D slices, so the chunk needs 128 of them;
+video codecs use closed 128-frame GOPs, so the chunk needs its GOP; 3-D codecs and volcomp use one blob per chunk.*
+
+| PHercParis4 2.40 µm, codec | family | bpv @ 30 dB | bpv @ 35 dB | bpv @ 40 dB | x volcomp @ 35 dB |
+|---|---|--:|--:|--:|--:|
+| jpeg | 2-D | - | 0.405 | 0.746 | 3.43 |
+| jpeg2000 | 2-D | 0.104 | 0.241 | 0.469 | 2.05 |
+| jpegxl | 2-D | - | 0.232 | 0.418 | 1.97 |
+| webp | 2-D | - | 0.360 | 0.741 | 3.05 |
+| avif | 2-D | - | 0.222 | 0.442 | 1.88 |
+| x264 | video, GOP 128 | 0.069 | 0.193 | 0.455 | 1.64 |
+| x265 | video, GOP 128 | **0.031** | 0.097 | 0.246 | 0.83 |
+| svtav1 | video, GOP 128 | - | **0.082** | **0.203** | 0.69 |
+| x264-intra | video, all-intra | 0.120 | 0.298 | 0.636 | 2.53 |
+| x265-intra | video, all-intra | 0.166 | 0.289 | 0.499 | 2.45 |
+| svtav1-intra | video, all-intra | - | 0.219 | 0.420 | 1.85 |
+| zfp-rate | 3-D | - | 0.742 | 1.149 | 6.30 |
+| sz3 | 3-D | 0.089 | 0.219 | 0.549 | 1.86 |
+| **volcomp** | | 0.046 | 0.118 | 0.256 | 1.00 |
+| volcomp + deblock | | 0.039 | 0.107 | 0.251 | 0.90 |
+| lossless: zstd-19 / blosc-zstd5 / lz4 | | | 5.336 / 5.987 / 8.025 | | |
+
+| best of family, x volcomp's bits @ 35 dB | 0.55 µm | 1.13 µm | 2.40 µm | 9.36 µm |
+|---|--:|--:|--:|--:|
+| svtav1 (GOP 128) | not run | not run | **0.69** | not run |
+| x265 (GOP 128) | not run | not run | **0.83** | not run |
+| x264 (GOP 128) | 1.43 | not run | 1.64 | not run |
+| jpegxl / avif | not run | not run | 1.88 (avif) | not run |
+| jpeg2000 | 4.05 | not run | 2.05 | not run |
+| sz3 | 2.94 | not run | 1.86 | not run |
+| zfp | outside sweep | not run | 6.30 (rate) | not run |
+| best all-intra | 4.43 (x264) | not run | 1.85 (svtav1) | not run |
+
+*"x volcomp" = the codec's bits per voxel at 35 dB over volcomp's, from log-linear interpolation along each
+sweep (docs/bench/interim/operating_points.md); below 1 means fewer bits than volcomp.*
+
+On PHercParis4, inter-frame AV1 and HEVC need 0.69x and 0.83x volcomp's bits at 35 dB. Every other lossy
+codec in the interim run needs 1.4x to 10.4x. For one chunk, volcomp reads 1.0x to 52x fewer bytes than the
+lossy codecs (SZ3 at parity but at 32.9 dB, ZFP and video GOPs 6.8-15x, all-intra and per-slice 19-52x) and
+decodes 12-192x faster. lz4 and blosc-zstd decode a chunk faster (1.5 and 1.9 ms against 2.8 ms) but, like
+zstd-19, read 36-55x more bytes.
 
 | measured in this repository | result | source |
 |---|---|---|
@@ -330,7 +379,7 @@ blue = ours only, grey = both). Slices sit at fixed box positions and were not p
 - Models not trained on compressed data are sensitive: teacher dice is 0.951 at q 8. Fine-tuning on compressed data is unfinished. No tracing or segmentation impact has been measured.
 - The released m7 stores are q 8 and flip 0.18-0.66 % of voxels at the 0.5 threshold. Surface mode fixes this but is not used in them. Readers older than revision 4 reject surface chunks.
 - The m7 stores mix stride 96 (2 stores) and 128 (59 stores). The published-mask comparison covers two scans.
-- The codec benchmark is pending; video codecs may win on ratio at equal PSNR.
+- Inter-frame video codecs (SVT-AV1, x265) beat volcomp on bits at 35 dB (0.69-0.83x, interim, one cube), at the cost of GOP-sized random access. The benchmark is interim (contended timings, two of four cubes incomplete).
 - Design tables use PHercParis4 2.4 µm. Four cubes show the spread across pitch (26.7-50.7 dB).
 - Measured on Linux x86-64 (WSL2, ±10 % timing) only. The viewer is tested in headless Chromium only, and draws axis-aligned slices only.
 - The villa PR is not merged, and the codec is not in the zarr codecs registry.
@@ -383,4 +432,4 @@ https://dl.ash2txt.org/community-uploads/forrest/volcomp/<Sample>/representation
 | mirror size, mirror/bucket ratios | docs/_mirror_size_2026-09-30.md | crawl of the mirror's autoindex (167,585 listings) |
 | mirror sizes, PR, conflicts | docs/_factsheet_2026-09-30.md | live listings, `gh pr view 1704` |
 | other codecs | docs/_landscape_2026-09-30.md | web survey |
-| codec benchmark | [pending: docs/bench/README.md] | `tools/bench_codecs.py` |
+| codec benchmark (interim) | docs/bench/interim/ (operating_points.md, results.csv, random_access.csv, plots) | `tools/bench_codecs.py` |

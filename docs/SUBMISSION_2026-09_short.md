@@ -38,6 +38,6 @@ MAE 4 of 255.
 - Blocks are visible at high zoom
 - The m7 stores are q 8, which flips 0.2-0.7 % of voxels at 0.5
 - The viewer is tested in Chromium only
-- The benchmark against JPEG XL, AV1, x265, ZFP and others is **[pending: docs/bench/]**
+- Interim benchmark: SVT-AV1 and x265 with z as time need 0.69-0.83x volcomp's bits at 35 dB; everything else needs 1.4-10x. volcomp decodes one chunk 12-190x faster than any lossy codec
 
 Full writeup: [SUBMISSION_2026-09.md](SUBMISSION_2026-09.md).
