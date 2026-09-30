@@ -64,3 +64,6 @@ corpus/heldout/
 !tests/golden/*.volc
 __pycache__/
 *.pyc
+
+# web viewer test tooling (node_modules, playwright)
+web/.tools/

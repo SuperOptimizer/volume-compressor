@@ -18,15 +18,20 @@ function init(bytes) {
     while (m[e]) e++;
     return new TextDecoder().decode(m.subarray(p, e));
   };
-  return { version: cstr(X.vc_version()), kernels: cstr(X.vc_kernels()) };
+  return { version: cstr(X.vc_version()), kernels: cstr(X.vc_kernels()), zstd: !!(X.vc_has_zstd && X.vc_has_zstd()) };
 }
 
-// smooth: 0 = plain volcomp_decode, else volcomp_decode_smooth(strength = smooth, flags)
-function decode(enc, smooth, flags) {
-  const n = enc.byteLength;
+// smooth: 0 = plain volcomp_decode, else volcomp_decode_smooth(strength = smooth, flags).
+// zstd: the chunk is a zstd frame around the volcomp stream (zarr codecs [volcomp, zstd]).
+function decode(enc, smooth, flags, zstd) {
+  let n = enc.byteLength;
   const p = X.vc_in(n);
   if (!p) throw new Error("wasm: out of memory for a " + n + " byte chunk");
   new Uint8Array(X.memory.buffer, p, n).set(new Uint8Array(enc));
+  if (zstd) {
+    n = Number(X.vc_unzstd(n));
+    if (n < 0) throw new Error("zstd: not a valid frame");
+  }
   const mode = X.vc_chunk_mode(n);
   if (mode < 0) throw new Error("not a volcomp chunk (bad magic)");
   const q = X.vc_stream_q(n);
@@ -55,7 +60,7 @@ self.onmessage = (ev) => {
   }
   if (m.type === "decode") {
     try {
-      const r = decode(m.enc, m.smooth || 0, m.flags || 0);
+      const r = decode(m.enc, m.smooth || 0, m.flags || 0, !!m.zstd);
       self.postMessage({ type: "done", id: m.id, out: r.out.buffer, ms: r.ms, mode: r.mode, q: r.q },
         [r.out.buffer]);
     } catch (e) {

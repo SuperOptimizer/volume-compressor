@@ -4,6 +4,10 @@
  * vc_decode / vc_decode_smooth, and reads the 128^3 result from vc_out().
  * One module instance per worker; the buffers are owned by the module. */
 #include "../../volcomp.h"
+#ifdef VC_WITH_ZSTD
+#define ZSTD_STATIC_LINKING_ONLY
+#include "zstd.h"
+#endif
 
 #define EXPORT __attribute__((used, visibility("default")))
 
@@ -66,6 +70,32 @@ EXPORT int vc_mask_dim(size_t n) {
   uint32_t d = 0;
   return volcomp_mask_info(g_in, n, &d) == VOLCOMP_OK ? (int)d : -1;
 }
+#ifdef VC_WITH_ZSTD
+/* Undo a zarr "zstd" bytes->bytes codec: decompress the n-byte frame in vc_in
+ * and put the result back in vc_in. Returns the decompressed size, or -1. The
+ * input pointer can move (call vc_in again before the next copy). */
+static ZSTD_DCtx *g_dctx = NULL;
+EXPORT long vc_unzstd(size_t n) {
+  if (!g_dctx) g_dctx = ZSTD_createDCtx();
+  if (!g_dctx) return -1;
+  unsigned long long cap = ZSTD_getFrameContentSize(g_in, n);
+  if (cap == ZSTD_CONTENTSIZE_ERROR) return -1;
+  if (cap == ZSTD_CONTENTSIZE_UNKNOWN) cap = (unsigned long long)VOLCOMP_CHUNK_VOXELS + (1u << 20);
+  if (cap > (64ull << 20)) return -1;
+  uint8_t *dst = (uint8_t *)malloc(cap ? (size_t)cap : 1);
+  if (!dst) return -1;
+  size_t got = ZSTD_decompressDCtx(g_dctx, dst, (size_t)cap, g_in, n);
+  if (ZSTD_isError(got)) { free(dst); return -1; }
+  free(g_in);
+  g_in = dst;
+  g_in_cap = (size_t)(cap ? cap : 1);
+  return (long)got;
+}
+EXPORT int vc_has_zstd(void) { return 1; }
+#else
+EXPORT long vc_unzstd(size_t n) { (void)n; return -1; }
+EXPORT int vc_has_zstd(void) { return 0; }
+#endif
 EXPORT const char *vc_version(void) { return VOLCOMP_VERSION_STRING; }
 EXPORT const char *vc_kernels(void) { return volcomp_kernels(); }
 EXPORT const char *vc_status_string(int s) { return volcomp_status_string((volcomp_status)s); }

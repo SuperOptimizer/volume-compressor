@@ -5,7 +5,7 @@ python/volcomp_zarr (libvolcomp), or decode local .volc files.
   python3 web/test/ref_checksums.py url LEVEL_URL CZ CY CX     # sha256 of plain / CT-smooth / pred-smooth decodes
   python3 web/test/ref_checksums.py files a.volc b.volc ...    # same line format as wasm_check.mjs
 """
-import hashlib, json, os, struct, sys, urllib.request
+import hashlib, json, os, struct, subprocess, sys, urllib.error, urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "python"))
 from volcomp_zarr import _lib as L  # noqa: E402
@@ -17,8 +17,20 @@ def get(url, rng=None):
         return r.read()
 
 
-def fetch_chunk(level_url, c):
-    meta = json.loads(get(level_url.rstrip("/") + "/zarr.json"))
+_metas = {}
+
+
+def level_meta(level_url):
+    if level_url not in _metas:
+        _metas[level_url] = json.loads(get(level_url.rstrip("/") + "/zarr.json"))
+    return _metas[level_url]
+
+
+def fetch_chunk(level_url, c, shard_url=None):
+    """The volcomp stream of inner chunk c (global chunk coords) of a sharded level,
+    or None when the shard (404) or the chunk (index all ones) is absent. A zstd
+    bytes codec after volcomp is undone with the zstd CLI."""
+    meta = level_meta(level_url)
     shard = meta["chunk_grid"]["configuration"]["chunk_shape"]
     sh = next(x for x in meta["codecs"] if x["name"] == "sharding_indexed")["configuration"]
     inner = sh["chunk_shape"]
@@ -27,12 +39,20 @@ def fetch_chunk(level_url, c):
     l = [ci - si * n for ci, si, n in zip(c, s, cps)]
     k = (l[0] * cps[1] + l[1]) * cps[2] + l[2]
     n = cps[0] * cps[1] * cps[2]
-    url = level_url.rstrip("/") + "/c/" + "/".join(map(str, s))
-    idx = get(url, f"bytes=-{n * 16 + 4}")
+    url = shard_url or level_url.rstrip("/") + "/c/" + "/".join(map(str, s))
+    try:
+        idx = get(url, f"bytes=-{n * 16 + 4}")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
     off, nb = struct.unpack_from("<QQ", idx, 16 * k)
     if off == 2**64 - 1:
         return None
-    return get(url, f"bytes={off}-{off + nb - 1}")
+    b = get(url, f"bytes={off}-{off + nb - 1}")
+    if any(x["name"] == "zstd" for x in sh.get("codecs", [])):
+        b = subprocess.run(["zstd", "-dc"], input=b, capture_output=True, check=True).stdout
+    return b
 
 
 def sums(b):

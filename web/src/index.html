@@ -38,16 +38,43 @@ main { flex: 1; display: flex; min-height: 0; }
 .view { position: relative; background: #07090c; min-width: 0; min-height: 0; overflow: hidden; }
 .view canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; touch-action: none; }
 .view.active { outline: 1px solid var(--accent); outline-offset: -1px; }
-.vlabel { position: absolute; left: 6px; top: 4px; pointer-events: none; font-size: 12px;
+.vlabel { position: absolute; left: 6px; top: 4px; pointer-events: none; font-size: 12px; white-space: pre; right: 24px; overflow: hidden;
   color: #e6ebf3; text-shadow: 0 0 3px #000, 0 0 3px #000; font-variant-numeric: tabular-nums; }
 .vtag { position: absolute; right: 6px; top: 4px; pointer-events: none; font-weight: 700; font-size: 12px; }
 #view0 .vtag { color: #4da3ff; } #view1 .vtag { color: #5bd16b; } #view2 .vtag { color: #ffb347; }
 #views.max { grid-template-columns: 1fr; grid-template-rows: 1fr; }
 #views.max .view:not(.maxed), #views.max #side { display: none; }
-#side { background: var(--panel); padding: 8px; display: flex; flex-direction: column; gap: 8px;
-  overflow: auto; min-width: 0; }
-#minimap { width: 100%; max-width: 320px; aspect-ratio: 1; background: #07090c; border: 1px solid var(--line);
-  cursor: pointer; align-self: center; touch-action: none; }
+#side { background: var(--panel); padding: 8px; display: flex; gap: 10px; overflow: hidden; min-width: 0; min-height: 0; }
+#layers-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; overflow: auto; }
+#mini-col { width: 260px; flex: none; display: flex; flex-direction: column; gap: 6px; overflow: auto; }
+.sec-head { display: flex; gap: 8px; align-items: baseline; }
+.sec-head .k, .k { color: var(--muted); font-size: 12px; }
+#layer-list { display: flex; flex-direction: column; gap: 2px; }
+.lrow { display: flex; align-items: center; gap: 5px; padding: 3px 4px; border: 1px solid var(--line); border-radius: 4px;
+  background: var(--panel2); cursor: pointer; min-width: 0; }
+.lrow.sel { border-color: var(--accent); }
+.lrow .sw { width: 12px; height: 12px; border-radius: 2px; flex: none; border: 1px solid #0006; }
+.lrow .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lrow .meta { color: var(--muted); font-size: 11px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.lrow button { padding: 0 5px; line-height: 16px; }
+#layer-settings { display: grid; grid-template-columns: auto 1fr; gap: 4px 8px; align-items: center; font-size: 12px; }
+#layer-settings .k { text-align: right; }
+#layer-settings .wide { grid-column: 1 / -1; }
+#layer-settings input[type=range] { width: 100%; }
+#minimap { width: 100%; aspect-ratio: 1; background: #07090c; border: 1px solid var(--line);
+  cursor: pointer; touch-action: none; }
+#addpanel { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 9; align-items: center; justify-content: center; }
+#addpanel.open { display: flex; }
+#addpanel .box { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px;
+  width: min(1100px, calc(100% - 32px)); max-height: calc(100% - 32px); display: flex; flex-direction: column; gap: 8px; }
+#add-list { overflow: auto; min-height: 60px; }
+#add-list table { border-collapse: collapse; width: 100%; font-size: 12px; }
+#add-list th { text-align: left; color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--panel); }
+#add-list td, #add-list th { padding: 3px 8px 3px 0; white-space: nowrap; }
+#add-list td.nm { white-space: normal; word-break: break-all; }
+#add-list tr.ok { cursor: pointer; }
+#add-list tr.ok:hover td { color: var(--accent); }
+#add-list tr.bad td { color: var(--muted); }
 #minimap-label { color: var(--muted); font-size: 12px; text-align: center; }
 .info { white-space: pre-wrap; word-break: break-all; font-size: 12px; color: var(--muted); }
 .info b { color: var(--text); font-weight: 600; }
@@ -68,6 +95,8 @@ footer { background: var(--panel); border-top: 1px solid var(--line); padding: 3
 #help td:first-child { white-space: nowrap; color: var(--accent); font-family: ui-monospace, monospace; }
 .legend { display: inline-block; width: 10px; height: 10px; vertical-align: middle; border: 1px solid var(--line); }
 @media (max-width: 800px) {
+  #side { flex-direction: column; overflow: auto; }
+  #mini-col { width: 100%; }
   #views { grid-template-columns: 1fr; grid-template-rows: repeat(3, minmax(200px, 1fr)) auto; overflow: auto; }
   input[type=text] { width: 100%; }
   select { max-width: 100%; }
@@ -80,26 +109,21 @@ footer { background: var(--panel); border-top: 1px solid var(--line); padding: 3
     <h1><b>volcomp</b> viewer</h1>
     <div class="grp"><span class="k">mirror</span><input id="base-url" type="text" spellcheck="false"><button id="base-go" title="Reload the sample list from this mirror">list</button></div>
     <div class="grp"><span class="k">sample</span><select id="sample"></select></div>
-    <div class="grp"><span class="k">volume</span><select id="volume"><option value="">—</option></select></div>
-    <div class="grp"><span class="k">level</span><select id="level"><option value="auto">auto</option></select></div>
-    <div class="grp"><input id="paste-url" type="text" placeholder="paste a URL: mirror, sample, volume .zarr or prediction .zarr" spellcheck="false"><button id="paste-go">open</button></div>
+    <div class="grp"><span class="k">volume</span><select id="volume" title="the CT layer (replaces the current CT layer)"><option value="">—</option></select></div>
+    <button id="add-layer" title="add a layer: the sample's volumes and everything under representations/, or a URL (+)">+ layer</button>
+    <div class="grp"><input id="paste-url" type="text" placeholder="paste a URL: mirror, sample, volume or any store .zarr (added as a layer)" spellcheck="false"><button id="paste-go">open</button></div>
   </div>
   <div class="row">
-    <div class="grp"><span class="k">overlay</span><select id="pred"><option value="">none</option></select>
-      <select id="pred-level" title="overlay level (auto = closest pitch to the CT level shown)"><option value="auto">auto</option></select></div>
-    <label class="grp"><input id="ov-on" type="checkbox" checked>show</label>
-    <label class="grp" title="draw p >= 0.5 as a solid mask instead of alpha = p"><input id="ov-thresh" type="checkbox">mask p≥0.5</label>
-    <div class="grp"><span class="k">opacity</span><input id="ov-opacity" type="range" min="0" max="100" value="70"></div>
-    <div class="grp"><span class="k">window</span><input id="win" type="range" min="1" max="255" value="255"><span id="win-val" class="val"></span>
-      <span class="k">level</span><input id="lev" type="range" min="0" max="255" value="128"><span id="lev-val" class="val"></span>
-      <button id="wl-auto" title="window/level from the active view's histogram (L)">auto</button><button id="wl-reset">reset</button></div>
-    <label class="grp" title="volcomp_decode_smooth: gated face filter for CT, Gaussian seam blur for predictions (D)"><input id="smooth" type="checkbox">deblock (smooth)</label>
+    <label class="grp" title="volcomp_decode_smooth: gated face filter for grey (CT) layers, Gaussian seam blur for probability layers; never for masks/labels (D)"><input id="smooth" type="checkbox">deblock (smooth)</label>
     <div class="grp"><span class="k">CT</span><input id="smooth-ct-s" type="number" min="0.1" max="4" step="0.1" value="2" title="CT strength (gated, x q)">
-      <label class="grp"><input id="smooth-pred" type="checkbox" checked>pred</label><input id="smooth-pr-s" type="number" min="0.1" max="4" step="0.1" value="0.6" title="prediction strength (Gaussian sigma)"></div>
-    <div class="grp"><span class="k">cache</span><select id="cache-cap">
-      <option value="512">512 MB</option><option value="1024">1 GB</option><option value="1536" selected>1.5 GB</option><option value="2048">2 GB</option></select>
+      <label class="grp"><input id="smooth-pred" type="checkbox" checked>prob</label><input id="smooth-pr-s" type="number" min="0.1" max="4" step="0.1" value="0.6" title="probability strength (Gaussian sigma)"></div>
+    <div class="grp"><span class="k">cache</span><select id="cache-cap" title="total decoded-chunk cache; each layer gets an equal share">
+      <option value="1024">1 GB</option><option value="1536">1.5 GB</option><option value="2048">2 GB</option><option value="3072" selected>3 GB</option><option value="4096">4 GB</option></select>
       <button id="clear-cache" title="drop cached chunks and shard indices (also retries failed reads)">clear</button></div>
+    <label class="grp"><input id="xhair" type="checkbox" checked>crosshair</label>
+    <label class="grp" title="draw each layer's extent"><input id="outlines" type="checkbox" checked>outlines</label>
     <button id="fit" title="fit all views (R)">fit</button>
+    <button id="copy-link" title="copy a link to this view (layers, settings, cursor, zoom)">link</button>
     <button id="help-btn" title="keyboard and mouse (?)">?</button>
   </div>
 </header>
@@ -109,16 +133,27 @@ footer { background: var(--panel); border-top: 1px solid var(--line); padding: 3
     <div class="view" id="view1"><canvas></canvas><div class="vlabel"></div><div class="vtag">Y</div></div>
     <div class="view" id="view2"><canvas></canvas><div class="vlabel"></div><div class="vtag">X</div></div>
     <div id="side">
-      <canvas id="minimap" width="320" height="320"></canvas>
-      <div id="minimap-label"></div>
-      <div id="info-hover" class="info"></div>
-      <div id="info-vol" class="info"></div>
-      <div id="info-pred" class="info"></div>
-      <div class="info"><span class="legend" style="background:#1a1e28"></span> not loaded yet &nbsp; <span class="legend" style="background:#461212"></span> read/decode error &nbsp; <span class="legend" style="background:#000"></span> air (0 / missing chunk)</div>
-      <div id="info-wasm" class="info"></div>
+      <div id="layers-col">
+        <div class="sec-head"><b>Layers</b><span class="k">the top row is drawn on top · click a row for its settings</span></div>
+        <div id="layer-list"></div>
+        <div id="layer-settings"></div>
+      </div>
+      <div id="mini-col">
+        <canvas id="minimap" width="300" height="300"></canvas>
+        <div id="minimap-label"></div>
+        <div id="info-hover" class="info"></div>
+        <div class="info"><span class="legend" style="background:#1a1e28"></span> not loaded &nbsp; <span class="legend" style="background:#461212"></span> error &nbsp; <span class="legend" style="background:#000"></span> air</div>
+        <div id="info-wasm" class="info"></div>
+      </div>
     </div>
   </div>
 </main>
+<div id="addpanel"><div class="box">
+  <div class="row"><h3 style="margin:0">Add a layer</h3><span id="add-scope" class="k"></span><span style="flex:1"></span><button id="add-refresh" title="list again">refresh</button><button id="add-close">close</button></div>
+  <div class="row"><input id="add-url" type="text" placeholder="store URL (.zarr, a level of one, or a directory of region_Z_Y_X.zarr stores)" spellcheck="false" style="flex:1;width:auto"><button id="add-url-go">add</button></div>
+  <div id="add-status" class="info"></div>
+  <div id="add-list"></div>
+</div></div>
 <footer><div id="status-main">starting…</div><div id="status-warn"></div></footer>
 <div id="help"><div class="box">
   <h3 style="margin-top:0">Keyboard and mouse</h3>
@@ -133,14 +168,17 @@ footer { background: var(--panel); border-top: 1px solid var(--line); padding: 3
     <tr><td>+ / −</td><td>zoom the active view</td></tr>
     <tr><td>1 2 3</td><td>make the z / y / x view active</td></tr>
     <tr><td>R, 0</td><td>fit all views</td></tr>
-    <tr><td>, / .</td><td>coarser / finer CT level · A: back to auto</td></tr>
-    <tr><td>L</td><td>auto window/level from the active view (ignores air)</td></tr>
+    <tr><td>N · shift+N</td><td>select the next / previous layer (the settings, keys and right-drag act on it)</td></tr>
+    <tr><td>, / .</td><td>coarser / finer level of the selected layer · A: back to auto</td></tr>
+    <tr><td>L</td><td>auto window/level of the selected layer from the active view (ignores 0)</td></tr>
+    <tr><td>V · T · [ ]</td><td>selected layer: visible on/off · threshold on/off · opacity −/+</td></tr>
+    <tr><td>I, Insert</td><td>add a layer</td></tr>
+    <tr><td>O</td><td>all layers above the bottom one on/off</td></tr>
     <tr><td>D</td><td>deblock (volcomp_decode_smooth) on/off</td></tr>
-    <tr><td>O · T · [ ]</td><td>overlay on/off · threshold mask at p ≥ 0.5 · opacity −/+</td></tr>
     <tr><td>C</td><td>crosshair on/off</td></tr>
     <tr><td>? H · Esc</td><td>this help · close / restore</td></tr>
   </table>
-  <p class="info">Minimap: the active view's slice at a coarse level; click or drag it to move that view. The URL hash keeps the volume, overlay and cursor, so a copied link reopens the same place.</p>
+  <p class="info">Every layer is placed in one world frame in micrometres (its own pitch and origin from its metadata) and resampled into the view: trilinear for grey and probability layers, nearest for masks and labels. Each layer picks its own pyramid level per view. Minimap: the active view's slice at a coarse level; click or drag it to move that view. The URL hash keeps the layers, their settings, the cursor and the zoom, so a copied link reopens the same view.</p>
   <button id="help-close">close</button>
 </div></div>
 <script type="text/plain" id="worker-src">/*@WORKER@*/</script>
