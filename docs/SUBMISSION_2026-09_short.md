@@ -15,9 +15,8 @@ level-0 CT, of which 275 TB is stored.
 
 **Released**
 
-- C library, format spec and a Python zarr v3 codec
-- A single-file browser viewer that streams the mirror by HTTP Range
-- The mirror, <https://dl.ash2txt.org/community-uploads/forrest/volcomp/>: CT of all 39 samples, the published masks as exact mask stores, and 61 new whole-volume m7 probability stores
+- C library, spec, Python zarr v3 codec, single-file browser viewer
+- The mirror, <https://dl.ash2txt.org/community-uploads/forrest/volcomp/>: 5.86 TB in all (52.6x smaller than the bucket's stored bytes, 233x smaller than its logical level 0). It holds the CT of 39 samples, the 41 published m7 masks as volcomp stores, and whole-volume m7 probability stores (59 up, 61 by tonight)
 - VC3D integration: ScrollPrize/villa PR #1704 (open)
 
 | our m7 (8-bit prob, q 8) vs published (binary) | 0343P | 0009B |
@@ -25,9 +24,8 @@ level-0 CT, of which 275 TB is stored.
 | size ratio, level 0 | 2.34x smaller | 1.63x smaller |
 | box dice p >= 0.5 | 0.637 | 0.655 |
 
-Most of the dice gap comes from inference, not compression. The two are separate runs, and m7 moves with
-window placement (stride 128 vs 96 gives dice 0.946). The thresholds differ (0.2 vs 0.5), and the
-published masks mark blocks of masked air. Against the same run's float output, q 8 costs dice 0.978 and
+The dice gap is mostly inference, not compression: separate runs (stride 128 vs 96 alone gives dice
+0.946), thresholds 0.2 vs 0.5, and masked-air blocks in the published masks. Against the same run's float output, q 8 costs dice 0.978 and
 MAE 4 of 255.
 
 ![PHerc0343P: CT, published, ours, diff](comparison/surfaces/PHerc0343P/z1493_zoom.png)

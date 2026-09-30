@@ -12,6 +12,7 @@ repository (section 10). Competitor numbers measured on other data are labelled 
 | PHercParis4 2.4 µm CT, 54 held-out 128³ chunks, q 8 | **52.9x**, 35.0 dB PSNR, MAE 3.2 | docs/BENCHMARKS.md |
 | decode / encode at q 8, one core | **1,375 / 784 MB/s** | docs/BENCHMARKS.md |
 | 512³ cubes at q 8: 0.55 / 1.13 / 2.40 / 9.36 µm | 145.7x / 131.7x / 52.3x / 31.0x | docs/comparison/README.md |
+| whole mirror vs the bucket: 5.86 TB | **52.6x** vs bucket stored bytes, **233x** vs logical level 0 | docs/_mirror_size_2026-09-30.md |
 | PHerc0343P 8.64 µm CT, whole level 0 (138 Gvox) | 239.3 MiB | fact sheet 3g |
 | our m7 stores (8-bit probability) vs published binary m7 masks | **1.63-2.34x smaller** | docs/comparison/surfaces/README.md |
 | q 8 cost on an m7 prediction vs the same run's float output | dice 0.978, MAE 4.10 / 255 | surfaces/PHerc0343P/README.md |
@@ -22,7 +23,7 @@ repository (section 10). Competitor numbers measured on other data are labelled 
 | C library `volcomp.h` 1.3.0 (format rev. 4), CLI, spec, tests, fuzzers | this repository |
 | Python zarr v3 codec `volcomp-zarr` | `python/` |
 | single-file browser viewer (~300 KB, WebAssembly decoder) | `web/dist/volcomp_viewer.html` |
-| CT of all 39 samples; published surface masks as exact mask stores; **61 new whole-volume m7 probability stores** | the mirror |
+| CT of 64 of the bucket's 67 volumes (all 39 samples); the 41 published m7 th0.2 masks as volcomp stores; **whole-volume m7 probability stores** (59 up, 61 when the last uploads finish) | the mirror (5.86 TB) |
 | VC3D integration | [ScrollPrize/villa#1704](https://github.com/ScrollPrize/villa/pull/1704) (open) |
 
 volcomp is a single-header C codec for `uint8` volumes: a 16³ 3-D DCT, a dead-zone quantiser and tANS,
@@ -37,6 +38,15 @@ in independently decodable 128³ chunks inside standard zarr v3 shards. One knob
 | stored, level 0 | 239.7 |
 | stored, all levels | 275.1 |
 | surface prediction stores (84) | 2.30 |
+
+| volcomp mirror vs bucket (docs/_mirror_size_2026-09-30.md) | bucket | mirror | ratio |
+|---|--:|--:|--:|
+| logical level 0 / our CT level 0 | 761.1 TB | 3.27 TB | **233x** |
+| stored level 0 / our CT level 0 | 239.7 TB | 3.27 TB | **73x** |
+| stored all levels / our CT all levels | 275.1 TB | 5.24 TB | **52.6x** |
+
+The whole mirror is 5.86 TB: CT 5.24 TB, surface stores 0.51 TB, teacher regions 0.11 TB. It holds 64 of
+the 67 volumes; on the 64 matched volumes the ratios are 232x / 73x / 52x.
 
 | pitch group | volumes | logical L0 TB | stored TB |
 |---|--:|--:|--:|
@@ -194,7 +204,7 @@ Surface mode makes the thresholded mask exact at 0.71-0.78x the size of q 8. Sur
 
 | m7 whole-volume release | |
 |---|---|
-| stores | 61: all 31 volumes at 8-9 µm (level 0) + 30 fine-pitch scans at the level nearest 9 µm |
+| stores | 61: all 31 volumes at 8-9 µm (level 0) + 30 fine-pitch scans at the level nearest 9 µm; 59 on the mirror at the 2026-09-30 crawl |
 | model / engine | `surface_m7_nnunet`, 192³ windows, Gaussian blend, TensorRT fp16 (corr. 0.99996 vs PyTorch), no TTA |
 | stride / CT input | 128 on q 8 CT with smoothing 2 (59 stores); 96 on plain q 8 CT (0343P, 0009B level 0) |
 | format | `uint8` = round(255·p), volcomp q 8, 8 levels named by pitch |
@@ -320,6 +330,7 @@ https://dl.ash2txt.org/community-uploads/forrest/volcomp/<Sample>/representation
 | viewer | web/README.md | `web/test/` (3e549a3, b4bbc3e) |
 | export pipeline, modes, API | tools/export/README.md, docs/api.md, spec/format.md | `tools/export/`, `tests/`, `fuzz/` |
 | bucket size | docs/_bucket_size_2026-09-30.md | anonymous `aws s3 ls` |
+| mirror size, mirror/bucket ratios | docs/_mirror_size_2026-09-30.md | crawl of the mirror's autoindex (167,585 listings) |
 | mirror sizes, PR, conflicts | docs/_factsheet_2026-09-30.md | live listings, `gh pr view 1704` |
 | other codecs | docs/_landscape_2026-09-30.md | web survey |
 | codec benchmark | [pending: docs/bench/README.md] | `tools/bench_codecs.py` |
