@@ -37,6 +37,6 @@ MAE 4 of 255.
 - No error bound
 - The m7 stores are q 8, which flips 0.2-0.7 % of voxels at 0.5
 - The viewer is tested in Chromium only
-- Interim benchmark: SVT-AV1/x265 need 0.69-0.83x volcomp's bits at 35 dB, others 1.4-10x; volcomp decodes a chunk 12-190x faster
+- Interim benchmark: SVT-AV1/x265 need 0.53-0.99x volcomp's bits at 35 dB, all others 1.4-31x; per chunk, volcomp reads 6-21x fewer bytes than them and decodes 14-179x faster
 
 Full writeup: [SUBMISSION_2026-09.md](SUBMISSION_2026-09.md).
