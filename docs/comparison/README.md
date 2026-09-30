@@ -120,3 +120,9 @@ For the three centre planes of every cube: the raw slice in grey with a red over
 - PHerc0191_9.36um: zmid [q1](PHerc0191_9.36um/diff_zmid_q1.png) [q2](PHerc0191_9.36um/diff_zmid_q2.png) [q4](PHerc0191_9.36um/diff_zmid_q4.png) [q8](PHerc0191_9.36um/diff_zmid_q8.png) [q16](PHerc0191_9.36um/diff_zmid_q16.png) [q32](PHerc0191_9.36um/diff_zmid_q32.png)  ·  ymid [q1](PHerc0191_9.36um/diff_ymid_q1.png) [q2](PHerc0191_9.36um/diff_ymid_q2.png) [q4](PHerc0191_9.36um/diff_ymid_q4.png) [q8](PHerc0191_9.36um/diff_ymid_q8.png) [q16](PHerc0191_9.36um/diff_ymid_q16.png) [q32](PHerc0191_9.36um/diff_ymid_q32.png)  ·  xmid [q1](PHerc0191_9.36um/diff_xmid_q1.png) [q2](PHerc0191_9.36um/diff_xmid_q2.png) [q4](PHerc0191_9.36um/diff_xmid_q4.png) [q8](PHerc0191_9.36um/diff_xmid_q8.png) [q16](PHerc0191_9.36um/diff_xmid_q16.png) [q32](PHerc0191_9.36um/diff_xmid_q32.png)
 
 ![PHercParis4_2.40um zmid q8 error](PHercParis4_2.40um/diff_zmid_q8.png)
+
+## Surface predictions
+
+Our volcomp m7 surface-probability stores against the published upstream m7 masks of the same scans
+(PHerc0343P, PHerc0009B): CT slices, overlays, disagreement panels, dice/precision/recall and store sizes.
+See [surfaces/README.md](surfaces/README.md); `tools/surface_compare.py`.

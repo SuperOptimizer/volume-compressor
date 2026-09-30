@@ -1,0 +1,353 @@
+{
+ "sample": "PHerc0009B",
+ "info": {
+  "level": 2,
+  "ours_name": "20260319104112-surface-20260925170000-surface-m7-L2-prob.zarr",
+  "ours_url": "https://dl.ash2txt.org/community-uploads/forrest/volcomp/PHerc0009B/representations/predictions/surfaces/20260319104112-surface-20260925170000-surface-m7-L2-prob.zarr",
+  "ours_levels": [
+   "9.604",
+   "19.208",
+   "38.416",
+   "76.832",
+   "153.664",
+   "307.328",
+   "614.656",
+   "1229.312"
+  ],
+  "pub_name": "20260319104112-surface-20260413222639-surface-m7-L2-th0.2.zarr",
+  "pub_prefix": "PHerc0009B/representations/predictions/surfaces/20260319104112-surface-20260413222639-surface-m7-L2-th0.2.zarr/",
+  "ct_prefix": "PHerc0009B/volumes/20260319104112-2.401um-0.3m-77keV-masked.zarr/",
+  "ct_name": "20260319104112-2.401um-0.3m-77keV-masked.zarr"
+ },
+ "shape": [
+  7278,
+  7065,
+  7065
+ ],
+ "voxels": 363275729550,
+ "box_lo": [
+  2368,
+  3200,
+  3840
+ ],
+ "box_hi": [
+  3392,
+  4224,
+  4864
+ ],
+ "box_published_fraction": 0.2530031204223633,
+ "producer_params": {
+  "backend": "TensorRT fp16",
+  "engine": "m7_p192_b1_fp16_NVIDIA_GeForce_RTX_5060_Ti_sm120_trt11.2.1.2.plan",
+  "window": 192,
+  "stride": 128,
+  "overlap": 64,
+  "halo": 32,
+  "blend": "separable Gaussian sigma=w/6, normalised over the whole-volume window grid",
+  "normalisation": {
+   "clip": [
+    0.0,
+    212.0
+   ],
+   "mean": 87.54424285888672,
+   "std": 47.74376678466797
+  },
+  "output": "softmax foreground channel (surface)",
+  "air_windows": "skipped (all-zero CT)",
+  "ct_decode_smooth": 2.0,
+  "ct_decode": "volcomp_decode_smooth strength 2, gated, zero guard",
+  "tta": 1
+ },
+ "sizes": {
+  "pub_l0": 1047330582,
+  "pub_all": 1319448305,
+  "pub_objects": 8028,
+  "ours_l0": 642517004,
+  "ours_all": 800943088
+ },
+ "box": {
+  "plain": {
+   "p>=0.5": {
+    "dice": 0.6551917449472158,
+    "precision": 0.859008120720992,
+    "recall": 0.5295465351007609,
+    "n_ours": 167005122,
+    "n_pub": 270908686,
+    "n_both": 143458756
+   },
+   "p>=0.2": {
+    "dice": 0.7443018270484388,
+    "precision": 0.704109931970388,
+    "recall": 0.7893599506071208,
+    "n_ours": 303708920,
+    "n_pub": 270908686,
+    "n_both": 213844467
+   }
+  },
+  "gated2": {
+   "p>=0.5": {
+    "dice": 0.6550841793275517,
+    "precision": 0.859208779351564,
+    "recall": 0.5293298310855932,
+    "n_ours": 166897793,
+    "n_pub": 270908686,
+    "n_both": 143400049
+   },
+   "p>=0.2": {
+    "dice": 0.7444016111273632,
+    "precision": 0.7043393708781208,
+    "recall": 0.7892961209815177,
+    "n_ours": 303585436,
+    "n_pub": 270908686,
+    "n_both": 213827175
+   }
+  },
+  "gauss0.6": {
+   "p>=0.5": {
+    "dice": 0.6540194502711255,
+    "precision": 0.860638510178376,
+    "recall": 0.527402513775435,
+    "n_ours": 166013861,
+    "n_pub": 270908686,
+    "n_both": 142877922
+   },
+   "p>=0.2": {
+    "dice": 0.7445403123774267,
+    "precision": 0.699695516925039,
+    "recall": 0.7955271356637121,
+    "n_ours": 308012851,
+    "n_pub": 270908686,
+    "n_both": 215515211
+   }
+  },
+  "ct_nonzero_fraction": 0.996612960472703,
+  "published_in_air": 70582,
+  "ours_in_air_p>=0.2": 21688
+ },
+ "box_all_voxels": {
+  "plain": {
+   "p>=0.5": {
+    "dice": 0.655096767637489,
+    "precision": 0.8590063995795606,
+    "recall": 0.5294231143911718,
+    "n_ours": 167010034,
+    "n_pub": 270979268,
+    "n_both": 143462688
+   },
+   "p>=0.2": {
+    "dice": 0.7442268627379565,
+    "precision": 0.7041017874629217,
+    "recall": 0.7892015709482247,
+    "n_ours": 303730608,
+    "n_pub": 270979268,
+    "n_both": 213857264
+   }
+  },
+  "gated2": {
+   "p>=0.5": {
+    "dice": 0.6549890700662099,
+    "precision": 0.8592071678493044,
+    "recall": 0.5292062564727277,
+    "n_ours": 166902616,
+    "n_pub": 270979268,
+    "n_both": 143403924
+   },
+   "p>=0.2": {
+    "dice": 0.7443265387373525,
+    "precision": 0.7043317879658101,
+    "recall": 0.7891368575104425,
+    "n_ours": 303606527,
+    "n_pub": 270979268,
+    "n_both": 213839728
+   }
+  },
+  "gauss0.6": {
+   "p>=0.5": {
+    "dice": 0.6539232899395014,
+    "precision": 0.8606373764334229,
+    "recall": 0.5272778875467329,
+    "n_ours": 166018093,
+    "n_pub": 270979268,
+    "n_both": 142881376
+   },
+   "p>=0.2": {
+    "dice": 0.7444684272547465,
+    "precision": 0.6996892409563102,
+    "recall": 0.7953711278015556,
+    "n_ours": 308035444,
+    "n_pub": 270979268,
+    "n_both": 215529086
+   }
+  }
+ },
+ "views": [
+  {
+   "view": "z2709",
+   "axis": "z",
+   "index": 2709,
+   "zoom_yx_size": [
+    768,
+    160,
+    256
+   ],
+   "slice_scores": {
+    "dice": 0.6468270050449292,
+    "precision": 0.863112812894323,
+    "recall": 0.5172182593634179,
+    "n_ours": 160877,
+    "n_pub": 268465,
+    "n_both": 138855
+   }
+  },
+  {
+   "view": "z3050",
+   "axis": "z",
+   "index": 3050,
+   "zoom_yx_size": [
+    768,
+    256,
+    256
+   ],
+   "slice_scores": {
+    "dice": 0.6478715328467153,
+    "precision": 0.8489896114549472,
+    "recall": 0.5237902799389663,
+    "n_ours": 163353,
+    "n_pub": 264772,
+    "n_both": 138685
+   }
+  },
+  {
+   "view": "y3541",
+   "axis": "y",
+   "index": 3541,
+   "zoom_yx_size": [
+    64,
+    768,
+    256
+   ],
+   "slice_scores": {
+    "dice": 0.7821820876841883,
+    "precision": 0.9396906528722891,
+    "recall": 0.6698958443848526,
+    "n_ours": 194862,
+    "n_pub": 273341,
+    "n_both": 183110
+   }
+  },
+  {
+   "view": "y3882",
+   "axis": "y",
+   "index": 3882,
+   "zoom_yx_size": [
+    192,
+    64,
+    256
+   ],
+   "slice_scores": {
+    "dice": 0.6239723397936591,
+    "precision": 0.9005784778366323,
+    "recall": 0.4773559324538493,
+    "n_ours": 143480,
+    "n_pub": 270689,
+    "n_both": 129215
+   }
+  },
+  {
+   "view": "x4181",
+   "axis": "x",
+   "index": 4181,
+   "zoom_yx_size": [
+    288,
+    768,
+    256
+   ],
+   "slice_scores": {
+    "dice": 0.6563179668382183,
+    "precision": 0.8600500417014179,
+    "recall": 0.5306220944675113,
+    "n_ours": 173855,
+    "n_pub": 281790,
+    "n_both": 149524
+   }
+  },
+  {
+   "view": "x4522",
+   "axis": "x",
+   "index": 4522,
+   "zoom_yx_size": [
+    224,
+    512,
+    256
+   ],
+   "slice_scores": {
+    "dice": 0.6395288117068432,
+    "precision": 0.8317276408639783,
+    "recall": 0.5194843627926797,
+    "n_ours": 158291,
+    "n_pub": 253434,
+    "n_both": 131655
+   }
+  }
+ ],
+ "whole": {
+  "plain": {
+   "p>=0.5": {
+    "dice": 0.6859914633510878,
+    "precision": 0.8675451702231137,
+    "recall": 0.5672759678214315,
+    "n_ours": 3067929223,
+    "n_pub": 4691838419,
+    "n_both": 2661567180
+   },
+   "p>=0.2": {
+    "dice": 0.757497869253636,
+    "precision": 0.714738523294165,
+    "recall": 0.805698936410879,
+    "n_ours": 5288940082,
+    "n_pub": 4691838419,
+    "n_both": 3780209224
+   }
+  },
+  "gated2": {
+   "p>=0.5": {
+    "dice": 0.6858075078755398,
+    "precision": 0.8677871212138923,
+    "recall": 0.5669211105456017,
+    "n_ours": 3065155246,
+    "n_pub": 4691838419,
+    "n_both": 2659902247
+   },
+   "p>=0.2": {
+    "dice": 0.7576373154634886,
+    "precision": 0.7151835207456044,
+    "recall": 0.8054493532207891,
+    "n_ours": 5284011880,
+    "n_pub": 4691838419,
+    "n_both": 3779038220
+   }
+  },
+  "all_voxels_plain": {
+   "p>=0.5": {
+    "dice": 0.27843583708630254,
+    "precision": 0.8673445078292945,
+    "recall": 0.16583640649383755,
+    "n_ours": 3068965388,
+    "n_pub": 16051060984,
+    "n_both": 2661850274
+   },
+   "p>=0.2": {
+    "dice": 0.35428727458932113,
+    "precision": 0.7143325162727383,
+    "recall": 0.2355585998189738,
+    "n_ours": 5293004819,
+    "n_pub": 16051060984,
+    "n_both": 3780965451
+   }
+  },
+  "published_in_air": 11359222565,
+  "ours_in_air_p>=0.2": 4064737,
+  "ct_mask_level_factor": 4
+ },
+ "seconds": 3780.5
+}
