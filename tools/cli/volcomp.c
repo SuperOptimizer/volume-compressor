@@ -19,9 +19,6 @@
  *   volcomp shard-pool out.shard [--mask | --mask-lossless | --q=Q] --shape=Z,Y,X --pos=SZ,SY,SX in0 .. in7
  *       one coarser 128^3 shard from the 8 that cover it (2x mean pooling); the
  *       offline part of the prediction pyramid, driven by coordinator.py pool-levels
- *   volcomp label-encode DIR out.voll --q=Q   (DIR/<cls>.u8 class probability planes -> label chunk)
- *   volcomp label-decode in.voll DIR          (writes DIR/<cls>.u8 for every stored class)
- *   volcomp label-verify in.voll DIR          (decode + error stats per class)
  * Input chunks are raw 128^3 u8 files (2097152 bytes), z-major. */
 #include "../../volcomp.h"
 #include "metrics.h"
@@ -448,12 +445,9 @@ static int usage(void) {
                   "  volcomp surface-maxpool-check coarse.blosc f000 .. f111 --csize=C\n"
                   "  volcomp surface-occupancy DIR out.bin --csize=C --coarse-shape=Z,Y,X --factor=F --out-shape=Z,Y,X [--scale=S] [--dilate=1]\n"
                   "  volcomp shard-pool out.shard [--mask | --mask-lossless | --q=Q] --shape=Z,Y,X --pos=SZ,SY,SX in0 .. in7\n"
-                  "  volcomp label-encode DIR out.voll --q=Q [--q-plane=CLS=Q ...]\n"
-                  "  volcomp label-decode in.voll DIR\n  volcomp label-verify in.voll DIR\n"
                   "\nQ is 0 for the lossless mode (exact) or 1..255 for the lossy DCT codec.\n");
   return 1;
 }
-#include "label_cli.h"
 
 int main(int argc, char **argv) {
   if (argc < 4) return usage();
@@ -532,8 +526,5 @@ int main(int argc, char **argv) {
   if (!strcmp(cmd, "shard-pool")) return surface_pool_cli(argc, argv);
   if (!strcmp(cmd, "surface-occupancy")) return surface_occupancy_cli(argc, argv);
   if (!strcmp(cmd, "surface-maxpool-check")) return surface_maxpool_check_cli(argc, argv);
-  if (!strcmp(cmd, "label-encode")) return label_encode(argc, argv);
-  if (!strcmp(cmd, "label-decode")) return label_decode(argc, argv);
-  if (!strcmp(cmd, "label-verify")) return label_verify(argc, argv);
   return usage();
 }

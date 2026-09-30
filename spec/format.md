@@ -185,37 +185,11 @@ encoded size of any chunk is at most
 `8 + 680 + 256 + 32·(2·16·8192 + 8) + 512·12288 = 14 681 264` bytes
 (`VOLCOMP_ENCODE_BOUND`).
 
-## 9. Label chunks (`volcomp_label.h`)
+## 9. Label chunks (removed)
 
-A label chunk stores up to 255 class PLANES (u8 probability maps) for one
-128³ region. Only planes with a nonzero voxel are stored; a class that is not
-stored decodes as all zeros. Class identity is an explicit tag, never coded
-lossily.
-
-```
-offset  size   field
-0       4      magic "VOLL"
-4       1      version = 2
-5       1      nplanes (0..255)
-6       2      q_raw  u16, the chunk's DEFAULT q; 0 (lossless) or 256..65280
-8       4      reserved = 0
-12      8*n    directory: { u8 cls, u8 mode, u16 q_raw, u32 n } per plane,
-               cls strictly ascending; the entry's q_raw is the q that plane
-               was encoded with, 0 (lossless) or 256..65280
-        var    plane bytes in directory order, n bytes each
-```
-
-Exact accounting is normative: header, directory and every plane's bytes
-must sum to the stream length. Mode 0 (image): the plane is a §2 or §10
-stream whose q equals the directory entry's `q_raw`, `n < 2 097 152`. Mode 1 (raw): the plane is
-stored verbatim, `n = 2 097 152` (the encoder uses it only when the §2 stream
-would not be smaller). Any other mode is rejected.
-
-**Bound.** `VOLCOMP_LABEL_ENCODE_BOUND(n) = 12 + n·(8 + 2 097 152)`.
-
-Version 1 (one `q_raw` for the whole chunk, `reserved = 0` where the entry's
-`q_raw` now sits) is not read; `volcomp_label_decode` returns
-`VOLCOMP_ERR_VERSION` for it.
+The separate label-chunk format (`volcomp_label.h`, with its own stream magic)
+was removed on 2026-09-30: nothing produced or consumed it. Section numbers 10
+to 13 are kept so that the references in `volcomp.h` stay valid.
 
 ## 10. Lossless chunks (`q = 0`)
 
