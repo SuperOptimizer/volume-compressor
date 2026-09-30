@@ -5,7 +5,7 @@ q with a fixed 4x gain (min(1, 4 * |raw - decoded| / 255): an error of 32 is a 5
 solid red), upscaled 2x by pixel replication to 1024^2 and written as lossless RGB PNG: `diff_<view>_q<N>.png`
 (plain decode).
 
-    VOLCOMP_LIB=build/release/libvolcomp.so python3 tools/diff_images.py docs/comparison
+    VOLCOMP_LIB=build/release/libvolcomp.so python3 tools/diff_images.py docs/comparison [--set first|more|all]
 """
 import os
 import sys
@@ -13,7 +13,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from compare_images import N, QS, VOLUMES, fetch_cube, pick_cube, roundtrip, views  # noqa: E402
+from compare_images import N, QS, SETS, VOLUMES, fetch_cube, pick_cube, roundtrip, views, write_readme  # noqa: E402
 
 PLANES = ["zmid", "ymid", "xmid"]
 GAIN = 4.0  # overlay opacity = min(1, GAIN * error / 255)
@@ -28,11 +28,11 @@ def overlay(raw, dec):
     return rgb.repeat(2, axis=0).repeat(2, axis=1)
 
 
-def main(out_root):
+def main(out_root, vols=VOLUMES):
     import s3fs
     from PIL import Image
     fs = s3fs.S3FileSystem(anon=True)
-    for sample, volume, res in VOLUMES:
+    for sample, volume, res in vols:
         name = f"{sample}_{res}"
         d = os.path.join(out_root, name)
         org, _ = pick_cube(fs, sample, volume)
@@ -46,21 +46,16 @@ def main(out_root):
                 Image.fromarray(img, "RGB").save(os.path.join(d, f"diff_{p}_q{q}.png"), optimize=True)
             print(f"{name} q={q}: max error on the centre planes "
                   f"{max(int(np.abs(rv[p].astype(int) - dv[p].astype(int)).max()) for p in PLANES)}", flush=True)
-    # index in the README
-    rp = os.path.join(out_root, "README.md")
-    s = open(rp).read()
-    if "## Error overlays" not in s:
-        L = ["", "## Error overlays", "",
-             "For the three centre planes of every cube: the raw slice in grey with a red overlay whose opacity is "
-             "the absolute error of the plain decode at that pixel with a fixed 4x gain (min(1, 4 |raw - decoded| / 255): "
-             "an error of 32 shows as 50 % red, 64 or more as solid red), magnified 2x by pixel replication to 1024^2. "
-             "`tools/diff_images.py`.", ""]
-        for name in [f"{s_}_{r}" for s_, _, r in VOLUMES]:
-            L.append(f"- {name}: " + "  ·  ".join(
-                f"{p} " + " ".join(f"[q{q}]({name}/diff_{p}_q{q}.png)" for q in QS) for p in PLANES))
-        L += ["", f"![{VOLUMES[2][0]}_{VOLUMES[2][2]} zmid q8 error]({VOLUMES[2][0]}_{VOLUMES[2][2]}/diff_zmid_q8.png)", ""]
-        open(rp, "w").write(s.rstrip("\n") + "\n" + "\n".join(L))
-
+    # the README (tables and the error-overlay index) is written by compare_images.write_readme from report.json
+    import json
+    rp = os.path.join(out_root, "report.json")
+    if os.path.exists(rp):
+        write_readme(out_root, json.load(open(rp)))
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "docs/comparison")
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("out", nargs="?", default="docs/comparison")
+    ap.add_argument("--set", choices=sorted(SETS), default="first")
+    a = ap.parse_args()
+    main(a.out, SETS[a.set])
