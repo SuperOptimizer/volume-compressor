@@ -46,22 +46,33 @@ What is released:
 
 ### 2.1 The size of the data
 
-> **[pending: docs/_bucket_size_2026-09-30.md]** A measurement of the open-data bucket's logical and stored
-> size is in progress and will replace this block. Until then the repository holds two totals that disagree,
-> and neither is a measurement of the bucket:
->
-> | claim | source |
-> |---|---|
-> | ~300 TB uncompressed, about 44x smaller (~6 TB) with per-level q 8 / 4 / 2 / 1 | villa PR #1704 body |
-> | 64 volumes, ~760 TB logical at level 0, plus the pyramids | tools/export/README.md |
->
-> For scale from a public source: the first 3.24 µm volume of PHerc 332 at 53 keV is 4.1 TB
-> (scrollprize.substack.com, cited in docs/_landscape_2026-09-30.md).
+docs/_bucket_size_2026-09-30.md lists every volume in `s3://vesuvius-challenge-open-data` (anonymous
+`aws s3` listing, 2026-09-30). All volumes are zarr v2, `uint8`, **uncompressed**, 128³ chunks, and empty
+(masked-out) chunks are simply not written, so the bytes stored are well below the logical size:
 
-What is measured is one whole scan. PHerc0343P at 8.64 µm is 138.04 Gvox (138 GB as `uint8`). Its volcomp
-level 0 on the mirror is 239.3 MiB, and the whole six-level pyramid is 372.6 MiB. That is 550x, but most of
-the volume is masked air, which costs almost nothing in any codec; section 4 gives the codec's behaviour on
-dense papyrus, which is the number to use.
+| quantity | TB |
+|---|--:|
+| logical size, level 0 (67 volumes in 39 samples) | 761.1 |
+| logical size with the pyramids | 869.9 |
+| stored, level 0 only | 239.7 |
+| stored, all pyramid levels | 275.1 |
+| surface prediction stores (84 stores, measured exactly) | 2.30 |
+
+By pitch, the fine scans are nearly all of it: volumes at 2.2-2.4 µm are 573.5 TB logical / 168.0 TB stored,
+at 1.1 µm or finer 148.9 / 95.3 TB, and the 34 volumes at 8.6-9.4 µm only 37.3 / 11.8 TB. Logical sizes are
+exact (from each level-0 `.zarray`); only 0.4 TB of the stored total was summed exactly and the rest is a
+12-plane systematic estimate per volume, so expect a few percent error on the stored figures. This settles
+the two totals quoted earlier in the repository: the export README's ~760 TB is the logical level-0 size,
+and the PR's "~300 TB uncompressed" matches the stored bytes (about 277 TB with the predictions), not the
+logical size. The volcomp mirror's own total has not been summed yet, so this writeup quotes no
+bucket-wide compression ratio.
+
+One whole scan is measured on both sides. PHerc0343P at 8.64 µm is 138.04 Gvox (0.138 TB logical). The
+bucket stores 0.033 TB at level 0 and 0.037 TB for all levels (summed exactly). The volcomp copy is 239.3 MiB
+at level 0 and 372.6 MiB for the whole six-level pyramid: about 550x against the logical level 0, about 130x
+against the stored level 0 and about 95x against the stored pyramid. Most of that volume is masked air,
+which costs almost nothing in any codec; section 4 gives the codec's behaviour on dense papyrus, which is
+the number to use for anything else.
 
 ### 2.2 What a tracer or a viewer needs
 
@@ -112,7 +123,7 @@ The mode is stored in header byte 5. An older reader rejects a mode it does not 
 | mode | name | what it stores | measured size |
 |---|---|---|---|
 | 0 | lossy DCT | as above | section 4 |
-| 1-3 | lossless (q = 0) | per-block prediction along z, zigzag residuals, CONST / SPARSE / DENSE / RAW per block; never more than raw + 8 bytes | 1.8x on synthetic CT; label planes and masks 60-250x |
+| 1-3 | lossless (q = 0) | per-block prediction along z, zigzag residuals, CONST / SPARSE / DENSE / RAW per block; never more than raw + 8 bytes | 1.8x on synthetic CT; class maps and masks 60-250x |
 | 4 | mask | 2x2x2 majority pool of a binary mask (64³), context-coded, decoded trilinearly to a 0..255 ramp | 0.0057 bits/voxel on the PHercParis4 recto, 11x smaller than packbits + zstd-19 |
 | 5 | mask, spatially lossless | the full 128³ binary mask, same coder, decodes to exact 0/255 | 0.0255 bits/voxel, 2.4x smaller than packbits + zstd-19 |
 | 6 | surface | a DCT base with a flat step law plus a refinement that keeps a threshold exact | 0.71-0.78x the size of q 8 at q 64 |
@@ -282,9 +293,8 @@ What the repository measures today:
 |---|---|---|
 | volcomp vs its predecessor c5d, same q, held-out set | 0.6 % (q 2) to 6.9 % (q 32) fewer bytes; decode 2.0-4.0x, encode 1.4-2.2x faster | docs/BENCHMARKS.md |
 | lossless q = 0 vs zstd-19, real label channels | 22 % smaller on a sparse mask; 23-34 % **larger** on the two busier channels | docs/BENCHMARKS.md |
-| label planes at q 8 vs the blosc-zstd chunks they ship in | 35x smaller (MAE 0.5, 43.7 dB) | README.md |
 | probability maps: q 8 vs u8 + zstd-19 | 0.065 vs 3.94 bits/voxel (recto), 0.052 vs 1.70 (m7) | docs/surface_mode.md |
-| masks: mode 5 vs packbits + zstd-19 | 2.4x smaller, exact | README.md |
+| masks: mode 5 vs packbits + zstd-19 | 2.4x smaller, exact | docs/api.md |
 
 ### 5.2 The landscape, with its caveats
 
@@ -528,7 +538,7 @@ cmake --preset release && cmake --build --preset release && ctest --preset relea
 ```
 
 Requires clang or GCC with C23. In C, `#include "volcomp.h"` and call `volcomp_encode`, `volcomp_decode`,
-`volcomp_decode_block` (README.md).
+`volcomp_decode_block` (docs/api.md).
 
 **Python / zarr.**
 
@@ -569,9 +579,9 @@ block = a[1024:1152, 2048:2176, 512:640]
 | other codecs and their caveats | docs/_landscape_2026-09-30.md | web survey, sources listed there |
 | m7 release scope and pipeline | the production notes summarised in the fact sheet section 5 and the surfaces READMEs | rvsm `tools/m7_wholevol.py` (commit 090eaa0) |
 | codec benchmark | [pending: docs/bench/README.md] | `tools/bench_codecs.py` |
-| bucket size | [pending: docs/_bucket_size_2026-09-30.md] | |
+| bucket size | docs/_bucket_size_2026-09-30.md | anonymous `aws s3 ls` of the bucket |
 
 Known disagreements inside the repository, listed so nobody quotes the wrong one: the ratio at q 8 is 52.9x
 (held-out chunks) or 52.3x (cube), not the "~40x at ~40 dB" in the vendored villa README; the whole-bucket
-total is 300 TB (PR) or 760 TB logical (export README) until measured; recto q 8 threshold dice is 0.9807
+"300 TB" (PR) is the stored size and "760 TB" (export README) the logical level-0 size (section 2.1); recto q 8 threshold dice is 0.9807
 (12 cubes) or 0.9872 (two regions only), depending on the region set.

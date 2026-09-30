@@ -2,7 +2,8 @@
 
 volcomp is a single-header C codec for `uint8` scroll CT and model predictions: 16³ 3-D DCT, dead-zone
 quantiser, tANS, independently decodable 128³ chunks inside standard zarr v3 `sharding_indexed` 1024³
-shards. One knob, `q`, plus exact modes for labels, masks and thresholded surface predictions.
+shards. One knob, `q`, plus exact modes for labels, masks and thresholded surface predictions. The
+open-data bucket holds 761 TB of logical level-0 CT, 275 TB stored (docs/_bucket_size_2026-09-30.md).
 
 Measured, single thread (docs/BENCHMARKS.md, docs/comparison/):
 
@@ -12,7 +13,7 @@ Measured, single thread (docs/BENCHMARKS.md, docs/comparison/):
 | 0.55 / 1.13 / 2.40 / 9.36 µm cubes | 8 | 146x / 132x / 52x / 31x | 41.6 / 42.7 / 36.6 / 33.4 dB |
 
 Decode 1.4 GB/s and encode 0.8 GB/s per core at q 8. A recto teacher run on q 8 CT agrees with its raw-CT
-prediction at dice 0.951 (0.978 at q 4); models not trained on compressed data do notice it.
+prediction at dice 0.951; models not trained on compressed data do notice it.
 
 ![PHercParis4 raw and q1-q32](comparison/PHercParis4_2.40um/zmid_all.png)
 
