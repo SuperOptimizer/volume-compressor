@@ -10,10 +10,15 @@
   `mask_decode_stored(bytes) -> bytearray` (the stored grid: 64³ for the 2×
   mode, 128³ for the lossless one), and for probability maps
   `surface_encode(bytes, q, threshold=128) -> bytes`, `surface_info(bytes)`.
+- typed chunks (format revision 5): `encode_typed(buf, dtype, q=0) -> bytes`,
+  `decode_typed(bytes, dtype, out=None)`, `decode_block_typed(bytes, bz, by, bx, dtype)`,
+  `chunk_dtype(bytes) -> "uint8" | "uint16" | ...`, `dtype_size(dtype)`,
+  `typed_encode_bound(dtype)`; `dtype` is a numpy name, type or dtype.
 - `volcomp_zarr.VolcompCodec`: zarr ≥ 3 array→bytes codec registered as `"volcomp"`
   (`{"name": "volcomp", "configuration": {"q": 8}}`, or
   `{"mode": "mask"}` / `{"mode": "mask-lossless"}` for the two mask modes),
-  uint8, 128³ inner chunks;
+  uint8 and (through the typed modes) uint16 / int16 / uint32 / int32 / float32,
+  128³ inner chunks;
   all-zero chunks are stored as missing when the array's fill value is 0.
   Needs `zarr>=3` and `numpy`.
 
@@ -70,10 +75,26 @@ z = zarr.create_array(store, shape=shape, chunks=(128,) * 3, shards=(1024,) * 3,
                       serializer=VolcompCodec(mode="surface", q=64), compressors=None, fill_value=0)
 ```
 
+**Typed arrays.** For a `uint16`, `int16`, `uint32`, `int32` or `float32` array
+the same codec writes typed chunks (spec §14). `q = 0` is exact, bit for bit,
+float NaN payloads included. `q > 0` is in value units: every element comes back
+within `q / 2` of its source, guaranteed. Integer arrays use the step `floor(q)`,
+and `floor(q) < 2` is exact. A float32 chunk holding a NaN or infinity is stored
+exactly. The mask and surface modes stay uint8 only, and a uint8 array still takes
+`q` in `{0} ∪ [1, 255]`; that check now runs when the array is created, since the
+codec cannot know the dtype before then.
+
+```python
+z = zarr.create_array(store, shape=shape, chunks=(128,) * 3, shards=(1024,) * 3, dtype="uint16",
+                      serializer=VolcompCodec(q=16), compressors=None, fill_value=0)
+z[:] = (winding * 256).astype("uint16")   # every element decodes within 8 of its source
+```
+
 `python/test_zarr_roundtrip.py` exercises the codec class itself (zarr ≥ 3 and
 numpy required): lossless round trips through both the bytes API and a zarr v3
 array on an all-zero chunk, a 3-class mask, a smooth SDF-like chunk and random
-noise.
+noise, the mask and surface modes, and the typed modes for every dtype, exact and
+error-bounded, in sharded arrays.
 
 ```sh
 uv venv /tmp/vcvenv && uv pip install --python /tmp/vcvenv/bin/python './python[zarr]'

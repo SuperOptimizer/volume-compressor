@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Lossless (q=0) round trips through the zarr v3 codec and the bytes-level binding.
+"""Round trips through the zarr v3 codec and the bytes-level binding: uint8 (lossless, mask,
+surface, reader-side deblocking) and the typed modes (uint16 / int16 / uint32 / int32 / float32,
+exact and error-bounded).
 
 Needs zarr>=3 and numpy:
     uv venv /tmp/vcvenv && uv pip install --python /tmp/vcvenv/bin/python ./python[zarr]
@@ -189,10 +191,19 @@ def main():
         raise SystemExit("expected an unknown mode to be rejected")
     except ValueError:
         pass
-    for bad in (0.5, -1.0, 256.0):
+    for bad in (-1.0, float("nan"), float("inf")):
         try:
             VolcompCodec(q=bad)
             raise SystemExit(f"expected q={bad} to be rejected")
+        except ValueError:
+            pass
+    # q's range depends on the dtype (typed q is in value units): uint8 arrays refuse q
+    # outside {0} u [1, 255] when the array is created
+    for bad in (0.5, 256.0):
+        try:
+            zarr.create_array(zarr.storage.MemoryStore(), shape=(D, D, D), chunks=(D, D, D), dtype="uint8",
+                              serializer=VolcompCodec(q=bad), fill_value=0)
+            raise SystemExit(f"expected q={bad} to be rejected for uint8")
         except ValueError:
             pass
     try:
@@ -201,8 +212,112 @@ def main():
     except ValueError:
         pass
 
+    fails += typed()
     print("\nFAIL" if fails else "\nok")
     return 1 if fails else 0
+
+
+def winding(dtype, shape=(D, D, D), tilt=0.0):
+    """a winding-like field W (radial ramp around an axis outside the chunk + waves), stored
+    as W * 256 in uint16 (the ufsm layout) and as scaled copies in the other dtypes"""
+    z, y, x = np.meshgrid(*(np.arange(n, dtype=np.float64) for n in shape), indexing="ij")
+    cy, cx = -60.0 + tilt * z, 40.0
+    r, th = np.hypot(y - cy, x - cx), np.arctan2(y - cy, x - cx)
+    w = 4.0 + r / 30.0 + 0.15 * np.sin(0.09 * z + 3.0 * th) + 0.05 * np.sin(0.21 * x + 0.13 * y)
+    scale = {"uint16": (256.0, 0.0), "int16": (256.0, -20000.0), "uint32": (1 << 20, 0.0),
+             "int32": (-(1 << 20), 0.0), "float32": (1.0, 0.0)}[dtype]
+    v = w * scale[0] + scale[1]
+    return (v if dtype == "float32" else np.rint(v)).astype(dtype)
+
+
+def typed():
+    """The typed modes (spec/format.md §14) through the bytes-level binding and zarr v3 arrays."""
+    fails = 0
+    names = ("uint16", "int16", "uint32", "int32", "float32")
+    rng = np.random.default_rng(11)
+
+    print("\n-- typed chunks, bytes-level binding --")
+    for name in names:
+        a = winding(name, tilt=0.3)
+        raw = a.nbytes
+        enc = vz.encode_typed(a, name, vz.Q_LOSSLESS)
+        got = np.frombuffer(bytes(vz.decode_typed(enc, name)), name).reshape(a.shape)
+        exact = np.array_equal(a.view(np.uint8), got.view(np.uint8))
+        assert vz.chunk_dtype(enc) == name and vz.is_lossless(enc) and vz.stream_q(enc) == 0.0
+        assert len(enc) <= vz.typed_encode_bound(name)
+        blk = np.frombuffer(bytes(vz.decode_block_typed(enc, 2, 3, 4, name)), name).reshape(16, 16, 16)
+        assert np.array_equal(blk, got[32:48, 48:64, 64:80]), name
+        other = "int16" if name != "int16" else "uint16"
+        try:
+            vz.decode_typed(enc, other)
+            raise SystemExit("expected a dtype mismatch to be refused")
+        except vz.VolcompError:
+            pass
+        try:
+            vz.decode(enc)
+            raise SystemExit("expected the u8 decode to refuse a typed chunk")
+        except vz.VolcompError:
+            pass
+        line = f"{name:>8} exact: {len(enc):8d} bytes ({raw / len(enc):5.2f}x) exact={exact}"
+        fails += not exact
+        q = 16.0 if name in ("uint16", "int16") else (4096.0 if name.endswith("32") and name != "float32" else 0.01)
+        enc = vz.encode_typed(a, name, q)
+        got = np.frombuffer(bytes(vz.decode_typed(enc, name)), name).reshape(a.shape)
+        err = float(np.abs(got.astype(np.float64) - a.astype(np.float64)).max())
+        assert not vz.is_lossless(enc) and 0.0 < vz.stream_q(enc) <= q
+        line += f" | q {q:g}: {len(enc):8d} bytes ({raw / len(enc):5.2f}x) max err {err:g} (<= {q / 2:g})"
+        print(line)
+        fails += not err <= q / 2
+        # incompressible noise is the RAW form: raw + 10 bytes, exact
+        nz = np.frombuffer(rng.bytes(raw), name).reshape(a.shape)
+        enc = vz.encode_typed(nz, name, 0.0)
+        assert len(enc) == raw + 10 and vz.decode_typed(enc, name) == nz.tobytes()
+    # float32 specials (NaN payloads, -0, inf, subnormals) are exact in mode 7, and a chunk
+    # holding any NaN or inf is kept exact at q > 0 too
+    f = winding("float32")
+    bits = f.view(np.uint32).copy()
+    bits[0, 0, :8] = [0x7FC01234, 0xFFC00000, 0x7F800001, 0x80000000, 0x7F800000, 0xFF800000, 1, 0x807FFFFF]
+    f = bits.view(np.float32)
+    for q in (0.0, 0.5):
+        enc = vz.encode_typed(f, "float32", q)
+        back = np.frombuffer(bytes(vz.decode_typed(enc, "float32")), np.uint32).reshape(f.shape)
+        assert np.array_equal(back, bits) and vz.stream_q(enc) == 0.0, q
+    print(f"{'float32':>8} specials: exact at q = 0 and kept exact at q > 0")
+
+    print("\n-- typed zarr v3 arrays (sharded 1024^3 / 128^3 chunks, codec chain [volcomp]) --")
+    shape = (256, 256, 384)
+    for name in names:
+        a = winding(name, shape=shape, tilt=0.2)
+        a[:, :, 300:] = 0  # an empty strip: all-zero chunks are stored as missing
+        for q in (0.0, 8.0 if name != "float32" else 0.001):
+            store = zarr.storage.MemoryStore()
+            z = zarr.create_array(store, shape=shape, chunks=(D, D, D), shards=(1024, 1024, 1024), dtype=name,
+                                  serializer=VolcompCodec(q=q), compressors=None, fill_value=0)
+            z[:] = a
+            meta = zarr.open_array(store, mode="r").metadata.to_dict()
+            inner = meta["codecs"][0]["configuration"]["codecs"]
+            assert inner[0]["name"] == "volcomp" and inner[0]["configuration"]["q"] == q, inner
+            got = zarr.open_array(store, mode="r")[:]
+            assert got.dtype == np.dtype(name)
+            err = float(np.abs(got.astype(np.float64) - a.astype(np.float64)).max())
+            ok = np.array_equal(got, a) if q == 0 else err <= q / 2
+            nbytes = sum(len(v) for k, v in store._store_dict.items() if not k.endswith("zarr.json"))
+            print(f"{name:>8} q {q:<6g}: {nbytes:9d} bytes for {a.nbytes} ({a.nbytes / nbytes:6.2f}x), "
+                  f"max err {err:g}, ok={ok}")
+            fails += not ok
+    # mask / surface modes are uint8 only
+    for mode in ("mask", "mask-lossless", "surface"):
+        try:
+            zarr.create_array(zarr.storage.MemoryStore(), shape=(D, D, D), chunks=(D, D, D), dtype="uint16",
+                              serializer=VolcompCodec(mode=mode, q=16), fill_value=0)
+            raise SystemExit(f"expected mode={mode} to be refused for uint16")
+        except ValueError:
+            pass
+    # typed q is in value units: any positive q, and it round-trips through the metadata
+    assert VolcompCodec.from_dict(VolcompCodec(q=0.001).to_dict()) == VolcompCodec(q=0.001)
+    zarr.create_array(zarr.storage.MemoryStore(), shape=(D, D, D), chunks=(D, D, D), dtype="float32",
+                      serializer=VolcompCodec(q=1e-4), fill_value=0)
+    return fails
 
 
 if __name__ == "__main__":

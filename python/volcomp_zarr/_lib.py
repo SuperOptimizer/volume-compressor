@@ -12,6 +12,9 @@ MASK_VOXELS = MASK_DIM ** 3
 MASK_LL_DIM = CHUNK_DIM  # a mode-5 (lossless) mask chunk stores the chunk itself
 MASK_LL_VOXELS = CHUNK_VOXELS
 STATUS = ["OK", "ERR_ARG", "ERR_CORRUPT", "ERR_VERSION", "ERR_NOMEM", "ERR_SHORT_BUF"]
+# element types (volcomp_dtype), by numpy name; uint8 is the u8 modes 0..6, the rest the typed modes 7 and 8
+DTYPES = {"uint8": 0, "uint16": 1, "int16": 2, "uint32": 3, "int32": 4, "float32": 5}
+DTYPE_NAMES = {v: k for k, v in DTYPES.items()}
 
 
 class VolcompError(RuntimeError):
@@ -79,6 +82,21 @@ _L.volcomp_shim_surface_info.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctype
                                          ctypes.POINTER(ctypes.c_uint32)]
 _L.volcomp_shim_is_lossless.restype = ctypes.c_int
 _L.volcomp_shim_is_lossless.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int)]
+_L.volcomp_shim_dtype_size.restype = ctypes.c_size_t
+_L.volcomp_shim_dtype_size.argtypes = [ctypes.c_int]
+_L.volcomp_shim_typed_encode_bound.restype = ctypes.c_size_t
+_L.volcomp_shim_typed_encode_bound.argtypes = [ctypes.c_int]
+_L.volcomp_shim_encode_typed.restype = ctypes.c_int
+_L.volcomp_shim_encode_typed.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_float, ctypes.c_void_p,
+                                         ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+_L.volcomp_shim_decode_typed.restype = ctypes.c_int
+_L.volcomp_shim_decode_typed.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t,
+                                         ctypes.c_int]
+_L.volcomp_shim_decode_block_typed.restype = ctypes.c_int
+_L.volcomp_shim_decode_block_typed.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint, ctypes.c_uint,
+                                               ctypes.c_uint, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+_L.volcomp_shim_chunk_dtype.restype = ctypes.c_int
+_L.volcomp_shim_chunk_dtype.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int)]
 _L.volcomp_shim_deblock.restype = None
 _L.volcomp_shim_deblock.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_float]
 
@@ -87,6 +105,7 @@ ENCODE_BOUND = _L.volcomp_shim_encode_bound()
 MASK_LL_BOUND = _L.volcomp_shim_mask_ll_bound()  # 9 + 128^3/8 = 262 153
 SURFACE_BOUND = _L.volcomp_shim_surface_bound()
 SURFACE_THRESHOLD = 128  # the default exact threshold of a surface chunk: u8 >= 128 is p >= 0.5
+TYPED_ENCODE_BOUND = _L.volcomp_shim_typed_encode_bound(5)  # 10 + 128^3 * 4: the largest typed chunk
 
 
 def _check(st):
@@ -269,3 +288,78 @@ def deblock(vol, nz, ny, nx, q, zero_guard=True):
     if n != nz * ny * nx:
         raise VolcompError("volume size does not match nz*ny*nx")
     _L.volcomp_shim_deblock_ex(p, nz, ny, nx, q, DEBLOCK_ZERO_GUARD if zero_guard else 0)
+
+
+def _dtype_code(dtype):
+    """volcomp_dtype code of a numpy dtype / type / name ("uint16", np.uint16, np.dtype("<u2")) or an int code."""
+    if isinstance(dtype, int):
+        if dtype in DTYPE_NAMES:
+            return dtype
+        raise VolcompError(f"unknown dtype code {dtype}")
+    name = getattr(dtype, "name", None)
+    if not isinstance(name, str):
+        name = getattr(dtype, "__name__", None) or str(dtype)
+    if name not in DTYPES:
+        raise VolcompError(f"volcomp has no element type {dtype!r}; one of {sorted(DTYPES)}")
+    return DTYPES[name]
+
+
+def dtype_size(dtype):
+    """Bytes per element of a volcomp dtype (1, 2 or 4)."""
+    return _L.volcomp_shim_dtype_size(_dtype_code(dtype))
+
+
+def typed_encode_bound(dtype):
+    """The largest chunk encode_typed writes for this dtype: 10 + 128^3 * size (8 + 128^3 for uint8)."""
+    return _L.volcomp_shim_typed_encode_bound(_dtype_code(dtype))
+
+
+def encode_typed(src, dtype, q=0.0):
+    """src: 128^3 z-major elements of `dtype` in host byte order (bytes-like, e.g. a C-contiguous
+    numpy array) -> a volcomp TYPED chunk.
+
+    dtype: uint16, int16, uint32, int32 or float32 (or uint8: the u8 lossless mode, q = 0 only).
+    q = 0 (Q_LOSSLESS) is exact (mode 7); q > 0 is error-bounded (mode 8): every element
+    decodes within q / 2 of its source. An integer dtype uses the step floor(q) (< 2: exact);
+    a chunk mode 8 cannot represent (NaN or infinity, out-of-range steps) is stored exactly.
+    """
+    code = _dtype_code(dtype)
+    p, n, keep = _buf(src)
+    want = CHUNK_VOXELS * _L.volcomp_shim_dtype_size(code)
+    if n != want:
+        raise VolcompError(f"source must be {want} bytes for {DTYPE_NAMES[code]}, got {n}")
+    cap = _L.volcomp_shim_typed_encode_bound(code)
+    out = ctypes.create_string_buffer(cap)
+    got = ctypes.c_size_t()
+    _check(_L.volcomp_shim_encode_typed(p, code, q, out, cap, ctypes.byref(got)))
+    return out.raw[: got.value]
+
+
+def decode_typed(enc, dtype, out=None):
+    """enc: a chunk of element type `dtype` -> bytearray of 128^3 elements in host byte order (or
+    fills `out`, a writable buffer of 128^3 * dtype_size(dtype) bytes, e.g. a numpy array).
+    Raises VolcompError if the chunk holds another dtype (chunk_dtype tells which)."""
+    code = _dtype_code(dtype)
+    p, n, keep = _buf(enc)
+    dst = out if out is not None else bytearray(CHUNK_VOXELS * _L.volcomp_shim_dtype_size(code))
+    dp, dn, dkeep = _buf(dst)
+    _check(_L.volcomp_shim_decode_typed(p, n, dp, dn, code))
+    return dst
+
+
+def decode_block_typed(enc, bz, by, bx, dtype):
+    """Block (bz, by, bx), each 0..7, of a chunk as 16^3 elements of `dtype` (a bytearray)."""
+    code = _dtype_code(dtype)
+    p, n, keep = _buf(enc)
+    dst = bytearray(BLOCK_VOXELS * _L.volcomp_shim_dtype_size(code))
+    dp, dn, dkeep = _buf(dst)
+    _check(_L.volcomp_shim_decode_block_typed(p, n, bz, by, bx, dp, dn, code))
+    return dst
+
+
+def chunk_dtype(enc):
+    """The element type a chunk decodes to, as a numpy name: "uint8" for the u8 modes, else the typed chunk's."""
+    p, n, keep = _buf(enc)
+    out = ctypes.c_int()
+    _check(_L.volcomp_shim_chunk_dtype(p, n, ctypes.byref(out)))
+    return DTYPE_NAMES[out.value]

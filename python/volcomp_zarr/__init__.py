@@ -1,4 +1,5 @@
-"""zarr v3 codec "volcomp" (array -> bytes) for 128^3 uint8 chunks.
+"""zarr v3 codec "volcomp" (array -> bytes) for 128^3 chunks: uint8, and through the typed
+modes (format revision 5) uint16, int16, uint32, int32 and float32.
 
     import volcomp_zarr            # registers the codec with zarr >= 3
     z = zarr.open("…/volume.zarr/0")   # sharding_indexed(1024^3) -> volcomp(q) inner 128^3 chunks
@@ -7,18 +8,22 @@ The low-level binding (encode/decode/decode_block/deblock over bytes) lives in
 volcomp_zarr._lib and needs only the standard library; the codec class below
 needs zarr >= 3 and numpy and is skipped if they are not installed.
 """
-from ._lib import (BLOCK_VOXELS, CHUNK_DIM, CHUNK_VOXELS, ENCODE_BOUND, MASK_DIM, MASK_LL_BOUND,
+from ._lib import (BLOCK_VOXELS, CHUNK_DIM, CHUNK_VOXELS, DTYPES, ENCODE_BOUND, MASK_DIM, MASK_LL_BOUND,
                    MASK_LL_DIM, MASK_LL_VOXELS, MASK_VOXELS, Q_LOSSLESS, SURFACE_BOUND, SURFACE_THRESHOLD,
-                   VERSION, VolcompError, deblock, decode, decode_block, decode_smooth, encode, is_lossless,
-                   mask_decode_stored, mask_encode, mask_encode_lossless, mask_info, stream_q,
-                   surface_encode, surface_info)
+                   TYPED_ENCODE_BOUND, VERSION, VolcompError, chunk_dtype, deblock, decode, decode_block,
+                   decode_block_typed, decode_smooth, decode_typed, dtype_size, encode, encode_typed,
+                   is_lossless, mask_decode_stored, mask_encode, mask_encode_lossless, mask_info, stream_q,
+                   surface_encode, surface_info, typed_encode_bound)
 
 __all__ = ["set_read_smoothing", "encode", "decode", "decode_block", "decode_smooth", "deblock", "stream_q", "is_lossless", "mask_encode",
            "mask_encode_lossless", "mask_info", "mask_decode_stored", "VolcompError", "VERSION",
            "ENCODE_BOUND", "Q_LOSSLESS", "CHUNK_DIM", "CHUNK_VOXELS", "BLOCK_VOXELS", "MASK_DIM",
            "MASK_VOXELS", "MASK_LL_DIM", "MASK_LL_VOXELS", "MASK_LL_BOUND", "VolcompCodec",
-           "surface_encode", "surface_info", "SURFACE_BOUND", "SURFACE_THRESHOLD"]
+           "surface_encode", "surface_info", "SURFACE_BOUND", "SURFACE_THRESHOLD",
+           "encode_typed", "decode_typed", "decode_block_typed", "chunk_dtype", "dtype_size",
+           "typed_encode_bound", "DTYPES", "TYPED_ENCODE_BOUND"]
 
+import math as _math
 import os as _os
 
 # Reader-side deblocking (decode_smooth), off by default. It is a property of the
@@ -47,11 +52,20 @@ try:  # zarr v3 codec registration (optional dependency)
     from zarr.core.common import JSON, parse_named_configuration
     from zarr.registry import register_codec
 
+    def _native(dtype):
+        """the numpy dtype of a zarr data type (zarr >= 3.1 wraps them), in host byte order"""
+        dt = np.dtype(dtype.to_native_dtype() if hasattr(dtype, "to_native_dtype") else dtype)
+        return dt.newbyteorder("=")
+
     @dataclass(frozen=True)
     class VolcompCodec(ArrayBytesCodec):
-        """{"name": "volcomp", "configuration": {"q": 8}} — uint8, 128^3 chunks only.
+        """{"name": "volcomp", "configuration": {"q": 8}} — 128^3 chunks.
 
-        q = 0 (Q_LOSSLESS) is the exact codec; q in 1..255 is the lossy DCT codec.
+        The array's data_type picks the codec. uint8: q = 0 (Q_LOSSLESS) is the exact codec
+        and q in 1..255 the lossy DCT codec. uint16 / int16 / uint32 / int32 / float32: the
+        typed modes, where q = 0 is exact and q > 0 (in value units, any size) bounds the error,
+        |x - decoded| <= q / 2 for every element (float32 NaN / infinity chunks are kept exact;
+        spec/format.md §14). The modes below are uint8 only.
         {"mode": "mask"} instead selects the binary MASK mode: the chunk is taken
         as a mask (nonzero = 1), its 2x2x2 majority pool is stored exactly, and
         decoding returns that grid trilinearly interpolated back to 128^3 as a
@@ -97,26 +111,47 @@ try:  # zarr v3 codec registration (optional dependency)
                     raise ValueError(f"volcomp: surface mode needs q in 2..255, got {self.q}")
                 if not 1 <= self.threshold <= 255:
                     raise ValueError(f"volcomp: threshold must be 1..255, got {self.threshold}")
-            elif not (self.q == 0.0 or 1.0 <= self.q <= 255.0):
-                raise ValueError(f"volcomp: q must be 0 (lossless) or 1..255, got {self.q}")
+            elif not (_math.isfinite(self.q) and self.q >= 0.0):
+                # the range depends on the array's dtype: checked in validate()
+                raise ValueError(f"volcomp: q must be 0 (lossless) or positive, got {self.q}")
+
+        def _check_dtype(self, dt) -> None:
+            if dt.name == "uint8":
+                if self.mode == "q" and not (self.q == 0.0 or 1.0 <= self.q <= 255.0):
+                    raise ValueError(f"volcomp: q must be 0 (lossless) or 1..255 for uint8, got {self.q}")
+                return
+            if dt.name not in DTYPES:
+                raise ValueError(f"volcomp codec supports {', '.join(DTYPES)} data, got {dt}")
+            if self.mode != "q":
+                raise ValueError(f'volcomp: mode "{self.mode}" is uint8 only, the array is {dt}')
 
         def validate(self, *, shape, dtype, chunk_grid) -> None:  # noqa: D401
-            if str(np.dtype(dtype.to_native_dtype() if hasattr(dtype, "to_native_dtype") else dtype)) != "uint8":
-                raise ValueError("volcomp codec requires uint8 data")
+            self._check_dtype(_native(dtype))
             cs = tuple(chunk_grid.chunk_shape)
             if cs != (CHUNK_DIM,) * 3:
                 raise ValueError(f"volcomp codec requires 128^3 (inner) chunks, got {cs}")
 
         def evolve_from_array_spec(self, array_spec: ArraySpec) -> "VolcompCodec":
+            self._check_dtype(_native(array_spec.dtype))
             return self
 
         def compute_encoded_size(self, input_byte_length: int, chunk_spec: ArraySpec) -> int:
+            dt = _native(chunk_spec.dtype)
+            if dt.name != "uint8":
+                return typed_encode_bound(dt.name)
             return SURFACE_BOUND if self.mode == "surface" else ENCODE_BOUND
 
         async def _encode_single(self, chunk_array: NDBuffer, chunk_spec: ArraySpec) -> Buffer | None:
-            arr = np.ascontiguousarray(chunk_array.as_numpy_array(), dtype=np.uint8)
+            dt = _native(chunk_spec.dtype)
+            arr = np.ascontiguousarray(chunk_array.as_numpy_array(), dtype=dt)
             if arr.shape != (CHUNK_DIM,) * 3:
                 raise ValueError(f"volcomp: chunk must be 128^3, got {arr.shape}")
+            if dt.name != "uint8":
+                # all-zero bytes (no -0.0) under an all-zero-bytes fill value -> stored as missing
+                fill_zero = not np.array([chunk_spec.fill_value], dtype=dt).view(np.uint8).any()
+                if fill_zero and not arr.view(np.uint8).any():
+                    return None
+                return chunk_spec.prototype.buffer.from_bytes(encode_typed(arr, dt.name, self.q))
             if not arr.any() and not chunk_spec.fill_value:
                 return None  # all-zero chunk -> stored as missing (fill value is 0 too)
             raw = arr.tobytes()
@@ -131,8 +166,13 @@ try:  # zarr v3 codec registration (optional dependency)
             return chunk_spec.prototype.buffer.from_bytes(enc)
 
         async def _decode_single(self, chunk_bytes: Buffer, chunk_spec: ArraySpec) -> NDBuffer:
-            out = np.empty((CHUNK_DIM,) * 3, dtype=np.uint8)
+            dt = _native(chunk_spec.dtype)
             raw = chunk_bytes.as_numpy_array().tobytes()
+            if dt.name != "uint8":
+                out = np.empty((CHUNK_DIM,) * 3, dtype=dt)
+                decode_typed(raw, dt.name, out.reshape(-1).view(np.uint8))
+                return chunk_spec.prototype.nd_buffer.from_numpy_array(out)
+            out = np.empty((CHUNK_DIM,) * 3, dtype=np.uint8)
             if _READ_SMOOTH > 0:
                 decode_smooth(raw, _READ_SMOOTH, out.reshape(-1).view(np.uint8), zero_guard=True, gated=True)
             else:
