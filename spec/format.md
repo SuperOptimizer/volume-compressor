@@ -1,4 +1,4 @@
-# volcomp stream format, version 1 (revision 4)
+# volcomp stream format, version 1 (revision 5)
 
 Normative. A conforming decoder accepts exactly the streams described here and
 rejects everything else with `VOLCOMP_ERR_CORRUPT` (or `VOLCOMP_ERR_VERSION`
@@ -7,7 +7,8 @@ stated otherwise.
 
 ## 1. Terms and geometry
 
-- **voxel**: one `uint8` sample.
+- **voxel**: one `uint8` sample. A typed chunk (§14) holds **elements** of a
+  16- or 32-bit type instead, in the same geometry.
 - **block**: 16×16×16 voxels, the transform and random-access unit. Block
   voxel index `v = z*256 + y*16 + x`.
 - **chunk**: 128×128×128 voxels = 8×8×8 blocks, the independently decodable
@@ -26,7 +27,8 @@ offset  size   field
 4       1      version = 1
 5       1      mode   0 = lossy DCT (this section), 1..3 = lossless (§10),
                       4 = binary mask (§11), 5 = lossless binary mask (§12),
-                      6 = surface chunk (§13)
+                      6 = surface chunk (§13), 7 = typed, exact (§14),
+                      8 = typed, error-bounded (§14)
 6       2      q_raw  u16, quantiser step q = q_raw / 256, 256 <= q_raw <= 65280
 8       T      frequency tables (§4.3), 10 models
 8+T     256    directory: 32 × { u32 tok_n, u32 bypass_n }
@@ -48,11 +50,15 @@ already rejects: the mode byte is the compatibility mechanism. Revision 1
 `VOLCOMP_ERR_CORRUPT`; revision 2 (volcomp 1.1.0) adds mode 4, the binary mask
 chunk of §11, and changes nothing else; revision 3 (volcomp 1.2.0) adds mode 5,
 the spatially lossless binary mask chunk of §12, and changes nothing else;
-revision 4 (volcomp 1.3.0, `VOLCOMP_FORMAT_REVISION`) adds mode 6, the surface
-chunk of §13, and changes nothing else. A writer must not emit a mode-4 chunk to a
-consumer that only reads revision 1, a mode-5 chunk to one that only reads
-revision 2, nor a mode-6 chunk to one that only reads revision 3; that consumer
-will refuse it cleanly rather than misread it.
+revision 4 (volcomp 1.3.0) adds mode 6, the surface chunk of §13, and changes
+nothing else; revision 5 (volcomp 1.4.0, `VOLCOMP_FORMAT_REVISION`) adds modes 7
+and 8, the typed chunks of §14 (16- and 32-bit integer and binary32 elements,
+exact and error-bounded), and changes nothing else. A writer must not emit a
+mode-4 chunk to a consumer that only reads revision 1, a mode-5 chunk to one
+that only reads revision 2, a mode-6 chunk to one that only reads revision 3,
+nor a mode-7 or mode-8 chunk to one that only reads revision 4; that consumer
+will refuse it cleanly rather than misread it. A revision-5 reader asked for
+`uint8` voxels from a typed chunk refuses it too (§14.8).
 
 ## 3. Encoding pipeline (informative summary; §4–§6 are normative)
 
@@ -183,7 +189,8 @@ Tokens per block ≤ 8192; bypass bits per block ≤ 18 + 4095·(11 + 12 + 1)
 at most 10 bits per token; the bound is kept loose). Therefore the
 encoded size of any chunk is at most
 `8 + 680 + 256 + 32·(2·16·8192 + 8) + 512·12288 = 14 681 264` bytes
-(`VOLCOMP_ENCODE_BOUND`).
+(`VOLCOMP_ENCODE_BOUND`). A typed chunk (§14) has its own, smaller bound,
+`10 + 2 097 152 · S` for elements of `S` bytes (§14.7).
 
 ## 9. Label chunks (removed)
 
@@ -559,3 +566,236 @@ block (it decodes the whole chunk, since the refinement is one adaptive pass).
 `q` is finer than a mode-0 chunk at the same `q`: surface q 48 is about the size
 of mode-0 q 16); `volcomp_is_lossless` is false; `volcomp_surface_info` returns
 `thr` and `M`. Measurements: `docs/surface_mode.md`.
+
+## 14. Typed chunks (modes 7 and 8)
+
+A typed chunk stores 128³ **elements** of a 16- or 32-bit type — unsigned or
+signed integers, or IEEE-754 binary32 floats — in §1's geometry, element index
+`(z*128 + y)*128 + x`. Mode 7 is exact. Mode 8 stores one integer `k` per
+element and reconstructs it as `k · q` for a step `q` carried in the header; the
+encoder guarantees `|x − x̂| ≤ q/2` for every element (§14.6).
+
+```
+offset  size  field
+0       8     header: magic, version 1, mode = 7 or 8, q_raw = 0
+8       1     dtype   1 u16, 2 i16, 3 u32, 4 i32, 5 f32
+9       1     form    0 CODED, 1 CONST, 2 RAW (mode 7 only)
+10      4     mode 8 only: q, binary32, little-endian
+H       P     payload, per form;  H = 10 (mode 7) or 14 (mode 8)
+```
+
+The element size `S` is 2 for dtypes 1 and 2 and 4 for dtypes 3, 4 and 5. A dtype
+of 0 (the `uint8` modes 0..6 have no dtype byte) or above 5 is
+`VOLCOMP_ERR_CORRUPT`; so is a form above 2 in mode 7 or above 1 in mode 8. In
+mode 8, `q` must be finite and greater than 0, and for an integer dtype it must
+also be an integer of at least 2; any other `q` is corrupt.
+
+```
+form 0  CODED  frequency tables, directory and 32 substreams (§14.3)
+form 1  CONST  mode 7: P = S, the element, little-endian;
+               mode 8: P = 4, k as a little-endian i32; every element is that one
+form 2  RAW    P = 2 097 152 · S, the elements, little-endian, in chunk index order
+```
+
+Exact accounting is normative: `H + P` is the stream length, with `P` fixed as
+above for CONST and RAW and accounted for CODED as in §14.3.
+
+### 14.1 Element codes
+
+Every element is coded as an unsigned **code** `c` of `W` bits: `W = 16` for
+dtypes 1 and 2 and `W = 32` for dtypes 3 to 5 in mode 7, and `W = 32` in mode 8,
+whose coded field is `k`:
+
+```
+u16, u32   c = the value
+i16        c = the element's bits XOR 0x8000
+i32        c = the element's bits XOR 0x80000000
+f32        b = the element's bit pattern;  c = NOT b if bit 31 of b is set, else b XOR 0x80000000
+mode 8     c = the bits of k as an i32 XOR 0x80000000
+```
+
+Each map is a bijection on `W`-bit patterns, so mode 7 returns every element bit
+for bit: every NaN payload, both zeros and both infinities. Codes order like the
+values they code (for f32, IEEE-754's total order, which puts negative NaNs below
+−∞ and positive NaNs above +∞). The centre code `2^(W−1)` is 0 for the signed
+types (+0.0 for f32, `k = 0` in mode 8) and mid-range for u16 and u32. The decoder
+inverts the map; for f32,
+`b = c XOR 0x80000000` if bit 31 of `c` is set, else `NOT c`.
+
+### 14.2 Prediction and residuals
+
+As §10, in `W`-bit modular arithmetic. For element
+`i = (z·16 + y)·16 + x` of a block, `pred` is the code at `(z−1, y, x)`, or at
+`(0, y−1, x)` when `z = 0`, or at `(0, 0, x−1)` when `z = y = 0`, or `2^(W−1)` at
+`i = 0`. With `d = (c − pred) mod 2^W` read as a two's-complement `W`-bit integer
+`s`, the residual is `u = zigzag(s) = (2s XOR (s >> (W−1))) mod 2^W`, where
+`s >> (W−1)` is an arithmetic shift (−1 for negative `s`, else 0), so
+`0 ≤ u < 2^W`; `unzig(u) = ((u >> 1) XOR −(u AND 1)) mod 2^W` inverts it. Prediction never
+crosses a block, so blocks stay independently decodable.
+
+### 14.3 The coded form
+
+```
+offset  size   field
+H       T      frequency tables (§14.4), 66 models
+H+T     D      directory: 32 × { LEB128 tok_n, LEB128 bypass_n }
+H+T+D   P'     payload: for s = 0..31: tok_n[s] token bytes then bypass_n[s] bypass bytes
+```
+
+Exact accounting is normative: `H + T + D + Σ(tok_n[s] + bypass_n[s])` must equal
+the stream length. Per substream: `3 ≤ tok_n ≤ 131 144` and
+`bypass_n ≤ 8192·W + 8`. §1's substreams (16 consecutive blocks each), §4.3's
+two-lane tANS (initial states, flush, zero padding, both lanes ending at state 0,
+exact consumption of `tok_n`) and §4.4's bypass stream (LSB-first, exact
+consumption of `bypass_n`, zero padding) apply unchanged, so a single block
+decodes from its one substream and is identical to the same region of the full
+decode.
+
+**Tokens.** The alphabet has 64 tokens. A value `u` is coded with §10's
+HybridUint: `u < 16` is token `u` with no bypass bits; otherwise token
+`12 + msb(u)`, with the low `msb(u)` bits of `u` written to the bypass stream
+LSB-first. Values reach `2^32 − 1`, so tokens reach 43; token 63 is EOB, and
+tokens 44..62 are never used. Token caps are normative and are checked before any
+bypass bit is read: a run token is at most 23 (`run ≤ 4095`) and a level token at
+most `11 + W`.
+
+### 14.4 Frequency tables
+
+For each model `m = 0..65` in order: the presence bitmap `B` (bit `t` set iff
+`freq[t] > 0`) as two canonical LEB128 values, bits 0..31 then bits 32..63; then,
+for each set bit in ascending order, the frequency as a canonical LEB128
+(1 ≤ freq ≤ 1024). `B` must be nonzero and may set only bits 0..43 and 63; the
+frequencies must sum to exactly 1024 and are not renormalised. The tANS table of
+each model is built from them exactly as §4.3 builds a 32-token one, spreading
+the symbols in ascending token order. (A model the chunk does not use is coded as
+the single token 0 at 1024: four bytes.)
+
+**Models.** 0 block mode; 1..2 SPARSE runs and EOB; 3..4 SPARSE levels;
+5..64 DENSE residuals by context (§14.5); 65 DENSE residuals of a block's first
+row.
+
+**Block sequence.** Each block starts with a mode token from model 0, at most 3:
+
+- `0 CONST` — `W` bypass bits hold the code of all 4096 elements.
+- `1 SPARSE` — `(run, level)*` then `EOB` over the residuals, as in §10: `run`
+  zero residuals are skipped, coded with model `1 + (prev_run ≠ 0)` (`prev_run = 1`
+  at the start of the block); `level` is `u − 1` for the nonzero residual `u` that
+  follows, coded with model `3 + (run ≠ 0)`; `EOB` uses the run model.
+  `pos + run ≤ 4095` and `level ≤ 2^W − 2` are normative.
+- `2 DENSE` — 4096 tokens, one residual each in index order, with the models of
+  §14.5.
+- `3 RAW` — `4096 · W` bypass bits, the codes in index order.
+
+The codes of a SPARSE or DENSE block are rebuilt from its residuals by §14.2.
+
+### 14.5 DENSE contexts
+
+The residual along z is the field's z-gradient, which changes slowly on a smooth
+field, so the residual one plane back, `a`, is most of the next one, and the
+residual one row back, `b`, tells which way it is drifting. For residual `i` of a
+block, with `y = (i >> 4) AND 15` and `u[·]` the residuals already decoded in the
+block:
+
+```
+i < 16                    model 65
+16 ≤ i < 256              model 5 + 3·cls(u[i − 16]) + 1
+i ≥ 256 and y = 0         model 5 + 3·cls(u[i − 256]) + 1
+i ≥ 256 and y > 0         model 5 + 3·cls(a) + g,   a = u[i − 256], b = u[i − 16],
+                          g = 0 if unzig(b) < unzig(a), 1 if equal, 2 if greater
+                          (unzig as W-bit two's-complement values)
+
+cls(a) = a for a < 16; 16 for 16..31; 17 for 32..63; 18 for 64..127; 19 for a ≥ 128
+```
+
+Both neighbours are 256 and 16 residuals back, so the context is never on the
+entropy decoder's critical path. On a smooth winding-like field, the residuals of
+block interiors have a conditional entropy of 1.41 bits under `cls(a)` alone and
+1.07 with `g` added.
+
+### 14.6 Mode 8: reconstruction and error bound
+
+Each element decodes from its `k` (the one `k` of a CONST chunk; otherwise
+`k = (c XOR 0x80000000)` as an i32) as:
+
+```
+integer dtypes   x̂ = clamp(k · q, min, max) of the dtype; k · q is an exact integer
+f32              x̂ = binary32(binary64(k) × binary64(q)): the product rounded to binary64,
+                 then to binary32, both round-to-nearest-even, overflowing to ±∞
+```
+
+(Computing an integer dtype's `k · q` in binary64 gives the same result: a
+product binary64 cannot hold exactly is beyond `2^53` and clamps to the same end.)
+Decoding is integer and IEEE arithmetic only, so every conforming decoder is
+bit-identical; an implementation must not flush binary32 subnormals to zero.
+
+The rest of this section is the reference encoder (`volcomp_encode_typed`); a
+decoder does not depend on it. It is called with a requested step `q_req > 0` and
+guarantees, for every element `x` and its decoded `x̂`,
+**`|x − x̂| ≤ q_req / 2`**, by choosing the stored step `q ≤ q_req` and each `k`:
+
+- **Integer dtypes.** `q = floor(q_req)`, and `k = x / q` rounded to the nearest
+  integer, ties away from zero, in exact integer arithmetic, so
+  `|x − k·q| ≤ q/2`; clamping moves `k·q` toward `x`, which lies in the type's
+  range, so the bound survives it. A fractional step cannot keep a bound below 1
+  for every integer: with `q = 1.6` the reconstructions round to 0, 2, 3, 5, …,
+  and `x = 1` is 1 from the nearest of them, more than 0.8. If `floor(q_req) < 2`
+  the encoder writes mode 7, which is exact.
+- **f32.** Let `M = max|x| + q_req/2` over the chunk and `ulp = 2^(⌊log2 M⌋ − 23)`
+  (at least `2^−149`), the binary32 spacing at `M`. The stored step `q` is the
+  largest binary32 not above `q_req − 2·ulp`. For each `x`,
+  `k0 = ⌊x/q + 1/2⌋` (binary64), and `k` is the first of `k0`, `k0 − 1`, `k0 + 1`
+  whose reconstruction lies within `q_req/2` of `x`. One of them always does: the
+  integer `k*` nearest `x/q` has `|x − k*·q| ≤ q/2` and `|k*·q| ≤ M`, and the two
+  roundings move `k*·q` by at most `ulp/2 + 2^−53·M < ulp`, so
+  `|x − x̂| < q/2 + ulp ≤ q_req/2`. (With `q = q_req` no `k` need exist: when the
+  binary32 values within `q_req/2` of `x` round from an interval narrower than
+  `q_req`, a multiple of `q_req` can miss it, and the nearest reconstruction is
+  then up to one ulp beyond the bound.)
+
+The encoder writes mode 7 instead of mode 8 — exact, hence within any bound, and
+never an error — when the chunk cannot be represented:
+
+- an f32 element is NaN or ±∞ (NaN has no `k`; the chunk is kept bit for bit);
+- f32: `q_req − 2·ulp ≤ 0`, i.e. `max|x|` at about `2^22 · q_req` or more, where the
+  binary32 grid near the largest values is too coarse for any step;
+- some `k` falls outside the i32 range (only u32 with `floor(q_req) = 2` and
+  `x = 2^32 − 1`);
+- the coded mode-8 chunk would not be smaller than a RAW mode-7 chunk,
+  `10 + 2 097 152 · S` bytes.
+
+A chunk whose elements are all bit-identical is a mode-7 CONST chunk at any
+`q_req`; a mode-8 chunk in which every `k` is equal is the CONST form. The sign of
+a zero is not kept by mode 8 (`k = 0` decodes to +0.0).
+
+### 14.7 Bounds
+
+The encoder writes the RAW form whenever the coded form of a mode-7 chunk would be
+`10 + 2 097 152 · S` bytes or more, and writes mode 8 only when it is smaller than
+that, so a typed chunk is never larger than `10 + 2 097 152 · S` bytes:
+4 194 314 for 16-bit and 8 388 618 for 32-bit elements
+(`VOLCOMP_TYPED_ENCODE_BOUND` is the latter). The directory limits follow §10's
+reasoning: a block has at most `1 + 4096` tokens (DENSE) or `1 + 2·2048 + 1`
+(SPARSE, which the reference encoder uses for at most 2048 nonzero residuals),
+at most 10 bits each, kept loose as `2·16·4098 + 8 = 131 144` token bytes per
+substream; and a block's bypass bits are at most `4096 · W` (a RAW block; the
+encoder picks RAW whenever its estimate for the block reaches that), i.e.
+`16 · 512 · W + 8 = 8192·W + 8` bytes per substream.
+
+### 14.8 Notes for readers
+
+`volcomp_decode`, `volcomp_decode_block` and `volcomp_decode_smooth` return
+`VOLCOMP_ERR_ARG` for a typed chunk; `volcomp_decode_typed` and
+`volcomp_decode_block_typed` read it into elements of its dtype (and refuse any
+other dtype), and `volcomp_chunk_dtype` reports the dtype without decoding.
+`volcomp_is_lossless` is true for mode 7 and false for mode 8;
+`volcomp_stream_q` reports 0 for mode 7 and the stored step `q` (≤ `q_req`) for
+mode 8. In a zarr v3 store the chunk codec is the same `"volcomp"` serializer:
+the array's `data_type` (`uint16`, `int16`, `uint32`, `int32`, `float32`)
+selects the typed modes and its `q` is `q_req`, 0 for mode 7.
+
+Measured on a smooth winding-like `u16` chunk (`W · 256`: a radial ramp of one
+turn per 30 voxels around an axis outside the chunk, plus waves; 4 194 304 raw
+bytes; `tests/test_typed.c`): mode 7, 371 352 bytes (11.3x); mode 8 at `q_req`
+2 / 8 / 32, 331 989 / 224 826 / 114 396 bytes (12.6x / 18.7x / 36.7x), with a
+maximum error of exactly `q_req/2`. zstd-19 of the same raw chunk is 959 110 bytes,
+and byte-shuffled z-deltas under zstd-19 are 361 041.

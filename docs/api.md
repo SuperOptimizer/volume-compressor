@@ -15,7 +15,11 @@ no dependencies beyond libc/libm.
 | **0** (`VOLCOMP_Q_LOSSLESS`) | predictive, exact | none — decoded bytes are the source bytes | class maps, masks, valid/occupancy flags, anything whose values *are* the data (a wrong label is not a "small" error), and archival copies |
 | **1..255** | 3-D DCT + dead-zone quantiser | P99 ≈ 2.5 q on scroll data | greyscale CT and model probability maps, where 20–200× at a controlled error is the point |
 
-and there are two further modes for **binary masks** (below):
+Volumes of other element types (`uint16`, `int16`, `uint32`, `int32`,
+`float32`) have their own pair of modes, exact and error-bounded:
+[Typed volumes](#typed-volumes-modes-7-and-8) below.
+
+There are also two further modes for **binary masks** (below):
 `volcomp_mask_encode`, where half the spatial resolution costs 30× less than
 storing the mask exactly, and `volcomp_mask_encode_lossless`, which stores the
 mask itself, voxel for voxel, for 4× that. A **surface** mode,
@@ -151,6 +155,95 @@ q16. Details and the full candidate study: [`docs/surface_mode.md`](surface_mode
 Format: [`spec/format.md`](../spec/format.md) §13. A revision-3 reader refuses these
 chunks cleanly.
 
+## Typed volumes (modes 7 and 8)
+
+```c
+size_t cap = volcomp_typed_encode_bound(VOLCOMP_DTYPE_U16);   /* 10 + 128^3 * 2 */
+st = volcomp_encode_typed(src /* 128^3 uint16_t, z-major */, VOLCOMP_DTYPE_U16, 0.0f, enc, cap, &n); /* exact */
+st = volcomp_encode_typed(src, VOLCOMP_DTYPE_U16, 16.0f, enc, cap, &n);  /* |x - x_hat| <= 8 everywhere */
+st = volcomp_decode_typed(enc, n, dst, 128 * 128 * 128 * sizeof(uint16_t), VOLCOMP_DTYPE_U16);
+st = volcomp_decode_block_typed(enc, n, bz, by, bx, blk, 4096 * sizeof(uint16_t), VOLCOMP_DTYPE_U16);
+volcomp_dtype dt; st = volcomp_chunk_dtype(enc, n, &dt);   /* VOLCOMP_DTYPE_U8 for modes 0..6 */
+```
+
+For volumes whose elements are not bytes: `VOLCOMP_DTYPE_U16`, `I16`, `U32`, `I32`
+and `F32` (IEEE binary32), 128³ elements per chunk in host byte order (the stream
+is little-endian). The chunk keeps the u8 lossless mode's geometry and coder,
+widened to the element: 16³ blocks, 32 substreams, prediction one step back along
+z, CONST / SPARSE / DENSE / RAW blocks, the same tANS. DENSE residuals are coded
+under the class of the residual one plane back and the sign of the drift seen
+one row back, which is what makes a smooth field cheap. A float is coded as its
+order-preserving bit pattern.
+
+- **`q = 0`, mode 7: exact.** Every element comes back bit for bit, every NaN
+  payload, -0 and both infinities included. The chunk is never larger than
+  `volcomp_typed_encode_bound(dt)` = `10 + 128³ · size` bytes, i.e. raw + 10.
+  `VOLCOMP_TYPED_ENCODE_BOUND` (8 388 618) covers every dtype.
+- **`q > 0`, mode 8: error-bounded.** The chunk stores `k = round(x / q)` per
+  element and decodes `k · q` in the element type, and **`|x - x_hat| <= q/2` for
+  every element**, guaranteed:
+  - Integer dtypes use the step `floor(q)`, an integer, because a fractional step
+    cannot keep a bound below 1 for every integer (at `q = 1.6`, `x = 1` is 1 from
+    every reconstruction). `k · q` is clamped to the type's range, which only
+    moves it closer. `floor(q) < 2` is exact.
+  - Float32 stores a step slightly below `q`: `q` less two binary32 ulps of the
+    chunk's largest magnitude. The binary32 rounding of `k · q` can then never
+    push an element past `q/2`; at `q` itself it could, by up to one ulp.
+  - **NaN and infinity:** a float32 chunk containing any is written as mode 7.
+    It is kept exactly and the call does not fail.
+  - **Range:** a chunk that mode 8 cannot represent within the bound is written
+    as mode 7 too. That covers a float32 chunk whose largest magnitude is about
+    `2^22 · q` or more (the binary32 grid there is too coarse for any step) and a
+    `k` outside i32 (only u32 at `floor(q) = 2` and `x = 2^32 - 1`). So does a
+    chunk whose mode-8 form would not be smaller than raw.
+  - `volcomp_stream_q()` reports the stored step (≤ `q`), or 0 when the chunk
+    is mode 7, and `volcomp_is_lossless()` tells the two apart.
+- A chunk of bit-identical elements is 10 + size bytes at any `q`. A mode-8
+  chunk whose `k` is the same everywhere is 18 bytes.
+
+`volcomp_decode`, `volcomp_decode_block` and `volcomp_decode_smooth` refuse a
+typed chunk with `VOLCOMP_ERR_ARG`. `volcomp_decode_typed` refuses a dtype other
+than the chunk's, also with `VOLCOMP_ERR_ARG`, and accepts `VOLCOMP_DTYPE_U8` for
+the u8 modes, where it is `volcomp_decode`. `volcomp_encode_typed` with
+`VOLCOMP_DTYPE_U8` is the u8 lossless mode and takes `q = 0` only. Encoding makes
+one `VOLCOMP_MALLOC`: about 21 MB of scratch for 4-byte elements, 17 MB for
+2-byte ones. Decoding a coded typed chunk makes one, about 290 KB of tables. The
+typed coder is integer arithmetic, plus the IEEE binary32/binary64 operations of
+mode 8's float reconstruction. Its streams and decodes are therefore identical
+on every build.
+
+Measured on a smooth winding-like `uint16` chunk: `W · 256`, a radial ramp of one
+turn per 30 voxels around an axis outside the chunk, plus waves. Raw is
+4 194 304 bytes; `tests/test_typed.c` prints this table.
+
+| `q` | mode | bytes | ratio | max error |
+|--:|--:|--:|--:|--:|
+| 0 | 7 | 371 352 | 11.3x | 0 |
+| 2 | 8 | 331 989 | 12.6x | 1 |
+| 4 | 8 | 308 272 | 13.6x | 2 |
+| 8 | 8 | 224 826 | 18.7x | 4 |
+| 16 | 8 | 194 644 | 21.5x | 8 |
+| 32 | 8 | 114 396 | 36.7x | 16 |
+| 64 | 8 | 63 920 | 65.6x | 32 |
+
+For comparison, zstd-19 of the raw chunk is 959 110 bytes, byte shuffle + zstd-19
+is 746 136, and z-deltas + byte shuffle + zstd-19 is 361 041.
+
+Throughput on this field: mode 7 encodes at about 100 MB/s and decodes at
+230-280 MB/s per core, counting u16 bytes. Mode 8 decodes at 430-580 MB/s from
+`q = 16` up. These are release builds on a Core Ultra 9 275HX that was shared
+with other jobs, so the timings are noisy.
+
+The same field in other dtypes:
+
+- **32-bit integers with 20 fractional bits of W, or float32 with every mantissa
+  bit live:** about 2x exact.
+- **Mode 8 at a step of 1/256 of W (u32/i32):** 22x.
+- **Mode 8 at 1/100 of W (float32):** 27x.
+
+Format: [`spec/format.md`](../spec/format.md) §14. A revision-4 reader refuses
+these chunks cleanly.
+
 ## Decode-side deblocking (optional, any existing stream)
 
 ```c
@@ -192,7 +285,8 @@ tools/fetch_corpus.sh fetch tune && ./build/release/volcomp-bench --corpus=corpu
 ```
 
 Presets: `dev` (asan+ubsan), `release`, `bench` (`-march=native`), `fuzz`
-(libFuzzer targets `fuzz_d_chunk`, `fuzz_rt_chunk`, `fuzz_rt_mask`, `fuzz_rt_mask_ll`). Requires clang or GCC and
+(libFuzzer targets `fuzz_d_chunk`, `fuzz_rt_chunk`, `fuzz_rt_mask`, `fuzz_rt_mask_ll`,
+`fuzz_typed_decode`). Requires clang or GCC and
 C23; Linux x86-64 is where it is measured, arm64 compiles and uses the C
 kernels. `-DVOLCOMP_STATIC_AVX2=ON` adds `-mavx2 -mfma` (no runtime dispatch),
 `-DVOLCOMP_NO_AVX2=ON` builds the C kernels only; `ctest` always runs the

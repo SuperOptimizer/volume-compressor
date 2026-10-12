@@ -189,6 +189,7 @@ is q/8 and the AC step is q·(1+r)^0.65 with r = x+y+z. Error grows with q; ther
 | 4 | mask | 2x2x2 majority pool of a binary mask (64³), context-coded, decoded trilinearly to a 0..255 ramp | 0.0057 bits/voxel on the PHercParis4 recto, 11x smaller than packbits + zstd-19 |
 | 5 | mask, spatially lossless | the full 128³ binary mask, same coder, decodes to exact 0/255 | 0.0255 bits/voxel, 2.4x smaller than packbits + zstd-19 |
 | 6 | surface | a DCT base with a flat step law plus a refinement that keeps a threshold exact | 0.71-0.78x the size of q 8 at q 64 |
+| 7-8 | typed (format revision 5, volcomp 1.4.0) | `uint16` / `int16` / `uint32` / `int32` / `float32` chunks with the lossless coder widened to the element: mode 7 exact, mode 8 within q/2 of every element (`volcomp_encode_typed`, [docs/api.md](docs/api.md)) | 11.3x exact, 18.7x at an error of 4 on a smooth `W · 256` winding field |
 
 An older reader rejects a mode it does not know instead of misreading it. Every mode decodes through the
 same `volcomp_decode` call.
@@ -312,7 +313,8 @@ tools/fetch_corpus.sh fetch tune && ./build/release/volcomp-bench --corpus=corpu
 ```
 
 - Presets: `dev` (asan+ubsan), `release`, `bench` (`-march=native`), `fuzz` (libFuzzer targets
-  `fuzz_d_chunk`, `fuzz_rt_chunk`, `fuzz_rt_mask`, `fuzz_rt_mask_ll`; sources in [fuzz/](fuzz/)).
+  `fuzz_d_chunk`, `fuzz_rt_chunk`, `fuzz_rt_mask`, `fuzz_rt_mask_ll`, `fuzz_typed_decode`; sources in
+  [fuzz/](fuzz/)).
 - Requires clang or GCC with C23. On x86-64 the AVX2+FMA kernels are chosen at runtime; every target has
   plain C kernels. `-DVOLCOMP_STATIC_AVX2=ON` compiles AVX2 in without dispatch, `-DVOLCOMP_NO_AVX2=ON`
   builds the C kernels only, and `ctest` runs the golden and codec tests on both kernel sets.
@@ -338,7 +340,7 @@ tools/fetch_corpus.sh fetch tune && ./build/release/volcomp-bench --corpus=corpu
 | [docs/REVIEW_NOTES_A.md](docs/REVIEW_NOTES_A.md) | review of the predecessor codec c5d that v1.0 was built from |
 | [docs/img/](docs/img/) | viewer screenshots |
 | docs/bench/README.md | codec head-to-head benchmark, in progress |
-| [spec/format.md](spec/format.md) | the normative stream, shard and mode format (revision 4) |
+| [spec/format.md](spec/format.md) | the normative stream, shard and mode format (revision 5) |
 | [python/README.md](python/README.md) | Python binding and zarr v3 codec |
 | [web/README.md](web/README.md) | the viewer: use, layer settings, streaming, verification, limits |
 | [tools/export/README.md](tools/export/README.md) | the bulk export pipeline |
