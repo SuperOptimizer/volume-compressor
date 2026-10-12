@@ -250,6 +250,9 @@ static inline const char *volcomp_kernels(void);
 #define VF_Q_RAW_MAX 65280u
 #define VF_NTOK 32u
 #define VF_TOK_EOB 31u
+/* the widest token alphabet a model can hold: 32 for every u8 mode, 64 for the
+ * typed chunks (§14); tables of narrower alphabets keep freq[s] = 0 above theirs */
+#define VF_NTOK_MAX 64u
 #define VF_NMODELS 10u
 #define VF_DC_CTX 9u
 #define VF_PROB_BITS 10u /* tANS table log: 1024 states per model */
@@ -980,25 +983,27 @@ typedef struct vf_dentry {
   uint8_t sym, nb;
 } vf_dentry;
 typedef struct vf_model {
-  uint16_t freq[VF_NTOK];
-  uint16_t cum[VF_NTOK + 1];
+  uint16_t freq[VF_NTOK_MAX];
+  uint16_t cum[VF_NTOK_MAX + 1];
   vf_dentry dt[VF_PROB_SCALE];
 } vf_model;
 
 static inline uint32_t vf_highbit(uint32_t v) { return 31u - (uint32_t)__builtin_clz(v); }
+/* Symbols with freq 0 occupy no slot, so a 32-symbol table built over the
+ * 64-symbol arrays is exactly the table the 32-symbol format defines. */
 static void vf_model_fill(vf_model *m) {
   m->cum[0] = 0;
-  for (uint32_t s = 0; s < VF_NTOK; s++) m->cum[s + 1] = (uint16_t)(m->cum[s] + m->freq[s]);
+  for (uint32_t s = 0; s < VF_NTOK_MAX; s++) m->cum[s + 1] = (uint16_t)(m->cum[s] + m->freq[s]);
   /* spread symbols over the table (FSE step), then assign next states */
   const uint32_t size = VF_PROB_SCALE, mask = size - 1u, step = (size >> 1) + (size >> 3) + 3u;
   uint32_t pos = 0;
-  for (uint32_t s = 0; s < VF_NTOK; s++)
+  for (uint32_t s = 0; s < VF_NTOK_MAX; s++)
     for (uint32_t i = 0; i < m->freq[s]; i++) {
       m->dt[pos].sym = (uint8_t)s;
       pos = (pos + step) & mask;
     }
-  uint16_t next[VF_NTOK];
-  for (uint32_t s = 0; s < VF_NTOK; s++) next[s] = m->freq[s];
+  uint16_t next[VF_NTOK_MAX];
+  for (uint32_t s = 0; s < VF_NTOK_MAX; s++) next[s] = m->freq[s];
   for (uint32_t u = 0; u < size; u++) {
     uint32_t s = m->dt[u].sym;
     uint32_t nx = next[s]++;
@@ -1007,13 +1012,14 @@ static void vf_model_fill(vf_model *m) {
     m->dt[u].ns = (uint16_t)((nx << nb) - size);
   }
 }
-/* encoder: normalise counts to sum exactly VF_PROB_SCALE (nonzero counts keep freq >= 1) */
-static bool vf_model_build(vf_model *m, const uint32_t counts[VF_NTOK]) {
+/* encoder: normalise counts[0..nsym) to sum exactly VF_PROB_SCALE (nonzero counts keep freq >= 1) */
+static bool vf_model_build_n(vf_model *m, const uint32_t *counts, uint32_t nsym) {
   uint64_t total = 0;
-  for (uint32_t s = 0; s < VF_NTOK; s++) total += counts[s];
+  for (uint32_t s = 0; s < nsym; s++) total += counts[s];
   if (total == 0) return false;
+  for (uint32_t s = nsym; s < VF_NTOK_MAX; s++) m->freq[s] = 0;
   uint32_t assigned = 0;
-  for (uint32_t s = 0; s < VF_NTOK; s++) {
+  for (uint32_t s = 0; s < nsym; s++) {
     if (counts[s] == 0) {
       m->freq[s] = 0;
       continue;
@@ -1025,7 +1031,7 @@ static bool vf_model_build(vf_model *m, const uint32_t counts[VF_NTOK]) {
   }
   if (assigned != VF_PROB_SCALE) {
     uint32_t big = 0;
-    for (uint32_t s = 1; s < VF_NTOK; s++)
+    for (uint32_t s = 1; s < nsym; s++)
       if (m->freq[s] > m->freq[big]) big = s;
     int32_t nf = (int32_t)m->freq[big] + ((int32_t)VF_PROB_SCALE - (int32_t)assigned);
     if (nf < 1) return false;
@@ -1034,17 +1040,22 @@ static bool vf_model_build(vf_model *m, const uint32_t counts[VF_NTOK]) {
   vf_model_fill(m);
   return true;
 }
-/* decoder: adopt transmitted frequencies verbatim; never renormalises */
-static bool vf_model_from_freqs(vf_model *m, const uint32_t freqs[VF_NTOK]) {
+static inline bool vf_model_build(vf_model *m, const uint32_t counts[VF_NTOK]) { return vf_model_build_n(m, counts, VF_NTOK); }
+/* decoder: adopt transmitted frequencies freqs[0..nsym) verbatim; never renormalises */
+static bool vf_model_from_freqs_n(vf_model *m, const uint32_t *freqs, uint32_t nsym) {
   uint32_t sum = 0;
-  for (uint32_t s = 0; s < VF_NTOK; s++) {
+  for (uint32_t s = 0; s < nsym; s++) {
     if (freqs[s] > VF_PROB_SCALE) return false;
     sum += freqs[s];
     m->freq[s] = (uint16_t)freqs[s];
   }
   if (sum != VF_PROB_SCALE) return false;
+  for (uint32_t s = nsym; s < VF_NTOK_MAX; s++) m->freq[s] = 0;
   vf_model_fill(m);
   return true;
+}
+static inline bool vf_model_from_freqs(vf_model *m, const uint32_t freqs[VF_NTOK]) {
+  return vf_model_from_freqs_n(m, freqs, VF_NTOK);
 }
 /* compact tables: per model u32 LE presence bitmap + LEB128 freq per set bit, ascending */
 static size_t vf_tables_write(const vf_model *m, uint8_t *out, uint32_t nm) {
@@ -1089,23 +1100,23 @@ typedef struct vf_esym {
 } vf_esym;
 typedef struct vf_etab {
   uint16_t state[VF_PROB_SCALE];
-  vf_esym sym[VF_NTOK];
+  vf_esym sym[VF_NTOK_MAX];
 } vf_etab;
 static void vf_etabs_init(const vf_model *m, vf_etab *et, uint32_t nm) {
   const uint32_t size = VF_PROB_SCALE, mask = size - 1u, step = (size >> 1) + (size >> 3) + 3u;
   for (uint32_t c = 0; c < nm; c++) {
     uint8_t tsym[VF_PROB_SCALE];
     uint32_t pos = 0;
-    for (uint32_t s = 0; s < VF_NTOK; s++)
+    for (uint32_t s = 0; s < VF_NTOK_MAX; s++)
       for (uint32_t i = 0; i < m[c].freq[s]; i++) {
         tsym[pos] = (uint8_t)s;
         pos = (pos + step) & mask;
       }
-    uint32_t cum[VF_NTOK + 1];
-    for (uint32_t s = 0; s <= VF_NTOK; s++) cum[s] = m[c].cum[s];
+    uint32_t cum[VF_NTOK_MAX + 1];
+    for (uint32_t s = 0; s <= VF_NTOK_MAX; s++) cum[s] = m[c].cum[s];
     for (uint32_t u = 0; u < size; u++) et[c].state[cum[tsym[u]]++] = (uint16_t)(size + u);
     uint32_t total = 0;
-    for (uint32_t s = 0; s < VF_NTOK; s++) {
+    for (uint32_t s = 0; s < VF_NTOK_MAX; s++) {
       uint32_t f = m[c].freq[s];
       if (f == 0) {
         et[c].sym[s].delta_nb = 0xffffffffu; /* marker: unusable */
