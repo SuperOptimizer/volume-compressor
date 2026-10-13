@@ -302,6 +302,23 @@ int main(int argc, char **argv) {
     }
   }
 
+  /* ---- 9. encoder token buffers: the most tokens one substream can carry ----
+   * 15 DENSE blocks (residual 1 everywhere: 4096 level tokens) and a SPARSE block
+   * with the most nonzeros (2048 residuals of VLL_NLIT, where SPARSE is the
+   * cheaper mode: 2 tokens each + EOB) are, with each block's mode token,
+   * 15 x 4097 + 4098 tokens; the per-substream buffer once held one fewer (a
+   * 4-byte heap overflow, caught by the asan-ubsan preset) */
+  {
+    memset(src, 7, N);
+    for (uint32_t bi = 0; bi < VF_BLOCKS_PER_SUB; bi++) {
+      uint8_t u[VF_BLKV], b[VF_BLKV];
+      for (uint32_t i = 0; i < VF_BLKV; i++) u[i] = bi + 1u < VF_BLOCKS_PER_SUB ? 1u : (i & 1u) ? VLL_NLIT : 0u;
+      vll_rebuild(b, u);
+      vll_scatter(src, bi >> 6, (bi >> 3) & 7u, bi & 7u, b);
+    }
+    rt(src, dec);
+  }
+
   free(g_enc);
   TEST_END();
 }

@@ -2283,8 +2283,10 @@ __attribute__((always_inline)) static inline bool vll_hyb_read(vf_bitr *r, uint3
 #define VLL_TOKMAX_RUN 23u /* run <= 4095 */
 #define VLL_TOKMAX_LVL 19u /* level <= 255 */
 #define VLL_SPARSE_MAX_NNZ 2048u
-/* per block: SPARSE emits at most 2*nnz+1 tokens, DENSE 4096 */
+/* per block: SPARSE emits at most 2*nnz+1 tokens, DENSE 4096 (VLL_SUB_TOK_MAX, the decoder's bound on code bytes, keeps this) */
 #define VLL_BLK_TOK_MAX (2u * VLL_SPARSE_MAX_NNZ + 1u)
+/* ... plus the block mode token: the encoder's token buffers (a SPARSE block with 2048 nonzeros is 4098 tokens) */
+#define VLL_BLK_TOKS (VLL_BLK_TOK_MAX + 1u)
 /* per block bypass: RAW 4096 B; DENSE 4096*7 bits; SPARSE nnz*(11+7) bits */
 #define VLL_BLK_BYP_MAX 4608u
 #define VLL_SUB_TOK_MAX (2u * VF_BLOCKS_PER_SUB * VLL_BLK_TOK_MAX + 8u)
@@ -2545,11 +2547,11 @@ static volcomp_status vll_encode(const uint8_t *restrict src, uint8_t *restrict 
       return VOLCOMP_OK;
     }
   }
-  const size_t sz_toks = (size_t)VF_BLOCKS * VLL_BLK_TOK_MAX * sizeof(uint16_t);
+  const size_t sz_toks = (size_t)VF_BLOCKS * VLL_BLK_TOKS * sizeof(uint16_t);
   const size_t sz_byp = (size_t)VLL_SUB_BYP_MAX * VF_NSUB;
   const size_t sz_code = (size_t)VLL_SUB_TOK_MAX * VF_NSUB;
   const size_t sz_es = sizeof(vf_etab) * VLL_NMODELS;
-  const size_t sz_fields = ((size_t)VF_BLOCKS_PER_SUB * VLL_BLK_TOK_MAX + 2u) * sizeof(uint32_t);
+  const size_t sz_fields = ((size_t)VF_BLOCKS_PER_SUB * VLL_BLK_TOKS + 2u) * sizeof(uint32_t);
   uint8_t *mem = (uint8_t *)VOLCOMP_MALLOC(sz_toks + sz_byp + sz_code + sz_es + sz_fields);
   if (!mem) return VOLCOMP_ERR_NOMEM;
   vll_enc e;
